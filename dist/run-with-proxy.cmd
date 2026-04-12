@@ -2,24 +2,17 @@
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
-if not "%~1"=="" (
-  set "PROXY_URL=%~1"
-  goto have_proxy
-)
+rem === Allowlisted proxy (edit this line before you commit / ship) ===
+set "PROXY_URL=http://203.0.113.10:3128"
 
-echo Enter your HTTPS proxy URL, for example: http://203.0.113.10:3128
-set /p "PROXY_URL=Proxy URL: "
-
-:have_proxy
-if "!PROXY_URL!"=="" (
-  echo No proxy URL given. From a terminal you can use: run-with-proxy.cmd http://HOST:PORT
+if "%PROXY_URL%"=="" (
+  echo PROXY_URL is empty in run-with-proxy.cmd
   pause
   exit /b 1
 )
 
-set "HTTPS_PROXY=!PROXY_URL!"
-set "HTTP_PROXY=!PROXY_URL!"
+set "HTTPS_PROXY=%PROXY_URL%"
+set "HTTP_PROXY=%PROXY_URL%"
 
 "%~dp0go-frog-windows-amd64.exe"
-set "ERR=!ERRORLEVEL!"
-exit /b !ERR!
+exit /b !ERRORLEVEL!

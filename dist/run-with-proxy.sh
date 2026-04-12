@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
-# Run go-frog on macOS with HTTP(S) traffic sent through a proxy (e.g. allowlisted droplet).
 set -euo pipefail
+
+# Allowlisted proxy (edit this line before you commit / ship)
+PROXY_URL="http://203.0.113.10:3128"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "This script is for macOS. On Linux, set HTTPS_PROXY and run the appropriate binary yourself."
+  echo "This script is for macOS."
   exit 1
 fi
 
-if [[ $# -ge 1 ]]; then
-  PROXY_URL="$1"
-else
-  read -r -p "Proxy URL (e.g. http://203.0.113.10:3128): " PROXY_URL
-fi
-
 if [[ -z "${PROXY_URL// }" ]]; then
-  echo "Usage: $0 http://HOST:PORT"
+  echo "PROXY_URL is empty in run-with-proxy.sh"
   exit 1
 fi
 
