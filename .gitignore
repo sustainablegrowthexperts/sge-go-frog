@@ -1,0 +1,26 @@
+# Crawl / list output (created next to the binary when you run the tool)
+results/
+
+# Local “go build” artifacts at repo root (tracked builds live in dist/)
+/go-frog
+/go-frog.exe
+
+# Editors & OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Go tooling noise
+*.test
+*.out
+coverage.out
+coverage.html
+cpu.prof
+mem.prof
+
+# Logs
+*.log
