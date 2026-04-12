@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Allowlisted proxy (edit this line before you commit / ship)
-PROXY_URL="http://128.199.217.199:7437"
+PROXY_URL="http://sgeadmin:g94sLhsqA5ecnfNOH6WgWde@128.199.217.199:7437"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
