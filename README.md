@@ -64,23 +64,18 @@ When you see **“Crawl complete! Results saved to …”**, press **Enter** to 
 
 Use this when the **site or firewall only allows one fixed IP** (for example an HTTP proxy on a **DigitalOcean droplet**), and you do **not** want to allow every laptop that runs go-frog.
 
-The **`dist`** wrappers (**`run-with-proxy.cmd`**, **`run-with-proxy.sh`**) do **not** contain any proxy URL—this repo is **public**. Your **administrator** gives you the URL separately (email, password manager, internal doc, etc.).
+The **`dist`** wrappers (**`run-with-proxy.cmd`**, **`run-with-proxy.sh`**) ship with an **empty** `PROXY_URL` placeholder—this repo is **public**. Your **administrator** gives you the real URL out of band; you **edit the script once** (the marked line near the top), **save**, then run it whenever you need the proxy. Do not commit your filled-in URL if the repo stays public.
 
 1. Run a forward **HTTP(S) proxy** on a server you control and allowlist **that server’s outbound IP** on the target side.
 2. Download **`dist`** into one folder: the **go-frog binary for your OS** and the matching wrapper. Keep them **in the same folder**.
 
-**How to supply the URL**
+**URL encoding** — If the password contains characters like `@`, `:`, `/`, `#`, or spaces, they should be **percent-encoded** in the URL (your admin can send a ready‑to‑paste string). On Windows batch, also avoid raw **`&` `^` `|` `<` `>`** inside the value or the line may break—encoding avoids that.
 
-- **Interactive:** Run the wrapper; if `PROXY_URL` / `HTTPS_PROXY` is not already set, it **asks you once** and then starts go-frog. Fine for double‑click on Windows or `./run-with-proxy.sh` on Mac.
-- **Environment (automation / batch):** Set **`PROXY_URL`** or **`HTTPS_PROXY`** to the full URL (including `http://user:pass@host:port` if your proxy uses Basic auth), then run the wrapper. Nothing secret is stored in git.
+**Windows** — Open **`run-with-proxy.cmd`** in Notepad, set **`PROXY_URL`** on the `set` line, save, then double‑click the file (or run it from cmd).
 
-**URL encoding** — If the password contains characters like `@`, `:`, `/`, `#`, or spaces, they must be **percent-encoded** inside the URL (your admin can send you a ready‑to‑paste URL).
+**Mac** — Open **`run-with-proxy.sh`** in an editor, set **`PROXY_URL=`** near the top (single quotes around the whole URL are fine), **`chmod +x run-with-proxy.sh`** once, then **`./run-with-proxy.sh`**. The script picks **Apple Silicon** vs **Intel** and runs the right **`go-frog-darwin-*`** binary.
 
-**Windows** — Double‑click **`run-with-proxy.cmd`**, paste the URL when prompted, or use **cmd**: `set PROXY_URL=http://...` then `run-with-proxy.cmd`.
-
-**Mac** — `chmod +x run-with-proxy.sh` once, then **`./run-with-proxy.sh`**, or **`export PROXY_URL='http://...'`** then **`./run-with-proxy.sh`**. The script picks **Apple Silicon** vs **Intel** and runs the right **`go-frog-darwin-*`** binary.
-
-**Advanced** — Set **`NO_PROXY`** in the same environment before launching if some hosts must bypass the proxy. **Linux** is not shipped in `dist`; set `HTTPS_PROXY` and run a binary you built yourself.
+**Advanced** — Set **`NO_PROXY`** in the environment before launching if some hosts must bypass the proxy (you can add `export NO_PROXY=…` to your copy of the script if you prefer). **Linux** is not shipped in `dist`; set `HTTPS_PROXY` and run a binary you built yourself.
 
 ---
 

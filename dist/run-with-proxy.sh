@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Proxy URL is not stored in this repo (public). Your admin gives you the URL.
-# Option A: export PROXY_URL or HTTPS_PROXY, then run this script.
-# Option B: run this script; it will prompt if neither is set.
+# This repo is public — no proxy URL is committed here.
+# Paste the URL your admin gave you between the quotes (once), save, then run this file.
+# Example shapes: http://proxy.example.com:8888   or   http://USER:PASS@host:8888
+# Password special chars: use a URL-encoded password, or use single quotes around the whole URL.
+PROXY_URL=""
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
@@ -13,18 +15,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-if [[ -z "${PROXY_URL:-}" && -n "${HTTPS_PROXY:-}" ]]; then
-  PROXY_URL="$HTTPS_PROXY"
-fi
-
 if [[ -z "${PROXY_URL// }" ]]; then
-  echo "Your admin should give you the proxy URL (e.g. http://host:8888 or http://user:pass@host:8888)."
-  echo "Special characters in the password must be URL-encoded in the URL."
-  read -r -p "Proxy URL: " PROXY_URL
-fi
-
-if [[ -z "${PROXY_URL// }" ]]; then
-  echo "No proxy URL. Set PROXY_URL or HTTPS_PROXY, or enter one when prompted."
+  echo "Edit run-with-proxy.sh: set PROXY_URL near the top of this file, save, then run again."
   exit 1
 fi
 

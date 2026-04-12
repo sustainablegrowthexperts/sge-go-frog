@@ -2,23 +2,14 @@
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
-rem Proxy URL is not stored in this repo (public). Your admin gives you the URL.
-rem Option A: set PROXY_URL or HTTPS_PROXY in the environment, then run this script.
-rem Option B: run this script and paste the URL when prompted.
+rem This repo is public — no proxy URL is committed here.
+rem Paste the URL your admin gave you between the quotes (once), save, then run this file.
+rem Example shapes: http://proxy.example.com:8888   or   http://USER:PASS@host:8888
+rem Password special chars: prefer a URL-encoded password; in batch avoid & ^ | < > inside the value.
+set "PROXY_URL="
 
-if not "!PROXY_URL!"=="" goto have_proxy
-if not "!HTTPS_PROXY!"=="" (
-  set "PROXY_URL=!HTTPS_PROXY!"
-  goto have_proxy
-)
-
-echo Your admin should give you the proxy URL for example http://host:8888
-echo or http://user:pass@host:8888 — special characters in the password must be URL-encoded.
-set /p "PROXY_URL=Proxy URL: "
-
-:have_proxy
 if "!PROXY_URL!"=="" (
-  echo No proxy URL. Set PROXY_URL or HTTPS_PROXY, or enter one when prompted.
+  echo Edit run-with-proxy.cmd: set PROXY_URL to your proxy URL on the "set" line above, save, then run again.
   pause
   exit /b 1
 )
