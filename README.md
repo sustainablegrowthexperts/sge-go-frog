@@ -60,6 +60,37 @@ When you see **“Crawl complete! Results saved to …”**, press **Enter** to 
 
 **Tip (Windows):** If you drag a file into PowerShell or Command Prompt, the path may appear inside **quotes**. go-frog removes a single pair of quotes so the file still opens.
 
+### Crawling through a proxy (optional)
+
+Use this when the **site or firewall only allows one fixed IP** (for example an HTTP proxy on a **DigitalOcean droplet**), and you do **not** want to allow every laptop that runs go-frog.
+
+1. Run a forward **HTTP(S) proxy** on a server you control and allowlist **that server’s outbound IP** on the target side.
+2. Download the usual **`dist`** files into one folder: the **go-frog binary for your OS** plus the wrapper script for your OS:
+   - **Windows:** `run-with-proxy.cmd`
+   - **Mac:** `run-with-proxy.sh`
+3. Keep the wrapper **in the same folder** as `go-frog-windows-amd64.exe` or your `go-frog-darwin-*` file (the scripts assume that layout).
+
+**Windows**
+
+- **Command Prompt or PowerShell:** go to that folder, then run  
+  `run-with-proxy.cmd http://YOUR_PROXY_HOST:PORT`  
+  Example: `run-with-proxy.cmd http://203.0.113.10:3128`
+- **Double‑click** `run-with-proxy.cmd`: if you did not pass a URL on the command line, it will **ask you to type the proxy URL**, then start `go-frog-windows-amd64.exe` with `HTTPS_PROXY` and `HTTP_PROXY` set for that session only.
+
+**Mac**
+
+1. In Terminal, `cd` into the folder that contains `run-with-proxy.sh` and the darwin binary.
+2. Allow execute once: `chmod +x run-with-proxy.sh`
+3. Run with the proxy on the command line:  
+   `./run-with-proxy.sh http://YOUR_PROXY_HOST:PORT`  
+   If you omit the argument, the script **prompts** for the URL.
+4. The script picks **Apple Silicon** vs **Intel** automatically and runs the matching `go-frog-darwin-*` binary.
+
+**Advanced**
+
+- To **bypass** the proxy for specific hosts (e.g. internal tools), set **`NO_PROXY`** yourself in the same terminal before running the wrapper, or edit the wrapper to export it (comma-separated hostnames).
+- **Linux** is not shipped in `dist`; set `export HTTPS_PROXY=http://…` and run your own built binary, same as go-frog’s underlying behavior.
+
 ---
 
 ## What it does (overview)
