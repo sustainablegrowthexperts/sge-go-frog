@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 rem === Allowlisted proxy (edit this line before you commit / ship) ===
-set "PROXY_URL=http://203.0.113.10:3128"
+set "PROXY_URL=http://128.199.217.199:7437"
 
 if "%PROXY_URL%"=="" (
   echo PROXY_URL is empty in run-with-proxy.cmd
