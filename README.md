@@ -64,15 +64,23 @@ When you see **“Crawl complete! Results saved to …”**, press **Enter** to 
 
 Use this when the **site or firewall only allows one fixed IP** (for example an HTTP proxy on a **DigitalOcean droplet**), and you do **not** want to allow every laptop that runs go-frog.
 
+The **`dist`** wrappers (**`run-with-proxy.cmd`**, **`run-with-proxy.sh`**) do **not** contain any proxy URL—this repo is **public**. Your **administrator** gives you the URL separately (email, password manager, internal doc, etc.).
+
 1. Run a forward **HTTP(S) proxy** on a server you control and allowlist **that server’s outbound IP** on the target side.
-2. In this repository, **`dist/run-with-proxy.cmd`** and **`dist/run-with-proxy.sh`** contain the proxy URL in one line at the top (`PROXY_URL=…`). **Maintainers:** set that to your real proxy, then commit—**users do not type the URL**; they only run the wrapper next to the matching binary.
-3. Download **`dist`** into one folder: the **go-frog binary for your OS** and the matching wrapper. Keep them **in the same folder** (the scripts start the exe next to themselves).
+2. Download **`dist`** into one folder: the **go-frog binary for your OS** and the matching wrapper. Keep them **in the same folder**.
 
-**Windows** — Double‑click **`run-with-proxy.cmd`**. It sets `HTTPS_PROXY` / `HTTP_PROXY` for that run and starts **`go-frog-windows-amd64.exe`**.
+**How to supply the URL**
 
-**Mac** — In Terminal, `cd` to the folder, run **`chmod +x run-with-proxy.sh`** once, then **`./run-with-proxy.sh`** (or double‑click the script if your Mac opens `.sh` files in Terminal). The script picks **Apple Silicon** vs **Intel** and runs the right **`go-frog-darwin-*`** binary.
+- **Interactive:** Run the wrapper; if `PROXY_URL` / `HTTPS_PROXY` is not already set, it **asks you once** and then starts go-frog. Fine for double‑click on Windows or `./run-with-proxy.sh` on Mac.
+- **Environment (automation / batch):** Set **`PROXY_URL`** or **`HTTPS_PROXY`** to the full URL (including `http://user:pass@host:port` if your proxy uses Basic auth), then run the wrapper. Nothing secret is stored in git.
 
-**Advanced** — To bypass the proxy for specific hosts, add an `NO_PROXY=…` line to the wrapper (comma-separated hostnames) or set it in Terminal before launching. **Linux** is not shipped in `dist`; set `HTTPS_PROXY` and run a binary you built yourself.
+**URL encoding** — If the password contains characters like `@`, `:`, `/`, `#`, or spaces, they must be **percent-encoded** inside the URL (your admin can send you a ready‑to‑paste URL).
+
+**Windows** — Double‑click **`run-with-proxy.cmd`**, paste the URL when prompted, or use **cmd**: `set PROXY_URL=http://...` then `run-with-proxy.cmd`.
+
+**Mac** — `chmod +x run-with-proxy.sh` once, then **`./run-with-proxy.sh`**, or **`export PROXY_URL='http://...'`** then **`./run-with-proxy.sh`**. The script picks **Apple Silicon** vs **Intel** and runs the right **`go-frog-darwin-*`** binary.
+
+**Advanced** — Set **`NO_PROXY`** in the same environment before launching if some hosts must bypass the proxy. **Linux** is not shipped in `dist`; set `HTTPS_PROXY` and run a binary you built yourself.
 
 ---
 

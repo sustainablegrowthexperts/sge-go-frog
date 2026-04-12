@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Allowlisted proxy (edit this line before you commit / ship)
-PROXY_URL="http://sgeadmin:g94sLhsqA5ecnfNOH6WgWde@128.199.217.199:7437"
+# Proxy URL is not stored in this repo (public). Your admin gives you the URL.
+# Option A: export PROXY_URL or HTTPS_PROXY, then run this script.
+# Option B: run this script; it will prompt if neither is set.
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
@@ -12,8 +13,18 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+if [[ -z "${PROXY_URL:-}" && -n "${HTTPS_PROXY:-}" ]]; then
+  PROXY_URL="$HTTPS_PROXY"
+fi
+
 if [[ -z "${PROXY_URL// }" ]]; then
-  echo "PROXY_URL is empty in run-with-proxy.sh"
+  echo "Your admin should give you the proxy URL (e.g. http://host:8888 or http://user:pass@host:8888)."
+  echo "Special characters in the password must be URL-encoded in the URL."
+  read -r -p "Proxy URL: " PROXY_URL
+fi
+
+if [[ -z "${PROXY_URL// }" ]]; then
+  echo "No proxy URL. Set PROXY_URL or HTTPS_PROXY, or enter one when prompted."
   exit 1
 fi
 
