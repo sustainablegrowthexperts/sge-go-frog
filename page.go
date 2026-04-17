@@ -12,5 +12,7 @@ type Page struct {
 	Title       string
 	Description string
 	H1s         []string
-	KeywordHits []int // occurrence counts per wizard keyword (same order as parsed "|" list)
+	ImgAlts     string // img src>"alt" cells joined by " | " (document order, no dedupe)
+	Robots      string // index/noindex and follow/nofollow from X-Robots-Tag + meta robots (HTTP 200 only)
+	KeywordHits []int  // occurrence counts per wizard keyword (same order as parsed "|" list)
 }

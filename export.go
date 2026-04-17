@@ -29,7 +29,7 @@ func writeResultsCSV(path string, pages []Page, keywordsRaw string) error {
 	keywords := parseSearchKeywords(keywordsRaw)
 
 	w := csv.NewWriter(f)
-	header := []string{"URL", "StatusCode", "LoadTime", "ParentURL", "Inlinks", "Title", "Description", "H1s"}
+	header := []string{"URL", "StatusCode", "LoadTime", "ParentURL", "Inlinks", "Title", "Description", "H1s", "img alts", "Robots"}
 	for _, kw := range keywords {
 		header = append(header, "Search: "+kw)
 	}
@@ -46,6 +46,8 @@ func writeResultsCSV(path string, pages []Page, keywordsRaw string) error {
 			p.Title,
 			p.Description,
 			strings.Join(p.H1s, "|"),
+			p.ImgAlts,
+			p.Robots,
 		}
 		for i := range keywords {
 			n := 0

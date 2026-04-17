@@ -63,8 +63,8 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 			elapsed = time.Since(t0)
 		}
 		body := append([]byte(nil), r.Body...)
-		title, description, h1s, keywordHits := pageFieldsForExport(r.StatusCode, body, keywordsRaw)
 		u := r.Request.URL.String()
+		title, description, h1s, keywordHits, imgAlts, robots := pageFieldsForExport(r.StatusCode, body, keywordsRaw, u, r.Headers)
 		parentURL, inlinks := pageParentAndInlinks(inbound, u)
 		store.append(Page{
 			URL:         u,
@@ -75,6 +75,8 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 			Title:       title,
 			Description: description,
 			H1s:         h1s,
+			ImgAlts:     imgAlts,
+			Robots:      robots,
 			KeywordHits: keywordHits,
 		})
 		if bar != nil {
@@ -99,8 +101,8 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 			elapsed = time.Since(t0)
 		}
 		body := append([]byte(nil), resp.Body...)
-		title, description, h1s, keywordHits := pageFieldsForExport(resp.StatusCode, body, keywordsRaw)
 		u := req.URL.String()
+		title, description, h1s, keywordHits, imgAlts, robots := pageFieldsForExport(resp.StatusCode, body, keywordsRaw, u, resp.Headers)
 		parentURL, inlinks := pageParentAndInlinks(inbound, u)
 		store.append(Page{
 			URL:         u,
@@ -111,6 +113,8 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 			Title:       title,
 			Description: description,
 			H1s:         h1s,
+			ImgAlts:     imgAlts,
+			Robots:      robots,
 			KeywordHits: keywordHits,
 		})
 		if bar != nil {
