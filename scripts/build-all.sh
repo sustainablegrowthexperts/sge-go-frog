@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Cross-compile go-frog for Windows (amd64) and macOS (Intel + Apple Silicon).
+# Build go-frog for the current platform (GUI requires CGo for Fyne).
+#
+# Cross-compiled dist/ binaries are not produced here because Fyne uses CGo,
+# which requires a platform-specific C toolchain. To distribute for multiple
+# platforms, build natively on each target, or use a CGo cross-compiler
+# solution (e.g. zig cc via CC=zig cc).
+#
 # Usage: chmod +x scripts/build-all.sh && ./scripts/build-all.sh
 
 set -euo pipefail
@@ -7,16 +13,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 mkdir -p dist
-export CGO_ENABLED=0
 
-build_one() {
-  local goos=$1 goarch=$2 out=$3
-  echo "Building dist/${out} ..."
-  GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -ldflags='-s -w' -o "dist/${out}" .
-}
+echo "Building go-frog (native) ..."
+go build -trimpath -ldflags='-s -w' -o "dist/go-frog" .
 
-build_one windows amd64 go-frog-windows-amd64.exe
-build_one darwin arm64 go-frog-darwin-arm64
-build_one darwin amd64 go-frog-darwin-amd64
-
-echo "Done. Outputs in dist/"
+echo "Done. Binary at dist/go-frog"

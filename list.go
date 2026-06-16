@@ -8,24 +8,17 @@ import (
 	"strings"
 )
 
-func runList(s WizardSettings) ([]Page, error) {
-	urls, err := urlsFromCSV(s.CSVPath)
-	if err != nil {
-		return nil, err
-	}
+func runList(urls []string, s WizardSettings, onProgress progressFunc) ([]Page, error) {
 	if len(urls) == 0 {
-		return nil, fmt.Errorf("no URLs found in CSV")
+		return nil, fmt.Errorf("no URLs to visit")
 	}
 
 	store := &pageStore{}
 	starts := &requestStartTimes{}
-	n := len(urls)
-	bar := newCrawlProgressBar(&n)
-	defer finishCrawlProgressBar(bar, &n)
 
-	c := newCollectorAsync(s.Concurrency)
+	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
 	attachHTTPTiming(c, starts)
-	attachPageRecording(c, starts, nil, store, s.KeywordsRaw, bar)
+	attachPageRecording(c, starts, nil, store, s.KeywordsRaw, onProgress)
 
 	for _, u := range urls {
 		if err := c.Visit(u); err != nil {

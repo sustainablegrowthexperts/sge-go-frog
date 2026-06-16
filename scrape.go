@@ -2,11 +2,11 @@ package main
 
 import (
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/gocolly/colly/v2"
-	"github.com/schollz/progressbar/v3"
 )
 
 // pageStore collects Page rows from concurrent colly callbacks.
@@ -53,7 +53,7 @@ func attachHTTPTiming(c *colly.Collector, starts *requestStartTimes) {
 	})
 }
 
-func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound *inboundTracker, store *pageStore, keywordsRaw string, bar *progressbar.ProgressBar) {
+func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound *inboundTracker, store *pageStore, keywordsRaw string, onProgress progressFunc) {
 	// OnScraped runs once per request after a successful HTTP round-trip (including non-2xx
 	// bodies that Colly still parses). Callback/HTML errors after a 2xx still reach OnScraped.
 	c.OnScraped(func(r *colly.Response) {
@@ -79,8 +79,8 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 			Robots:      robots,
 			KeywordHits: keywordHits,
 		})
-		if bar != nil {
-			_ = bar.Add(1)
+		if onProgress != nil {
+			onProgress(u)
 		}
 	})
 
@@ -117,8 +117,8 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 			Robots:      robots,
 			KeywordHits: keywordHits,
 		})
-		if bar != nil {
-			_ = bar.Add(1)
+		if onProgress != nil {
+			onProgress(u)
 		}
 	})
 }
@@ -130,19 +130,32 @@ func pageParentAndInlinks(inbound *inboundTracker, pageURL string) (parentURL, i
 	return inbound.parentAndInlinks(pageURL)
 }
 
-func newCollectorAsync(concurrency int) *colly.Collector {
+func newCollectorAsync(concurrency int, proxyURL string) *colly.Collector {
 	c := colly.NewCollector(colly.Async(true))
 	_ = c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: concurrency,
 	})
-	c.SetClient(&http.Client{
+
+	client := &http.Client{
 		Timeout: 60 * time.Second,
 		// Record 3xx (and other non-follow) responses as their own rows instead of following and
 		// only storing the final 200 target.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	})
+	}
+
+	// When proxyURL is set, use it explicitly. When empty, leave Transport nil so
+	// Go's default http.ProxyFromEnvironment picks up HTTPS_PROXY/HTTP_PROXY env vars.
+	if proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
+			client.Transport = &http.Transport{
+				Proxy: http.ProxyURL(u),
+			}
+		}
+	}
+
+	c.SetClient(client)
 	return c
 }

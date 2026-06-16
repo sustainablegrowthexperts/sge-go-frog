@@ -8,7 +8,7 @@ import (
 	"github.com/gocolly/colly/v2"
 )
 
-func runSpider(s WizardSettings) ([]Page, error) {
+func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
 	start, err := normalizeHTTPURL(s.StartURL)
 	if err != nil {
 		return nil, fmt.Errorf("starting URL: %w", err)
@@ -27,14 +27,12 @@ func runSpider(s WizardSettings) ([]Page, error) {
 	inbound := newInboundTracker()
 	store := &pageStore{}
 	starts := &requestStartTimes{}
-	bar := newCrawlProgressBar(nil)
-	defer finishCrawlProgressBar(bar, nil)
 
-	c := newCollectorAsync(s.Concurrency)
+	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
 	c.AllowedDomains = allowedHosts
 
 	attachHTTPTiming(c, starts)
-	attachPageRecording(c, starts, inbound, store, s.KeywordsRaw, bar)
+	attachPageRecording(c, starts, inbound, store, s.KeywordsRaw, onProgress)
 
 	// Colly does not run OnResponse/OnScraped when it treats 3xx as an HTTP error, so enqueue
 	// redirect targets from OnError (see scrape.go) instead of OnResponse.

@@ -10,15 +10,7 @@ You do **not** need to install Go or any other tools. Download the file that mat
 
 ### 1. Download the right file
 
-On GitHub, open this repository and go to the **`dist`** folder. Download **one** of these:
-
-| Your computer | File to download |
-|---------------|------------------|
-| **Windows** (typical PC or laptop) | `go-frog-windows-amd64.exe` |
-| **Mac — Apple Silicon** (most Macs sold since late 2020: M1, M2, M3, …) | `go-frog-darwin-arm64` |
-| **Mac — Intel** (older Macs) | `go-frog-darwin-amd64` |
-
-If you are unsure which Mac you have: Apple menu → **About This Mac** → look for “Chip” (Apple M…) vs “Processor” (Intel).
+On GitHub, open this repository and go to the **`dist`** folder. Download the binary for your platform.
 
 ### 2. Save it somewhere sensible
 
@@ -26,56 +18,46 @@ Create a folder (for example **Documents → go-frog**) and move the downloaded 
 
 ### 3. Start the program
 
-**Windows**
+**Windows** — **Double‑click** the `.exe`. A graphical window opens.
 
-- You can **double‑click** `go-frog-windows-amd64.exe`. A black **Command Prompt** window opens with questions.
-- If Windows shows **“Windows protected your PC”**, click **More info** → **Run anyway** (you still trust this only if you trust the source).
+**Mac** — **Double‑click** the file in Finder (macOS may ask you to confirm in **System Settings → Privacy & Security** the first time).
 
-**Mac**
+**Linux** — Run from a terminal: `./go-frog`
 
-1. Open **Terminal** (Spotlight: search “Terminal”).
-2. Type `cd ` (with a space), then **drag your folder** onto the window and press **Enter**. That moves you into the folder that contains the go-frog file.
-3. For **Apple Silicon**, run:
-   ```bash
-   chmod +x go-frog-darwin-arm64
-   ./go-frog-darwin-arm64
-   ```
-   For **Intel**, use `go-frog-darwin-amd64` in both lines instead.
-4. The first time, macOS may block the app. If that happens: **System Settings → Privacy & Security** and allow it, or **right‑click the file → Open** and confirm.
+> **Prefer the terminal wizard?** Run with `--cli` flag: `./go-frog --cli` (or create a shortcut that adds that flag).
 
-### 4. Answer the on-screen questions
+### 4. Use the GUI
 
-The program runs as a short **wizard**:
+A simple window appears with all the inputs you need:
 
-1. **Mode** — Type `1` to crawl a whole site starting from one address, or `2` to only check URLs listed in a CSV file.
-2. **Starting URL** (mode 1) or **CSV file path** (mode 2) — Paste or type the value. On Windows you can **drag a file** from File Explorer into the window to paste its path.
-3. **Keywords** (optional) — Words to count on each page, separated by `|`. You can press **Enter** to skip.
-4. **Concurrency** — Press **Enter** to accept the default (**10**), or type another positive number if you know what you are doing.
+1. **Mode** — Select **Spider** (crawl a domain) or **List** (process a CSV of URLs).
+2. **Starting URL** (spider mode) — Paste the full URL, e.g. `https://example.com`.
+3. **CSV File** (list mode) — Type the path or click **Browse…** to pick a file.
+4. **Keywords** (optional) — Words to count on each page, separated by `|`. Leave blank to skip.
+5. **Concurrency** — The number of simultaneous requests. Default is **10**.
+6. **Output CSV** — Leave blank to auto-save to the **`results/`** folder with a timestamped name, or click **Save As…** to pick a location.
+7. Click **Run Crawl** — progress is shown, and a desktop notification appears when done.
 
-For **mode 1**, use the **exact** website address your browser shows after the page loads (including `https://` vs `http://` and `www` vs no `www`). The program reminds you of this when you choose spider mode.
-
-### 5. Get your report
-
-When you see **“Crawl complete! Results saved to …”**, press **Enter** to close the window. Open the **`results`** folder and double‑click the new **`.csv`** file in Excel, Google Sheets, or similar.
-
-**Tip (Windows):** If you drag a file into PowerShell or Command Prompt, the path may appear inside **quotes**. go-frog removes a single pair of quotes so the file still opens.
+The fields switch automatically when you change the mode. You can run as many crawls as you like without restarting.
 
 ### Crawling through a proxy (optional)
 
 Use this when the **site or firewall only allows one fixed IP** (for example an HTTP proxy on a **DigitalOcean droplet**), and you do **not** want to allow every laptop that runs go-frog.
 
-The **`dist`** wrappers (**`run-with-proxy.cmd`**, **`run-with-proxy.sh`**) ship with an **empty** `PROXY_URL` placeholder—this repo is **public**. Your **administrator** gives you the real URL out of band; you **edit the script once** (the marked line near the top), **save**, then run it whenever you need the proxy. Do not commit your filled-in URL if the repo stays public.
+**Easiest: use the GUI.** Open the **Advanced** accordion section in the go-frog window and paste the proxy URL into the **Proxy URL** field. No scripts or environment variables needed. The proxy is used only for that crawl session.
 
-1. Run a forward **HTTP(S) proxy** on a server you control and allowlist **that server’s outbound IP** on the target side.
+**Running in `--cli` mode?** The program also respects the standard `HTTPS_PROXY` / `HTTP_PROXY` environment variables. Use the **`dist`** wrappers (**`run-with-proxy.cmd`**, **`run-with-proxy.sh`**) which ship with an **empty** `PROXY_URL` placeholder—this repo is **public**. Your **administrator** gives you the real URL out of band; you **edit the script once** (the marked line near the top), **save**, then run it whenever you need the proxy. Do not commit your filled-in URL if the repo stays public.
+
+1. Run a forward **HTTP(S)** proxy on a server you control and allowlist **that server’s outbound IP** on the target side.
 2. Download **`dist`** into one folder: the **go-frog binary for your OS** and the matching wrapper. Keep them **in the same folder**.
 
 **URL encoding** — If the password contains characters like `@`, `:`, `/`, `#`, or spaces, they should be **percent-encoded** in the URL (your admin can send a ready‑to‑paste string). On Windows batch, also avoid raw **`&` `^` `|` `<` `>`** inside the value or the line may break—encoding avoids that.
 
-**Windows** — Open **`run-with-proxy.cmd`** in Notepad, set **`PROXY_URL`** on the `set` line, save, then double‑click the file (or run it from cmd).
+**Windows (--cli mode)** — Open **`run-with-proxy.cmd`** in Notepad, set **`PROXY_URL`** on the `set` line, save, then double‑click the file (or run it from cmd).
 
-**Mac** — Open **`run-with-proxy.sh`** in an editor, set **`PROXY_URL=`** near the top (single quotes around the whole URL are fine), **`chmod +x run-with-proxy.sh`** once, then **`./run-with-proxy.sh`**. The script picks **Apple Silicon** vs **Intel** and runs the right **`go-frog-darwin-*`** binary.
+**Mac (--cli mode)** — Open **`run-with-proxy.sh`** in an editor, set **`PROXY_URL=`** near the top (single quotes around the whole URL are fine), **`chmod +x run-with-proxy.sh`** once, then **`./run-with-proxy.sh`**.
 
-**Advanced** — Set **`NO_PROXY`** in the environment before launching if some hosts must bypass the proxy (you can add `export NO_PROXY=…` to your copy of the script if you prefer). **Linux** is not shipped in `dist`; set `HTTPS_PROXY` and run a binary you built yourself.
+**Advanced** — Set **`NO_PROXY`** in the environment before launching if some hosts must bypass the proxy (you can add `export NO_PROXY=…` to your copy of the script if you prefer).
 
 ---
 
@@ -89,6 +71,10 @@ The **`dist`** wrappers (**`run-with-proxy.cmd`**, **`run-with-proxy.sh`**) ship
 Progress is shown on **stderr**; prompts and the final path message use **stdout**. Colored text appears only in a normal terminal window; plain text if output is piped or `NO_COLOR` is set.
 
 ---
+
+## `--cli` flag (terminal wizard)
+
+Run with `--cli` to use the original terminal wizard instead of the GUI. This is useful on servers, over SSH, or when you prefer typing to clicking.
 
 ## Interactive wizard (reference)
 
@@ -175,7 +161,13 @@ After that, a short **configuration summary** is printed, then the crawl/list ru
 
 ## For developers: build from source
 
-**Requirements:** a [Go](https://go.dev/dl/) toolchain matching the `go` version in `go.mod`, plus network access to the hosts you crawl or list. Dependencies are listed in `go.mod` (Colly, goquery, progressbar, etc.); the built binary does not need a separate runtime.
+**Requirements:**
+- A [Go](https://go.dev/dl/) toolchain matching the `go` version in `go.mod`.
+- A **C compiler** (Fyne, the GUI toolkit, uses CGo).
+  - **Linux:** `sudo apt install golang gcc libgl1-mesa-dev xorg-dev` (or your distro's equivalents).
+  - **macOS:** Xcode Command Line Tools (`xcode-select --install`).
+  - **Windows:** [TDM-GCC](https://jmeubank.github.io/tdm-gcc/) or [MSYS2](https://www.msys2.org/).
+- Network access to the hosts you crawl or list.
 
 From the repository root:
 
@@ -185,25 +177,42 @@ go build -trimpath -o go-frog .
 
 On Windows you may prefer `-o go-frog.exe`.
 
-**Cross-compile all release binaries** (writes to `dist/`):
+**Build scripts** (writes to `dist/`):
 
-- **Windows (PowerShell):**  
-  `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-all.ps1`
-- **macOS / Linux:**  
-  `chmod +x scripts/build-all.sh && ./scripts/build-all.sh`
+| Script | Platform | Use case |
+|--------|----------|----------|
+| `scripts/build-all.sh` / `.ps1` | Current OS | Quick native build for your machine |
+| `scripts/cross-build.sh` | Linux | Cross-compile for **all** targets (needs [zig](https://ziglang.org/download/) + [Docker](https://docs.docker.com/engine/install/)) |
 
-Those scripts set `CGO_ENABLED=0` and build `go-frog-windows-amd64.exe`, `go-frog-darwin-arm64`, and `go-frog-darwin-amd64` into **`dist/`**.
+- **Native build (any OS):**  
+  `go build -trimpath -o go-frog .`  
+  `scripts/build-all.sh` (macOS/Linux) or `scripts\build-all.ps1` (Windows)
 
-Manual cross-compile examples:
+- **Cross-compile from Linux:**  
+  ```bash
+  # Install tools
+  sudo apt install zig          # or download from ziglang.org
+  sudo apt install docker.io    # only needed for macOS targets
+  sudo usermod -aG docker $USER # then log out and back in
 
-```powershell
-$env:GOOS="windows"; $env:GOARCH="amd64"; $env:CGO_ENABLED="0"; go build -trimpath -o go-frog.exe .
-```
+  # Build everything
+  chmod +x scripts/cross-build.sh
+  ./scripts/cross-build.sh
+  ```
 
-```bash
-GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o go-frog-darwin-amd64 .
-GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o go-frog-darwin-arm64 .
-```
+  | Target | Tool | Output |
+  |--------|------|--------|
+  | `linux/amd64` | native Go | `dist/go-frog-linux-amd64` |
+  | `linux/arm64` | zig cc | `dist/go-frog-linux-arm64` |
+  | `windows/amd64` | zig cc | `dist/go-frog-windows-amd64.exe` |
+  | `darwin/amd64` | fyne-cross + Docker | `dist/go-frog-darwin-amd64` |
+  | `darwin/arm64` | fyne-cross + Docker | `dist/go-frog-darwin-arm64` |
+
+  > **No Docker?** macOS targets can only be built natively on a Mac with Xcode Command Line Tools:
+  > ```bash
+  > go build -trimpath -ldflags='-s -w' -o dist/go-frog-darwin-arm64 .
+  > GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/go-frog-darwin-amd64 .
+  > ```
 
 ---
 

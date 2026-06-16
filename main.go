@@ -11,16 +11,28 @@ import (
 
 const defaultConcurrency = 10
 
-// WizardSettings holds answers from the interactive CLI (used by later phases).
+// WizardSettings holds all crawl configuration.
 type WizardSettings struct {
 	Mode        int // 1 = Spider, 2 = List
 	StartURL    string
 	CSVPath     string
 	KeywordsRaw string
 	Concurrency int
+	ProxyURL    string // optional HTTP proxy (empty = env / none)
 }
 
 func main() {
+	// Check for --cli flag to use the terminal wizard instead of the GUI.
+	for _, arg := range os.Args[1:] {
+		if arg == "--cli" {
+			runCLI()
+			return
+		}
+	}
+	runGUI()
+}
+
+func runCLI() {
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Println(styleTitle + "go-frog" + styleReset + " — site crawl & custom search")
@@ -51,9 +63,27 @@ func main() {
 	var err error
 	switch settings.Mode {
 	case 1:
-		pages, err = runSpider(settings)
+		bar := newCrawlProgressBar(nil)
+		defer finishCrawlProgressBar(bar, nil)
+		pages, err = runSpider(settings, func(_ string) {
+			_ = bar.Add(1)
+		})
 	case 2:
-		pages, err = runList(settings)
+		urls, uErr := urlsFromCSV(settings.CSVPath)
+		if uErr != nil {
+			printErr("Reading CSV: %v\n", uErr)
+			os.Exit(1)
+		}
+		if len(urls) == 0 {
+			printErr("No URLs found in CSV\n")
+			os.Exit(1)
+		}
+		n := len(urls)
+		bar := newCrawlProgressBar(&n)
+		defer finishCrawlProgressBar(bar, &n)
+		pages, err = runList(urls, settings, func(_ string) {
+			_ = bar.Add(1)
+		})
 	default:
 		err = fmt.Errorf("unknown mode %d", settings.Mode)
 	}

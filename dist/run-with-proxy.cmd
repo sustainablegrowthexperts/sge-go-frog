@@ -3,6 +3,12 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 rem This repo is public — no proxy URL is committed here.
+rem
+rem EASIER: just run go-frog.exe and enter the proxy URL in the "Advanced"
+rem section of the graphical window. No script needed!
+rem
+rem Only use this script if you are running in --cli (terminal) mode.
+rem
 rem Paste the URL your admin gave you between the quotes (once), save, then run this file.
 rem Example shapes: http://proxy.example.com:8888   or   http://USER:PASS@host:8888
 rem Password special chars: prefer a URL-encoded password; in batch avoid & ^ | < > inside the value.
@@ -10,6 +16,8 @@ set "PROXY_URL="
 
 if "!PROXY_URL!"=="" (
   echo Edit run-with-proxy.cmd: set PROXY_URL to your proxy URL on the "set" line above, save, then run again.
+  echo.
+  echo Or better: run go-frog normally and enter the proxy in the GUI's Advanced section.
   pause
   exit /b 1
 )

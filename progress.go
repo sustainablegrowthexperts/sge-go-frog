@@ -8,6 +8,11 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
+// progressFunc is called during a crawl whenever a page finishes.
+// url is the completed page URL. The callee should track its own counter
+// if it needs a page count (the crawl code does not synchronize access to it).
+type progressFunc func(url string)
+
 // newCrawlProgressBar builds a stderr progress bar. Pass listURLCount when list mode and count
 // is known (>0); pass nil for spider mode (unknown total: spinner + page count).
 //
