@@ -1,0 +1,9 @@
+services:
+  go-frog:
+    build: .
+    ports:
+      - "4374:8080"
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1

@@ -19,17 +19,21 @@ type WizardSettings struct {
 	KeywordsRaw string
 	Concurrency int
 	ProxyURL    string // optional HTTP proxy (empty = env / none)
+	listURLs    []string
 }
 
 func main() {
-	// Check for --cli flag to use the terminal wizard instead of the GUI.
-	for _, arg := range os.Args[1:] {
+	for i, arg := range os.Args[1:] {
 		if arg == "--cli" {
 			runCLI()
 			return
 		}
+		if arg == "--addr" && i+1 < len(os.Args[1:]) {
+			startServer(os.Args[i+2])
+			return
+		}
 	}
-	runGUI()
+	startServer(":8080")
 }
 
 func runCLI() {

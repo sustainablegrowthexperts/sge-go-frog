@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
@@ -86,6 +87,10 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 
 	c.OnError(func(resp *colly.Response, err error) {
 		if resp == nil || resp.Request == nil {
+			// Connection-level failures (DNS, dial timeout, TLS).
+			if onProgress != nil {
+				onProgress(fmt.Sprintf("ERR:%v", err))
+			}
 			return
 		}
 		// For 2xx, Colly already ran OnScraped. Colly then calls OnError for later issues (e.g. HTML
