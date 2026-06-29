@@ -132,6 +132,7 @@ func pageParentAndInlinks(inbound *inboundTracker, pageURL string) (parentURL, i
 
 func newCollectorAsync(concurrency int, proxyURL string) *colly.Collector {
 	c := colly.NewCollector(colly.Async(true))
+	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	_ = c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: concurrency,
