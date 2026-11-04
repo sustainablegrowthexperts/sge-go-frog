@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	auditpkg "go-frog/internal/audit"
+
 	"github.com/gocolly/colly/v2"
 )
 
@@ -54,7 +56,7 @@ func attachHTTPTiming(c *colly.Collector, starts *requestStartTimes) {
 	})
 }
 
-func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound *inboundTracker, store *pageStore, keywordsRaw string, onProgress progressFunc) {
+func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound *inboundTracker, store *pageStore, keywordsRaw string, onProgress progressFunc, archive *auditpkg.ArchiveWriter) {
 	// OnScraped runs once per request after a successful HTTP round-trip (including non-2xx
 	// bodies that Colly still parses). Callback/HTML errors after a 2xx still reach OnScraped.
 	c.OnScraped(func(r *colly.Response) {
@@ -65,6 +67,9 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 		}
 		body := append([]byte(nil), r.Body...)
 		u := r.Request.URL.String()
+		if archive != nil {
+			archive.Record(u, r.StatusCode, r.Headers, body, r.Request.Depth)
+		}
 		title, description, h1s, keywordHits, imgAlts, robots := pageFieldsForExport(r.StatusCode, body, keywordsRaw, u, r.Headers)
 		parentURL, inlinks := pageParentAndInlinks(inbound, u)
 		store.append(Page{
@@ -107,6 +112,11 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 		}
 		body := append([]byte(nil), resp.Body...)
 		u := req.URL.String()
+		if archive != nil {
+			// Metadata is kept for redirects and errors; the writer only saves
+			// HTML bodies for 200 responses.
+			archive.Record(u, resp.StatusCode, resp.Headers, body, req.Depth)
+		}
 		title, description, h1s, keywordHits, imgAlts, robots := pageFieldsForExport(resp.StatusCode, body, keywordsRaw, u, resp.Headers)
 		parentURL, inlinks := pageParentAndInlinks(inbound, u)
 		store.append(Page{

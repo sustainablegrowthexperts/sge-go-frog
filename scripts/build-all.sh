@@ -17,4 +17,7 @@ mkdir -p dist
 echo "Building go-frog (native) ..."
 go build -trimpath -ldflags='-s -w' -o "dist/go-frog" .
 
-echo "Done. Binary at dist/go-frog"
+echo "Building go-frog-audit (native) ..."
+go build -trimpath -ldflags='-s -w' -o "dist/go-frog-audit" ./cmd/audit
+
+echo "Done. Binaries at dist/go-frog and dist/go-frog-audit"

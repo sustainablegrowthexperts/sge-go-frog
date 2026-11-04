@@ -72,6 +72,17 @@ func buildResultsFilename(s WizardSettings, t time.Time) string {
 	return filepath.Join(resultsDir, ts+"-"+slug+".csv")
 }
 
+// buildArchiveDir returns the audit archive directory that sits next to the
+// run's CSV, e.g. results/2026-01-02-03-04-05-example.com/.
+func buildArchiveDir(s WizardSettings, t time.Time) string {
+	return strings.TrimSuffix(buildResultsFilename(s, t), ".csv")
+}
+
+func buildArchiveDirForHost(host string, t time.Time) string {
+	ts := t.Format("2006-01-02-15-04-05")
+	return filepath.Join(resultsDir, ts+"-"+sanitizeFileSlug(host))
+}
+
 func resultFileSlug(s WizardSettings) string {
 	switch s.Mode {
 	case 1:

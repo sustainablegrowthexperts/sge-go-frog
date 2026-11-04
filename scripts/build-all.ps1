@@ -16,4 +16,7 @@ New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 Write-Host "Building go-frog (native) ..."
 go build -trimpath -ldflags="-s -w" -o (Join-Path "dist" "go-frog.exe") .
 
-Write-Host "Done. Binary at dist/go-frog.exe"
+Write-Host "Building go-frog-audit (native) ..."
+go build -trimpath -ldflags="-s -w" -o (Join-Path "dist" "go-frog-audit.exe") ./cmd/audit
+
+Write-Host "Done. Binaries at dist/go-frog.exe and dist/go-frog-audit.exe"

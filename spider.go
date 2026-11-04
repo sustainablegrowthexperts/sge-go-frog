@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
+
+	auditpkg "go-frog/internal/audit"
 
 	"github.com/gocolly/colly/v2"
 )
@@ -28,11 +31,33 @@ func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
 	store := &pageStore{}
 	starts := &requestStartTimes{}
 
+	var archive *auditpkg.ArchiveWriter
+	var sitemapPages []string
+	if s.Audit {
+		archiveDir := strings.TrimSpace(s.AuditArchiveDir)
+		if archiveDir == "" {
+			archiveDir = buildArchiveDirForHost(host, time.Now())
+		}
+		archive, err = auditpkg.NewArchiveWriter(archiveDir, auditpkg.ArchiveMeta{
+			StartURL: start,
+			Host:     host,
+			Mode:     "spider",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create audit archive: %w", err)
+		}
+		defer archive.Close()
+
+		discovery := discoverSitemap(root, host, s.ProxyURL)
+		archive.SetSitemap(discovery.Meta)
+		sitemapPages = discovery.Pages
+	}
+
 	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
 	c.AllowedDomains = allowedHosts
 
 	attachHTTPTiming(c, starts)
-	attachPageRecording(c, starts, inbound, store, s.KeywordsRaw, onProgress)
+	attachPageRecording(c, starts, inbound, store, s.KeywordsRaw, onProgress, archive)
 
 	// Colly does not run OnResponse/OnScraped when it treats 3xx as an HTTP error, so enqueue
 	// redirect targets from OnError (see scrape.go) instead of OnResponse.
@@ -61,6 +86,9 @@ func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
 		if !hostMatchesSite(u.Hostname(), host) {
 			return
 		}
+		if archive != nil {
+			archive.MarkSource(abs, "redirect")
+		}
 		_ = r.Request.Visit(abs)
 	})
 
@@ -85,13 +113,52 @@ func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
 		}
 		anchor := strings.TrimSpace(e.Text)
 		inbound.add(abs, e.Request.URL.String(), anchor)
+		if archive != nil {
+			archive.MarkSource(abs, "link")
+		}
 		_ = e.Request.Visit(abs)
 	})
 
+	if archive != nil {
+		archive.MarkSource(start, "start")
+	}
 	if err := c.Visit(start); err != nil {
 		return nil, err
 	}
 	c.Wait()
+
+	// Sitemap coverage runs after link-following so we only fetch pages the
+	// crawl could not reach through links. The collector records them exactly
+	// like any other page, including redirects and 404s.
+	if s.Audit && len(sitemapPages) > 0 {
+		seen := make(map[string]struct{})
+		for _, page := range store.snapshot() {
+			if canonical, ok := auditpkg.CanonicalURL(page.URL, nil); ok {
+				seen[canonical] = struct{}{}
+			}
+		}
+		for _, sitemapURL := range sitemapPages {
+			if canonical, ok := auditpkg.CanonicalURL(sitemapURL, nil); ok {
+				if _, done := seen[canonical]; done {
+					continue
+				}
+			}
+			if visited, _ := c.HasVisited(sitemapURL); visited {
+				continue
+			}
+			if archive != nil {
+				archive.MarkSource(sitemapURL, "sitemap")
+			}
+			_ = c.Visit(sitemapURL)
+		}
+		c.Wait()
+	}
+
+	if archive != nil {
+		if err := archive.Close(); err != nil {
+			return nil, fmt.Errorf("finalize audit archive: %w", err)
+		}
+	}
 
 	return store.snapshot(), nil
 }

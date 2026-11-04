@@ -23,6 +23,75 @@ Open **http://localhost:4374/**.
 
 Click **Run Crawl**. A job card shows progress in real time — page count, current URL, and a progress bar. When done, a **⬇ Download CSV** button appears.
 
+### Internal linking audit (opt-in)
+
+Tick **Perform internal linking audit?** in Spider mode. With the audit off, crawl behavior is unchanged. With it on, go-frog also reads `robots.txt` and the site sitemap (including sitemap indexes), then fetches sitemap pages that link-following could not reach. Those sitemap-only pages are normal crawl rows, so they also appear in the CSV and `manifest.json`. In addition, go-frog saves:
+
+- `results/<run>/manifest.json` — every fetched URL, status, redirect target, content type, robots header, depth, discovery source (`start`, `link`, `redirect`, `sitemap`), and timestamp
+- `results/<run>/sitemap.json` — fetched sitemap documents, discovered page URLs, and non-fatal sitemap warnings
+- `results/<run>/html/*.html` — raw HTML for every HTTP 200 HTML page
+
+After the crawl finishes, the deterministic auditor reads that archive and writes a **Strict** report plus an **Inclusive** companion:
+
+- `audit.json` — content-link graph, block decisions, anchor analysis, and counts
+- `audit-pages.csv` — per-page content inbound/outbound occurrences and unique values, nav inbound, PageRank, orphan flag/type, sitemap flags, and content/nav reachability
+- `audit-links.csv` — every non-asset link the audit considered, including external, non-HTTP, redirect-target, and excluded rows, with raw and normalized targets/anchors, target type, decision, and reason; asset links are omitted entirely
+- `audit-blocks.csv` — every link block with its evidence fields and classification decision/reason
+
+The same four files are written under `inclusive/` inside the run archive. In the web UI, each profile is exposed as a single `*-audit.zip` download instead of four separate files. The bundle contains `audit.xlsx` (Summary, Pages, Links, and Blocks sheets with typed columns and filters), the three CSV files, `audit.json`, and `manifest.txt` with the row counts. The CSVs and JSON are copied unchanged, so existing scripts can still consume them.
+
+Strict keeps the class-based widget exclusions; Inclusive uses the same navigation/menu/footer filters but removes every widget/listing exclusion, so related posts, recent-post blocks, carousels, sliders, product/blog listing grids, and similar links count as content. The two profiles differ only by the exclusion list. Both still exclude self-links, external and non-HTTP links, redirect aliases, non-page/404 targets, and assets. The job card shows **Strict** and **Inclusive** tabs with separate summaries and bundle downloads.
+
+Both reports count **content page links only**: an internal link counts only when its normalized target is a saved 200 HTML page. Asset links (`.mp4`, `.pdf`, images, archives, and similar files) are omitted entirely — no rows, counts, anchors, or graph metrics. Redirect aliases and non-page/404 targets are excluded from the graph; the audit does not fetch, resolve, or health-check them. `Summary.ContentLinks`, `Summary.ContentPageLinks`, and `Summary.ContentLinkOccurrences` are content page link occurrences; `Summary.UniqueContentLinks` counts distinct source→target pairs. Header/navbar/footer/menu links are ranked as nav in both profiles. In the **Strict** report, related posts, editorial feeds, carousels, sliders, and motion widgets are **excluded** by class/id substring matching (`excluded_class:<match>`) and never contribute to graph metrics; repeating them does not change the decision. The **Inclusive** report removes those class exclusions while keeping the nav/menu/footer filters, and emits `filters_used.exclude_substrings` as an explicit empty array.
+
+Block classification is **purely subtractive**: start with content, apply explicit `force_exclude` / `force_content` overrides, remove class-excluded widgets, remove nav/header/footer markers, and treat everything left as content. The auditor does not look for `<main>`/`<article>` content roots or use link-density scoring, so a link-dense block is never reclassified as nav solely because it sits outside a content container. `audit.json` block rows and `audit-blocks.csv` expose the reduced evidence schema: `nav_marker`, `excluded_class`, `position`, `link_count`, `link_text_ratio`, `direct_anchor_count`, `decision`, and `reason` (plus the existing block identity, sample, and snippet fields).
+
+Redirect aliases are reported for visibility only. They do not pass link equity in this audit; link to the final URL if the link should count.
+
+Reachability is computed by breadth-first search from the start page, not from direct inbound counts. **Content orphans** are non-start pages with zero content inbound; **content-unreachable** pages include direct orphans plus pages that are only reachable through another orphan. Nav reachability is a separate nav-only BFS. Pages found in the sitemap but not reachable through content links are flagged **sitemap-only, content-unreachable**. The audit uses the same site boundary as the crawl: apex and `www` are one site, subdomains are external. Inbound counts are link occurrences; anchor over-optimization is measured by distinct source pages. **PageRank uses unique source→target edges; page-table inbound/outbound columns are occurrences unless labeled unique.**
+
+#### PageRank methodology
+
+`audit.json` includes a `pagerank_meta` block that records the graph size and settings used for the ranking. The methodology is:
+
+- **Nodes:** the saved HTTP 200 HTML pages in the archive (200 in the comparison run). Assets, redirect aliases, and non-page targets are not nodes. Strict also omits excluded widgets; Inclusive counts them.
+- **Edges:** one per distinct `source -> target` content page pair. Repeated links between the same two pages count once.
+- **Self-links:** excluded before PageRank is computed.
+- **Dangling nodes:** their rank is redistributed uniformly across all nodes each iteration.
+- **Damping, tolerance, iterations:** damping `0.85`, convergence tolerance `1e-8`, maximum `100` iterations.
+- **Ranking metric:** PageRank over the content page graph. The page-table inbound/outbound counts are link occurrences unless the column is labeled unique.
+- **`top_share`:** the raw top PageRank divided by the raw sum of all PageRank scores. PageRank values in the report are rounded to six decimals only for output; ordering and `top_share` use the unrounded values.
+
+After the run, each audit tab downloads one ZIP bundle; the individual JSON and CSV files are no longer offered as separate web downloads. To re-audit the same archive later, or run it on another machine:
+
+```bash
+go-frog-audit --archive results/2026-01-02-03-04-05-example.com
+```
+
+Or with the Docker image:
+
+```bash
+docker run --rm -v "$PWD/results:/results" --entrypoint /go-frog-audit go-frog \
+  --archive /results/2026-01-02-03-04-05-example.com
+```
+
+Optional per-site overrides (deterministic, no model):
+
+```json
+{
+  "force_content": [".related-posts", "#more-from-us"],
+  "force_exclude": [".newsletter", ".cookie-banner"],
+  "exclude_classes": ["my-widget", "my-carousel"],
+  "nav_substrings": ["my-chrome", "my-footer"],
+  "replace_exclude_classes": false,
+  "replace_nav_substrings": false
+}
+```
+
+The auditor looks for overrides in this order: `--config <path>`, `GOFROG_AUDIT_CONFIG`, `audit-config.json` inside the archive, then `audit-config/<host>.json` in the current working directory. For the web UI, use `GOFROG_AUDIT_CONFIG` or `audit-config/<host>.json`; `force_content` / `force_exclude` match the block, anchor, or one of their ancestors and take priority over class exclusion.
+
+`exclude_classes` and `nav_substrings` are case-insensitive partial class/id substrings (not CSS selectors), normalized for `_`/`-` and whitespace. They append to the built-in lists. Set `replace_exclude_classes` or `replace_nav_substrings` to `true` to replace the corresponding defaults instead, which is how a site can remove a broad default such as `stream`.
+
 ---
 
 ## `--cli` flag (terminal wizard)
@@ -96,6 +165,7 @@ HTTPS_PROXY=http://user:pass@proxy.example.com:3128 ./go-frog --cli
 - Follows internal `http`/`https` links on the same site. `www.example.com` and `example.com` are treated as the same site for crawl boundaries. Subdomains like `blog.example.com` are not followed unless you start the crawl there.
 - Redirects are **not auto-followed** — you get a row for the 301/302 URL itself, and the `Location` target is fetched separately.
 - **Inlinks column** shows who linked to each page: `https://from/page>"anchor text" | https://other/>"other anchor"`.
+- With the audit checkbox on, the crawl also writes the HTML archive and sitemap metadata described above. It reads `robots.txt`/sitemaps and fetches sitemap pages that link-following missed, so those pages appear as normal CSV rows. Sitemap fetch failures are warnings only and never fail the crawl. The `Inlinks` column is unchanged.
 
 ### List mode
 
@@ -131,9 +201,10 @@ HTTPS_PROXY=http://user:pass@proxy.example.com:3128 ./go-frog --cli
 
 ```bash
 go build -trimpath -o go-frog .
+go build -trimpath -o go-frog-audit ./cmd/audit
 ```
 
-No C compiler or GUI dependencies required. The web UI is embedded.
+No C compiler or GUI dependencies required. The web UI is embedded. The Docker image includes both binaries.
 
 ---
 

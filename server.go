@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	auditpkg "go-frog/internal/audit"
+	"go-frog/internal/auditbundle"
 )
 
 //go:embed web/*
@@ -41,6 +44,16 @@ type crawlJob struct {
 	errMsg     string
 	result     []Page
 	settings   WizardSettings
+
+	auditReady   bool
+	auditError   string
+	auditSummary auditpkg.AuditSummary
+	auditDir     string
+
+	auditInclusiveReady   bool
+	auditInclusiveError   string
+	auditInclusiveSummary auditpkg.AuditSummary
+	auditInclusiveDir     string
 }
 
 func newJobManager() *jobManager {
@@ -105,6 +118,40 @@ func (j *crawlJob) fail(err error) {
 	j.errMsg = err.Error()
 }
 
+func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Result, inclusiveErr error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.status = "done"
+	j.result = pages
+	j.pages = len(pages)
+	j.auditReady = true
+	j.auditError = ""
+	j.auditSummary = strict.SummaryValue()
+	j.auditDir = strict.OutputDir
+
+	j.auditInclusiveReady = inclusive != nil
+	j.auditInclusiveError = ""
+	j.auditInclusiveSummary = auditpkg.AuditSummary{}
+	j.auditInclusiveDir = ""
+	switch {
+	case inclusive != nil:
+		j.auditInclusiveSummary = inclusive.SummaryValue()
+		j.auditInclusiveDir = inclusive.OutputDir
+	case inclusiveErr != nil:
+		j.auditInclusiveError = inclusiveErr.Error()
+	}
+}
+
+func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.status = "done"
+	j.result = pages
+	j.pages = len(pages)
+	j.auditReady = false
+	j.auditError = err.Error()
+}
+
 type jobView struct {
 	ID         string
 	Mode       string
@@ -113,6 +160,19 @@ type jobView struct {
 	Pages      int
 	CurrentURL string
 	Error      string
+
+	Audit        bool
+	AuditReady   bool
+	AuditError   string
+	AuditPages   int
+	AuditLinks   int
+	AuditOrphans int
+
+	AuditInclusiveReady   bool
+	AuditInclusiveError   string
+	AuditInclusivePages   int
+	AuditInclusiveLinks   int
+	AuditInclusiveOrphans int
 }
 
 func (j *crawlJob) view() jobView {
@@ -123,13 +183,25 @@ func (j *crawlJob) view() jobView {
 		u = u[:77] + "..."
 	}
 	return jobView{
-		ID:         j.id,
-		Mode:       j.mode,
-		Target:     j.target,
-		Status:     j.status,
-		Pages:      j.pages,
-		CurrentURL: u,
-		Error:      j.errMsg,
+		ID:           j.id,
+		Mode:         j.mode,
+		Target:       j.target,
+		Status:       j.status,
+		Pages:        j.pages,
+		CurrentURL:   u,
+		Error:        j.errMsg,
+		Audit:        j.settings.Audit,
+		AuditReady:   j.auditReady,
+		AuditError:   j.auditError,
+		AuditPages:   j.auditSummary.Pages,
+		AuditLinks:   j.auditSummary.ContentLinkOccurrences,
+		AuditOrphans: j.auditSummary.Orphans,
+
+		AuditInclusiveReady:   j.auditInclusiveReady,
+		AuditInclusiveError:   j.auditInclusiveError,
+		AuditInclusivePages:   j.auditInclusiveSummary.Pages,
+		AuditInclusiveLinks:   j.auditInclusiveSummary.ContentLinkOccurrences,
+		AuditInclusiveOrphans: j.auditInclusiveSummary.Orphans,
 	}
 }
 
@@ -150,7 +222,10 @@ func startServer(addr string) error {
 			http.NotFound(w, r)
 			return
 		}
-		indexTmpl.Execute(w, nil)
+		indexTmpl.Execute(w, map[string]any{
+			"NavSubstrings":     strings.Join(auditpkg.DefaultNavSubstrings, "\n"),
+			"ExcludeSubstrings": strings.Join(auditpkg.DefaultExcludeSubstrings, "\n"),
+		})
 	})
 
 	mux.HandleFunc("/api/crawl", func(w http.ResponseWriter, r *http.Request) {
@@ -219,6 +294,13 @@ func startServer(addr string) error {
 			return
 		}
 
+		// Internal linking audit is opt-in and spider-only.
+		if mode == "spider" && r.FormValue("audit") == "1" {
+			settings.Audit = true
+			settings.AuditArchiveDir = buildArchiveDir(settings, time.Now())
+			settings.AuditFilters = parseAuditFilters(r, mode, true)
+		}
+
 		job := jm.create(mode, target, settings)
 
 		go func() {
@@ -238,9 +320,27 @@ func startServer(addr string) error {
 
 			if err != nil {
 				job.fail(err)
-			} else {
-				job.finish(pages)
+				return
 			}
+
+			if settings.Audit {
+				result, auditErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
+				if auditErr != nil {
+					job.finishWithAuditError(pages, fmt.Errorf("internal linking audit: %w", auditErr))
+					return
+				}
+
+				// Build the inclusive report from the same archive. It keeps the
+				// strict run's navigation filters but counts every other
+				// widget/listing link as content.
+				inclusive, inclusiveErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{
+					Filters: inclusiveAuditFilters(result),
+					OutDir:  filepath.Join(settings.AuditArchiveDir, "inclusive"),
+				})
+				job.finishWithAudits(pages, result, inclusive, inclusiveErr)
+				return
+			}
+			job.finish(pages)
 		}()
 
 		w.Header().Set("Content-Type", "text/html")
@@ -263,12 +363,58 @@ func startServer(addr string) error {
 			return
 		}
 
+		if len(parts) == 2 && strings.HasPrefix(parts[1], "audit/") {
+			switch strings.TrimPrefix(parts[1], "audit/") {
+			case "bundle.zip":
+				serveAuditBundle(w, r, job, "strict")
+			case "inclusive/bundle.zip":
+				serveAuditBundle(w, r, job, "inclusive")
+			default:
+				http.NotFound(w, r)
+			}
+			return
+		}
+
 		w.Header().Set("Content-Type", "text/html")
 		writeJobFragment(w, job.view())
 	})
 
 	fmt.Printf("go-frog web server listening on %s\n", addr)
 	return http.ListenAndServe(addr, mux)
+}
+
+// inclusiveAuditFilters returns the filter profile for the less strict report:
+// the same navigation/menu/footer patterns as the strict run and no widget or
+// listing exclusions. A nil or partial strict result falls back to the default
+// navigation list so the inclusive run never accidentally counts site chrome.
+func inclusiveAuditFilters(strict *auditpkg.Result) *auditpkg.FilterOptions {
+	nav := append([]string(nil), auditpkg.DefaultNavSubstrings...)
+	if strict != nil && strict.FiltersUsed != nil {
+		nav = append([]string(nil), strict.FiltersUsed.NavSubstrings...)
+	}
+	return &auditpkg.FilterOptions{
+		NavSubstrings:     nav,
+		ExcludeSubstrings: nil,
+		Explicit:          true,
+	}
+}
+
+// parseAuditFilters reads the run-page filter editor fields. Filters are only
+// accepted for spider-mode runs with the audit enabled, and only replace the
+// defaults when the client confirms it submitted the complete lists. Absent
+// fields leave AuditFilters nil so the auditor uses defaults + config.
+func parseAuditFilters(r *http.Request, mode string, auditEnabled bool) *auditpkg.FilterOptions {
+	if !auditEnabled || mode != "spider" {
+		return nil
+	}
+	if r.FormValue("audit_filters_explicit") != "1" {
+		return nil
+	}
+	return &auditpkg.FilterOptions{
+		NavSubstrings:     auditpkg.SplitSubstrings(r.FormValue("audit_nav_substrings")),
+		ExcludeSubstrings: auditpkg.SplitSubstrings(r.FormValue("audit_exclude_substrings")),
+		Explicit:          true,
+	}
 }
 
 func serveDownload(w http.ResponseWriter, r *http.Request, job *crawlJob) {
@@ -294,6 +440,46 @@ func serveDownload(w http.ResponseWriter, r *http.Request, job *crawlJob) {
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(path)))
 	http.ServeFile(w, r, path)
+}
+
+// serveAuditBundle packages the profile's report directory into one ZIP and
+// sends it as the only audit download exposed by the web UI.
+func serveAuditBundle(w http.ResponseWriter, r *http.Request, job *crawlJob, profile string) {
+	job.mu.Lock()
+	dir := job.auditDir
+	ready := job.auditReady
+	settings := job.settings
+	if profile == "inclusive" {
+		dir = job.auditInclusiveDir
+		ready = job.auditInclusiveReady
+	}
+	job.mu.Unlock()
+
+	if !ready {
+		http.NotFound(w, r)
+		return
+	}
+
+	tmp, err := os.CreateTemp(os.TempDir(), "go-frog-audit-*.zip")
+	if err != nil {
+		http.Error(w, "failed to create audit bundle", http.StatusInternalServerError)
+		return
+	}
+	bundlePath := tmp.Name()
+	tmp.Close()
+	os.Remove(bundlePath)
+	defer os.Remove(bundlePath)
+
+	if err := auditbundle.WriteFile(dir, bundlePath); err != nil {
+		fmt.Fprintf(os.Stderr, "build audit bundle: %v\n", err)
+		http.Error(w, "failed to build audit bundle", http.StatusInternalServerError)
+		return
+	}
+
+	filename := sanitizeFileSlug(resultFileSlug(settings)) + "-" + profile + "-audit.zip"
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	http.ServeFile(w, r, bundlePath)
 }
 
 // ── html fragment rendering ──────────────────────────────────────────────────
@@ -331,7 +517,50 @@ func writeJobFragment(w io.Writer, v jobView) {
 	case "error":
 		fmt.Fprintf(w, `<span class="err-text">%s</span>`, esc(v.Error))
 	}
-	fmt.Fprint(w, `</div></div>`)
+	fmt.Fprint(w, `</div>`)
+
+	if v.Audit {
+		switch {
+		case v.AuditReady:
+			fmt.Fprint(w, `<div class="job-audit" x-data="{ auditTab: 'strict' }">`)
+			fmt.Fprint(w, `<div class="job-audit-head"><span>Internal linking audit</span><div class="audit-tabs">`)
+			fmt.Fprint(w, `<button type="button" class="audit-tab" :class="{ active: auditTab === 'strict' }" @click="auditTab = 'strict'">Strict</button>`)
+			fmt.Fprint(w, `<button type="button" class="audit-tab" title="Counts every link outside navigation, menus, and footers" :class="{ active: auditTab === 'inclusive' }" @click="auditTab = 'inclusive'">Inclusive</button>`)
+			fmt.Fprint(w, `</div></div>`)
+			fmt.Fprint(w, `<div x-show="auditTab === 'strict'">`)
+			writeAuditPanel(w, true, "", v.AuditPages, v.AuditLinks, v.AuditOrphans, "/api/crawl/"+v.ID+"/audit", "")
+			fmt.Fprint(w, `</div>`)
+			fmt.Fprint(w, `<div x-show="auditTab === 'inclusive'" x-cloak>`)
+			writeAuditPanel(w, v.AuditInclusiveReady, v.AuditInclusiveError, v.AuditInclusivePages, v.AuditInclusiveLinks, v.AuditInclusiveOrphans, "/api/crawl/"+v.ID+"/audit/inclusive", "Inclusive audit did not produce a report.")
+			fmt.Fprint(w, `</div></div>`)
+		case v.AuditError != "":
+			fmt.Fprintf(w, `<div class="job-audit"><div class="job-audit-head">Internal linking audit failed</div><div class="err-text">%s</div></div>`, esc(v.AuditError))
+		case v.Status == "done":
+			fmt.Fprint(w, `<div class="job-audit"><div class="job-audit-head">Internal linking audit</div><div class="job-audit-stats">Audit did not produce a report.</div></div>`)
+		}
+	}
+
+	fmt.Fprint(w, `</div>`)
+}
+
+func writeAuditPanel(w io.Writer, ready bool, errText string, pages, links, orphans int, baseURL, emptyMsg string) {
+	if !ready {
+		if errText != "" {
+			fmt.Fprintf(w, `<div class="job-audit-stats err-text">%s</div>`, esc(errText))
+		} else if emptyMsg != "" {
+			fmt.Fprintf(w, `<div class="job-audit-stats">%s</div>`, emptyMsg)
+		}
+		return
+	}
+	orphanWord := "orphans"
+	if orphans == 1 {
+		orphanWord = "orphan"
+	}
+	fmt.Fprintf(w, `<div class="job-audit-stats">%d pages &middot; %d content link occurrences &middot; %d %s</div>`,
+		pages, links, orphans, orphanWord)
+	fmt.Fprint(w, `<div class="job-audit-links">`)
+	fmt.Fprintf(w, `<a href="%s/bundle.zip">&#x2B07; Download audit bundle (ZIP)</a>`, baseURL)
+	fmt.Fprint(w, `</div>`)
 }
 
 func esc(s string) string {

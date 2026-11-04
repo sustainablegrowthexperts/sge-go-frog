@@ -6,6 +6,7 @@
 <title>go-frog</title>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+<script type="module" src="https://sidebar.sustainable-growth-experts.com/sge-sidebar.js"></script>
 <style>
   :root {
     --bg: #f5f5f5;
@@ -19,11 +20,18 @@
     --radius: 8px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
   body {
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background: var(--bg); color: var(--text);
-    padding: 32px 16px;
   }
+  .shell { display: flex; height: 100vh; overflow: hidden; }
+  sge-sidebar { flex: none; }
+  @media (min-width: 768px) {
+    sge-sidebar { width: 64px; }
+  }
+  .main { display: flex; flex: 1; flex-direction: column; min-width: 0; }
+  .main-scroll { flex: 1; overflow-y: auto; padding: 32px 16px; }
   .container { max-width: 600px; margin: 0 auto; }
   h1 { font-size: 22px; font-weight: 700; }
   h1 span { font-weight: 400; color: var(--muted); font-size: 14px; margin-left: 8px; }
@@ -118,62 +126,149 @@
   }
   .btn-dl:hover { opacity: 0.9; }
   .err-text { color: var(--red); }
+  .check-row {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 500; cursor: pointer;
+  }
+  .check-row input { width: 16px; height: 16px; accent-color: var(--blue); }
+  .audit-filters {
+    margin-top: 10px; padding: 12px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--bg);
+  }
+  .audit-filters-head { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+  .filter-group { margin-bottom: 12px; }
+  .filter-group:last-of-type { margin-bottom: 0; }
+  .filter-group label {
+    display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px;
+  }
+  .filter-actions { display: flex; gap: 8px; margin-top: 4px; }
+  .job-audit {
+    margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+  }
+  .job-audit-head {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 12px; font-weight: 600; margin-bottom: 2px;
+  }
+  .job-audit-stats { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .audit-tabs { display: flex; gap: 4px; }
+  .audit-tab {
+    padding: 2px 8px; font-size: 11px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: var(--bg); color: var(--muted);
+  }
+  .audit-tab.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+  .job-audit-links { display: flex; flex-wrap: wrap; gap: 10px; }
+  .job-audit-links a {
+    font-size: 12px; color: var(--blue); text-decoration: none;
+  }
+  .job-audit-links a:hover { text-decoration: underline; }
+  @media (max-width: 767px) {
+    .shell { display: block; height: auto; overflow: visible; }
+    .main-scroll { overflow: visible; padding: 20px 16px 96px; }
+  }
   [x-cloak] { display: none !important; }
 </style>
 </head>
-<body x-data="{mode: 'spider', keywords: ['']}">
-<div class="container">
-  <h1>go-frog <span>site crawl &amp; custom search</span></h1>
+<body x-data="{mode: 'spider', keywords: [''], audit: false}">
+<div class="shell">
+  <sge-sidebar src="https://sidebar.sustainable-growth-experts.com/menu.json" theme="light"></sge-sidebar>
+  <div class="main">
+    <div class="main-scroll">
+      <div class="container">
+        <h1>go-frog <span>site crawl &amp; custom search</span></h1>
 
-  <div class="card">
-    <form hx-post="/api/crawl"
-          hx-encoding="multipart/form-data"
-          hx-target="#jobs"
-          hx-swap="afterbegin"
-          hx-indicator=".btn-run">
+        <div class="card">
+          <form hx-post="/api/crawl"
+                hx-encoding="multipart/form-data"
+                hx-target="#jobs"
+                hx-swap="afterbegin"
+                hx-indicator=".btn-run">
 
-      <div class="tabs">
-        <button type="button" @click="mode='spider'"
-                :class="mode==='spider' && 'active'">🕷 Spider</button>
-        <button type="button" @click="mode='list'"
-                :class="mode==='list' && 'active'">📋 List</button>
+            <div class="tabs">
+              <button type="button" @click="mode='spider'"
+                      :class="mode==='spider' && 'active'">🕷 Spider</button>
+              <button type="button" @click="mode='list'"
+                      :class="mode==='list' && 'active'">📋 List</button>
+            </div>
+
+            <input type="hidden" name="mode" :value="mode">
+
+            <div class="field" x-show="mode==='spider'">
+              <label>Starting URL</label>
+              <input type="text" name="startUrl" placeholder="https://example.com" :required="mode==='spider'">
+            </div>
+
+            <div class="field" x-show="mode==='list'" x-cloak>
+              <label>URLs <small>(one per line)</small></label>
+              <textarea name="urls" rows="6" placeholder="https://example.com&#10;https://example.com/about&#10;https://other-site.com" :required="mode==='list'"></textarea>
+            </div>
+
+            <div class="field">
+              <label>Keywords <small>(optional)</small></label>
+              <div class="hint">Counts how many times each keyword appears in the HTML of every crawled page. Results appear as extra columns in the CSV.</div>
+              <template x-for="(kw, i) in keywords" :key="i">
+                <div class="kw-row">
+                  <input type="text" x-model="keywords[i]" placeholder="keyword" style="margin-bottom:0">
+                  <button type="button" class="kw-remove" @click="keywords.splice(i,1)" x-show="keywords.length > 1">&times;</button>
+                </div>
+              </template>
+              <button type="button" class="kw-add" @click="keywords.push('')">+ Add keyword</button>
+              <input type="hidden" name="keywords" :value="keywords.filter(k => k.trim()).join('|')">
+            </div>
+
+            <div class="field">
+              <label>Concurrency</label>
+              <input type="number" name="concurrency" value="10" min="1" max="50">
+            </div>
+
+            <div class="field" x-show="mode==='spider'" x-cloak>
+              <label class="check-row">
+                <input type="checkbox" name="audit" value="1" x-model="audit" :disabled="mode!=='spider'">
+                <span>Perform internal linking audit?</span>
+              </label>
+              <div class="hint">Saves the crawled HTML and reports content page links only, excluding navigation, menus, and footers. Spider mode only.</div>
+
+              <div class="audit-filters" x-show="mode==='spider' && audit" x-cloak>
+                <div class="audit-filters-head">Edit class filters</div>
+
+                <div class="filter-group">
+                  <label>Navigation &amp; footer class filters</label>
+                  <div class="hint">Case-insensitive partial class/id matches. Remove a line to disable that pattern, or add one for a custom match. <code>header</code> only matches a real header element, banner landmark, or header-* class.</div>
+                  <textarea name="audit_nav_substrings" rows="12" x-ref="navFilters"
+                            data-default="{{.NavSubstrings}}"
+                            :disabled="!audit || mode!=='spider'">{{.NavSubstrings}}</textarea>
+                  <div class="filter-actions">
+                    <button type="button" class="kw-add"
+                            @click="$refs.navFilters.value = $refs.navFilters.dataset.default">Reset navigation list</button>
+                  </div>
+                </div>
+
+                <div class="filter-group">
+                  <label>Excluded widget class filters</label>
+                  <div class="hint">Case-insensitive partial class/id matches for feeds, related content, carousels, and other motion widgets. Remove a line to disable it. Clearing both lists disables every class filter for this run.</div>
+                  <textarea name="audit_exclude_substrings" rows="12" x-ref="excludeFilters"
+                            data-default="{{.ExcludeSubstrings}}"
+                            :disabled="!audit || mode!=='spider'">{{.ExcludeSubstrings}}</textarea>
+                  <div class="filter-actions">
+                    <button type="button" class="kw-add"
+                            @click="$refs.excludeFilters.value = $refs.excludeFilters.dataset.default">Reset excluded list</button>
+                  </div>
+                </div>
+
+                <input type="hidden" name="audit_filters_explicit" value="1"
+                       :disabled="!audit || mode!=='spider'">
+              </div>
+            </div>
+
+            <button type="submit" class="btn-run">Run Crawl</button>
+          </form>
+        </div>
+
+        <div id="jobs"></div>
       </div>
-
-      <input type="hidden" name="mode" :value="mode">
-
-      <div class="field" x-show="mode==='spider'">
-        <label>Starting URL</label>
-        <input type="text" name="startUrl" placeholder="https://example.com" :required="mode==='spider'">
-      </div>
-
-      <div class="field" x-show="mode==='list'" x-cloak>
-        <label>URLs <small>(one per line)</small></label>
-        <textarea name="urls" rows="6" placeholder="https://example.com&#10;https://example.com/about&#10;https://other-site.com" :required="mode==='list'"></textarea>
-      </div>
-
-      <div class="field">
-        <label>Keywords <small>(optional)</small></label>
-        <div class="hint">Counts how many times each keyword appears in the HTML of every crawled page. Results appear as extra columns in the CSV.</div>
-        <template x-for="(kw, i) in keywords" :key="i">
-          <div class="kw-row">
-            <input type="text" x-model="keywords[i]" placeholder="keyword" style="margin-bottom:0">
-            <button type="button" class="kw-remove" @click="keywords.splice(i,1)" x-show="keywords.length > 1">&times;</button>
-          </div>
-        </template>
-        <button type="button" class="kw-add" @click="keywords.push('')">+ Add keyword</button>
-        <input type="hidden" name="keywords" :value="keywords.filter(k => k.trim()).join('|')">
-      </div>
-
-      <div class="field">
-        <label>Concurrency</label>
-        <input type="number" name="concurrency" value="10" min="1" max="50">
-      </div>
-
-      <button type="submit" class="btn-run">Run Crawl</button>
-    </form>
+    </div>
   </div>
-
-  <div id="jobs"></div>
 </div>
 </body>
 </html>

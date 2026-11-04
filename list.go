@@ -18,7 +18,7 @@ func runList(urls []string, s WizardSettings, onProgress progressFunc) ([]Page, 
 
 	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
 	attachHTTPTiming(c, starts)
-	attachPageRecording(c, starts, nil, store, s.KeywordsRaw, onProgress)
+	attachPageRecording(c, starts, nil, store, s.KeywordsRaw, onProgress, nil)
 
 	for _, u := range urls {
 		if err := c.Visit(u); err != nil {

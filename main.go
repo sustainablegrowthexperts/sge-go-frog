@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	auditpkg "go-frog/internal/audit"
 )
 
 const defaultConcurrency = 10
@@ -19,7 +21,15 @@ type WizardSettings struct {
 	KeywordsRaw string
 	Concurrency int
 	ProxyURL    string // optional HTTP proxy (empty = env / none)
-	listURLs    []string
+
+	// Audit is opt-in and spider-only. When true, the crawl also writes a
+	// self-contained HTML archive to AuditArchiveDir for the internal-link
+	// auditor. Existing CSV and page-row behavior is unchanged.
+	Audit           bool
+	AuditArchiveDir string
+	AuditFilters    *auditpkg.FilterOptions
+
+	listURLs []string
 }
 
 func main() {
