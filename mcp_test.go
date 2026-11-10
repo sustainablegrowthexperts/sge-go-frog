@@ -5500,3 +5500,495 @@ func TestStructuredLoggingLimits(t *testing.T) {
 	}
 	findTestLogRecord(t, records, "mcp tool call", map[string]any{"tool": "list_jobs", "outcome": "error", "error_code": codeLimitExceeded})
 }
+
+// goldenAnnotations is the expected hint set for one tool. A nil Destructive
+// means the tool does not publish the hint at all.
+type goldenAnnotations struct {
+	readOnly    bool
+	idempotent  bool
+	openWorld   bool
+	destructive *bool
+}
+
+// goldenField describes one expected input-schema property. The zero value
+// means "presence only"; every field that is set is asserted.
+type goldenField struct {
+	kind        string
+	itemKind    string
+	enum        []string
+	enumOnItems bool
+	defaultVal  any
+	hasDefault  bool
+	anyOf       []goldenField
+	fields      map[string]goldenField
+}
+
+// goldenTool is the hard-coded public contract for one tool. It is intentionally
+// separate from the implementation constants so a changed name, hint, field, or
+// enum value fails loudly here.
+type goldenTool struct {
+	name        string
+	annotations goldenAnnotations
+	required    []string
+	fields      map[string]goldenField
+}
+
+func stringEnum(values ...string) goldenField {
+	return goldenField{kind: "string", enum: values}
+}
+
+func stringField() goldenField { return goldenField{kind: "string"} }
+
+func intField() goldenField { return goldenField{kind: "integer"} }
+
+func boolField() goldenField { return goldenField{kind: "boolean"} }
+
+func stringArray() goldenField {
+	return goldenField{kind: "array", itemKind: "string"}
+}
+
+// withDefault marks a golden field as having the documented JSON Schema default.
+func withDefault(field goldenField, value any) goldenField {
+	field.defaultVal = value
+	field.hasDefault = true
+	return field
+}
+
+func intArray() goldenField {
+	return goldenField{kind: "array", itemKind: "integer"}
+}
+
+// schemaProperties extracts the properties object from a client-decoded tool
+// schema. The SDK returns map[string]any over the wire.
+func schemaProperties(t *testing.T, path string, schema any) map[string]any {
+	t.Helper()
+	obj, ok := schema.(map[string]any)
+	if !ok {
+		t.Fatalf("%s = %T, want an object", path, schema)
+	}
+	props, ok := obj["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s.properties = %T, want an object", path, obj["properties"])
+	}
+	return props
+}
+
+// schemaTypeNames flattens the string-or-array "type" keyword. The inference
+// library emits ["null", "array"] for optional slices.
+func schemaTypeNames(raw any) []string {
+	switch v := raw.(type) {
+	case string:
+		return []string{v}
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return slices.Clone(v)
+	default:
+		return nil
+	}
+}
+
+func schemaHasType(t *testing.T, path string, schema map[string]any, want string) {
+	t.Helper()
+	for _, got := range schemaTypeNames(schema["type"]) {
+		if got == want {
+			return
+		}
+	}
+	t.Fatalf("%s.type = %v, want %q", path, schema["type"], want)
+}
+
+func schemaEnum(t *testing.T, path string, schema map[string]any) []string {
+	t.Helper()
+	items, ok := schema["enum"].([]any)
+	if !ok {
+		t.Fatalf("%s.enum = %T, want an array", path, schema["enum"])
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			t.Fatalf("%s.enum contains %v (%T), want strings", path, item, item)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func assertStringSet(t *testing.T, path string, got, want []string) {
+	t.Helper()
+	gotCopy := slices.Clone(got)
+	wantCopy := slices.Clone(want)
+	slices.Sort(gotCopy)
+	slices.Sort(wantCopy)
+	if !slices.Equal(gotCopy, wantCopy) {
+		t.Fatalf("%s = %v, want %v", path, got, want)
+	}
+}
+
+func assertJSONEqual(t *testing.T, path string, got, want any) {
+	t.Helper()
+	gotJSON, gotErr := json.Marshal(got)
+	wantJSON, wantErr := json.Marshal(want)
+	if gotErr != nil || wantErr != nil {
+		t.Fatalf("%s: marshal got/want: %v / %v", path, gotErr, wantErr)
+	}
+	if !bytes.Equal(gotJSON, wantJSON) {
+		t.Fatalf("%s = %s, want %s", path, gotJSON, wantJSON)
+	}
+}
+
+// assertGoldenField checks exactly the parts of a property schema covered by
+// the golden description.
+func assertGoldenField(t *testing.T, path string, schema map[string]any, want goldenField) {
+	t.Helper()
+
+	if want.kind != "" {
+		schemaHasType(t, path, schema, want.kind)
+	}
+	if want.itemKind != "" {
+		items, ok := schema["items"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s.items = %T, want an object", path, schema["items"])
+		}
+		schemaHasType(t, path+".items", items, want.itemKind)
+	}
+	if want.enum != nil {
+		enumSchema := schema
+		enumPath := path
+		if want.enumOnItems {
+			items, ok := schema["items"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s.items = %T, want an object", path, schema["items"])
+			}
+			enumSchema = items
+			enumPath = path + ".items"
+		}
+		assertStringSet(t, enumPath+".enum", schemaEnum(t, enumPath, enumSchema), want.enum)
+	}
+	if want.hasDefault {
+		assertJSONEqual(t, path+".default", schema["default"], want.defaultVal)
+	}
+	if len(want.anyOf) > 0 {
+		branches, ok := schema["anyOf"].([]any)
+		if !ok {
+			t.Fatalf("%s.anyOf = %T, want an array", path, schema["anyOf"])
+		}
+		if len(branches) != len(want.anyOf) {
+			t.Fatalf("%s.anyOf has %d branches, want %d", path, len(branches), len(want.anyOf))
+		}
+		for i, branchWant := range want.anyOf {
+			branch, ok := branches[i].(map[string]any)
+			if !ok {
+				t.Fatalf("%s.anyOf[%d] = %T, want an object", path, i, branches[i])
+			}
+			assertGoldenField(t, fmt.Sprintf("%s.anyOf[%d]", path, i), branch, branchWant)
+		}
+	}
+	if want.fields != nil {
+		props, ok := schema["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s.properties = %T, want an object", path, schema["properties"])
+		}
+		gotNames := make([]string, 0, len(props))
+		for name := range props {
+			gotNames = append(gotNames, name)
+		}
+		wantNames := make([]string, 0, len(want.fields))
+		for name := range want.fields {
+			wantNames = append(wantNames, name)
+		}
+		assertStringSet(t, path+".properties", gotNames, wantNames)
+		for name, fieldWant := range want.fields {
+			fieldSchema, ok := props[name].(map[string]any)
+			if !ok {
+				t.Fatalf("%s.properties.%s = %T, want an object", path, name, props[name])
+			}
+			assertGoldenField(t, path+".properties."+name, fieldSchema, fieldWant)
+		}
+	}
+}
+
+// TestToolSchemasGolden locks the seven-tool v1 contract: exact names and
+// count, annotations, input-schema fields and enums, required properties, and
+// serverInfo metadata. A failure names the exact tool and schema path.
+func TestToolSchemasGolden(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+	t.Run("initialize advertises name, build version, and tool-schema version", func(t *testing.T) {
+		init := session.InitializeResult()
+		if init == nil || init.ServerInfo == nil {
+			t.Fatal("initialize result is missing serverInfo")
+		}
+		if init.ServerInfo.Name != "go-frog" {
+			t.Fatalf("serverInfo.name = %q, want %q", init.ServerInfo.Name, "go-frog")
+		}
+		const wantVersion = "0.1.0+mcp.1.0.0"
+		if init.ServerInfo.Version != wantVersion {
+			t.Fatalf("serverInfo.version = %q, want %q", init.ServerInfo.Version, wantVersion)
+		}
+		if init.Capabilities == nil {
+			t.Fatal("initialize result is missing capabilities")
+		}
+		if init.Capabilities.Resources != nil {
+			t.Fatalf("resources capability = %+v, want nil (v1 exposes no resources)", init.Capabilities.Resources)
+		}
+		if init.Capabilities.Prompts != nil {
+			t.Fatalf("prompts capability = %+v, want nil (v1 exposes no prompts)", init.Capabilities.Prompts)
+		}
+	})
+
+	t.Run("structured logs carry the build and tool-schema versions", func(t *testing.T) {
+		var buf bytes.Buffer
+		newStructuredLogger(&buf, "json").Info("schema identity")
+		var record map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &record); err != nil {
+			t.Fatalf("decode log record: %v", err)
+		}
+		if record["service"] != "go-frog" {
+			t.Fatalf("log service = %v, want go-frog", record["service"])
+		}
+		if record["version"] != "0.1.0+mcp.1.0.0" {
+			t.Fatalf("log version = %v, want 0.1.0+mcp.1.0.0", record["version"])
+		}
+		if record["mcp_schema_version"] != "1.0.0" {
+			t.Fatalf("log mcp_schema_version = %v, want 1.0.0", record["mcp_schema_version"])
+		}
+	})
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+
+	wantNames := []string{
+		"start_crawl",
+		"get_job",
+		"list_jobs",
+		"get_results",
+		"search_pages",
+		"get_audit",
+		"get_artifact",
+	}
+	gotNames := make([]string, 0, len(tools.Tools))
+	byName := make(map[string]*mcp.Tool, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		gotNames = append(gotNames, tool.Name)
+		byName[tool.Name] = tool
+	}
+	if len(gotNames) != len(wantNames) {
+		t.Fatalf("tools/list count = %d (%v), want %d", len(gotNames), gotNames, len(wantNames))
+	}
+	assertStringSet(t, "tools/list names", gotNames, wantNames)
+
+	destructiveFalse := false
+	readOnly := goldenAnnotations{readOnly: true, idempotent: true, openWorld: false}
+	// job_id, pattern, and kind are required by the handlers but stay out of the
+	// schema's required list: the SDK validates before the tool wrapper, and the
+	// shared rate limiter, logger, and stable field-named invalid_argument
+	// envelope must still run for a missing value.
+	goldens := []goldenTool{
+		{
+			name: "start_crawl",
+			annotations: goldenAnnotations{
+				readOnly:    false,
+				idempotent:  false,
+				openWorld:   true,
+				destructive: &destructiveFalse,
+			},
+			required: []string{"mode"},
+			fields: map[string]goldenField{
+				"mode":         stringEnum("spider", "list"),
+				"start_url":    stringField(),
+				"urls":         stringArray(),
+				"keywords":     stringArray(),
+				"concurrency":  withDefault(intField(), 10),
+				"audit":        boolField(),
+				"archive_html": boolField(),
+				"audit_filters": {
+					kind: "object",
+					fields: map[string]goldenField{
+						"nav_substrings":     stringArray(),
+						"exclude_substrings": stringArray(),
+						"explicit":           boolField(),
+					},
+				},
+				"limits": {
+					kind: "object",
+					fields: map[string]goldenField{
+						"max_pages":            intField(),
+						"max_depth":            intField(),
+						"max_duration_seconds": intField(),
+					},
+				},
+				"client_request_id": stringField(),
+			},
+		},
+		{
+			name:        "get_job",
+			annotations: readOnly,
+			required:    nil,
+			fields: map[string]goldenField{
+				"job_id": stringField(),
+			},
+		},
+		{
+			name:        "list_jobs",
+			annotations: readOnly,
+			required:    nil,
+			fields: map[string]goldenField{
+				"status": stringEnum("queued", "running", "done", "error", "cancelled"),
+				"mode":   stringEnum("spider", "list"),
+				"limit":  withDefault(intField(), 20),
+				"offset": withDefault(intField(), 0),
+			},
+		},
+		{
+			name:        "get_results",
+			annotations: readOnly,
+			required:    nil,
+			fields: map[string]goldenField{
+				"job_id": stringField(),
+				"status_code": {
+					anyOf: []goldenField{
+						intField(),
+						intArray(),
+					},
+				},
+				"url_contains":     stringField(),
+				"title_contains":   stringField(),
+				"keyword":          stringField(),
+				"min_keyword_hits": intField(),
+				"sort":             stringEnum("url", "status_code", "load_time", "keyword_hits"),
+				"order":            stringEnum("asc", "desc"),
+				"include_audit":    boolField(),
+				"offset":           withDefault(intField(), 0),
+				"limit":            withDefault(intField(), 100),
+			},
+		},
+		{
+			name:        "search_pages",
+			annotations: readOnly,
+			required:    nil,
+			fields: map[string]goldenField{
+				"job_id":         stringField(),
+				"pattern":        stringField(),
+				"regex":          boolField(),
+				"case_sensitive": withDefault(boolField(), false),
+				"scope": withDefault(goldenField{
+					kind:        "array",
+					itemKind:    "string",
+					enum:        []string{"metadata", "html", "text", "all"},
+					enumOnItems: true,
+				}, []string{"metadata"}),
+				"context_chars":        withDefault(intField(), 120),
+				"offset":               withDefault(intField(), 0),
+				"limit":                withDefault(intField(), 50),
+				"max_matches_per_page": withDefault(intField(), 100),
+			},
+		},
+		{
+			name:        "get_audit",
+			annotations: readOnly,
+			required:    nil,
+			fields: map[string]goldenField{
+				"job_id":  stringField(),
+				"profile": withDefault(stringEnum("strict", "inclusive"), "strict"),
+				"section": withDefault(stringEnum("summary", "pages", "links", "blocks", "anchors", "pagerank", "redirects", "failed", "sitemap", "structure", "all"), "summary"),
+				"sort":    stringField(),
+				"filter": {
+					kind: "object",
+				},
+				"offset": withDefault(intField(), 0),
+				"limit":  withDefault(intField(), 100),
+			},
+		},
+		{
+			name:        "get_artifact",
+			annotations: readOnly,
+			required:    nil,
+			fields: map[string]goldenField{
+				"job_id": stringField(),
+				"kind":   stringEnum("csv", "audit_strict_zip", "audit_inclusive_zip", "audit_json_strict", "audit_json_inclusive"),
+				"inline": boolField(),
+			},
+		},
+	}
+
+	for _, golden := range goldens {
+		golden := golden
+		t.Run(golden.name, func(t *testing.T) {
+			tool, ok := byName[golden.name]
+			if !ok {
+				t.Fatalf("tool %q is missing", golden.name)
+			}
+			if strings.TrimSpace(tool.Description) == "" {
+				t.Fatalf("%s.description is empty", golden.name)
+			}
+			if tool.Annotations == nil {
+				t.Fatalf("%s.annotations is nil", golden.name)
+			}
+			if tool.Annotations.ReadOnlyHint != golden.annotations.readOnly {
+				t.Fatalf("%s.annotations.readOnlyHint = %t, want %t", golden.name, tool.Annotations.ReadOnlyHint, golden.annotations.readOnly)
+			}
+			if tool.Annotations.IdempotentHint != golden.annotations.idempotent {
+				t.Fatalf("%s.annotations.idempotentHint = %t, want %t", golden.name, tool.Annotations.IdempotentHint, golden.annotations.idempotent)
+			}
+			if tool.Annotations.OpenWorldHint == nil {
+				t.Fatalf("%s.annotations.openWorldHint is nil, want %t", golden.name, golden.annotations.openWorld)
+			}
+			if *tool.Annotations.OpenWorldHint != golden.annotations.openWorld {
+				t.Fatalf("%s.annotations.openWorldHint = %t, want %t", golden.name, *tool.Annotations.OpenWorldHint, golden.annotations.openWorld)
+			}
+			switch {
+			case golden.annotations.destructive == nil && tool.Annotations.DestructiveHint != nil:
+				t.Fatalf("%s.annotations.destructiveHint = %t, want the hint omitted", golden.name, *tool.Annotations.DestructiveHint)
+			case golden.annotations.destructive != nil && tool.Annotations.DestructiveHint == nil:
+				t.Fatalf("%s.annotations.destructiveHint is nil, want %t", golden.name, *golden.annotations.destructive)
+			case golden.annotations.destructive != nil && *tool.Annotations.DestructiveHint != *golden.annotations.destructive:
+				t.Fatalf("%s.annotations.destructiveHint = %t, want %t", golden.name, *tool.Annotations.DestructiveHint, *golden.annotations.destructive)
+			}
+
+			schema, ok := tool.InputSchema.(map[string]any)
+			if !ok {
+				t.Fatalf("%s.inputSchema = %T, want an object", golden.name, tool.InputSchema)
+			}
+			props := schemaProperties(t, golden.name+".inputSchema", schema)
+			gotFieldNames := make([]string, 0, len(props))
+			for name := range props {
+				gotFieldNames = append(gotFieldNames, name)
+			}
+			wantFieldNames := make([]string, 0, len(golden.fields))
+			for name := range golden.fields {
+				wantFieldNames = append(wantFieldNames, name)
+			}
+			assertStringSet(t, golden.name+".inputSchema.properties", gotFieldNames, wantFieldNames)
+
+			rawRequired, _ := schema["required"].([]any)
+			gotRequired := make([]string, 0, len(rawRequired))
+			for _, item := range rawRequired {
+				if name, ok := item.(string); ok {
+					gotRequired = append(gotRequired, name)
+				}
+			}
+			assertStringSet(t, golden.name+".inputSchema.required", gotRequired, golden.required)
+
+			for fieldName, fieldWant := range golden.fields {
+				fieldSchema, ok := props[fieldName].(map[string]any)
+				if !ok {
+					t.Fatalf("%s.inputSchema.properties.%s = %T, want an object", golden.name, fieldName, props[fieldName])
+				}
+				assertGoldenField(t, golden.name+".inputSchema.properties."+fieldName, fieldSchema, fieldWant)
+			}
+		})
+	}
+}

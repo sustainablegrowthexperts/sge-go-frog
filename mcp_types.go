@@ -9,6 +9,8 @@ import (
 	"unicode/utf8"
 
 	auditpkg "go-frog/internal/audit"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // Stable MCP tool error codes. Clients switch on these values, so they are part
@@ -122,10 +124,14 @@ const (
 	jobStatusCancelled = "cancelled"
 )
 
+// crawlModes is the accepted crawl mode set shared by start_crawl and the
+// list_jobs mode filter.
+var crawlModes = []string{"spider", "list"}
+
 // listJobStatuses and listJobModes are the accepted list_jobs filter values.
 var (
 	listJobStatuses = []string{jobStatusQueued, jobStatusRunning, jobStatusDone, jobStatusError, jobStatusCancelled}
-	listJobModes    = []string{"spider", "list"}
+	listJobModes    = crawlModes
 )
 
 // list_jobs pagination defaults.
@@ -717,4 +723,124 @@ type getJobOutput struct {
 	Audit        getJobAudit     `json:"audit"`
 	Error        *string         `json:"error"`
 	Artifacts    getJobArtifacts `json:"artifacts"`
+}
+
+// MCP tool input schema catalog.
+//
+// The SDK normally infers schemas from the input structs. The catalog below
+// starts from that inference (so descriptions and types stay in one place) and
+// adds the contract details JSON Schema inference cannot express: enums,
+// documented defaults, and the required fields the handler also validates.
+// The golden test in mcp_test.go is the only place that hard-codes the expected
+// wire contract; handlers remain authoritative even when the schema is ignored.
+var (
+	startCrawlInputSchema = mcpInputSchema[startCrawlInput](func(schema *jsonschema.Schema) {
+		setSchemaRequired(schema, "mode")
+		setSchemaEnum(schema, "mode", crawlModes)
+		setSchemaDefault(schema, "concurrency", defaultConcurrency)
+	})
+	// Read tools keep job_id/kind/pattern optional in the schema because the
+	// handler validates them to the same envelope, and that validation must
+	// still run so tool calls are rate-limited and logged.
+	getJobInputSchema   = mcpInputSchema[getJobInput](nil)
+	listJobsInputSchema = mcpInputSchema[listJobsInput](func(schema *jsonschema.Schema) {
+		setSchemaEnum(schema, "status", listJobStatuses)
+		setSchemaEnum(schema, "mode", listJobModes)
+		setSchemaDefault(schema, "limit", defaultListJobsLimit)
+		setSchemaDefault(schema, "offset", 0)
+	})
+	getResultsInputSchema = mcpInputSchema[getResultsInput](func(schema *jsonschema.Schema) {
+		setSchemaEnum(schema, "sort", getResultsSorts)
+		setSchemaEnum(schema, "order", getResultsOrders)
+		setSchemaDefault(schema, "sort", "url")
+		setSchemaDefault(schema, "offset", 0)
+		setSchemaDefault(schema, "limit", defaultGetResultsLimit)
+		// status_code accepts one integer or an array of integers.
+		schemaProperty(schema, "status_code").AnyOf = []*jsonschema.Schema{
+			{Type: "integer"},
+			{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
+		}
+	})
+	searchPagesInputSchema = mcpInputSchema[searchPagesInput](func(schema *jsonschema.Schema) {
+		setSchemaItemEnum(schema, "scope", searchScopes)
+		setSchemaDefault(schema, "case_sensitive", false)
+		setSchemaDefault(schema, "scope", []string{"metadata"})
+		setSchemaDefault(schema, "context_chars", defaultSearchContextChars)
+		setSchemaDefault(schema, "offset", 0)
+		setSchemaDefault(schema, "limit", defaultSearchLimit)
+		setSchemaDefault(schema, "max_matches_per_page", defaultSearchMatchesPerPage)
+	})
+	getAuditInputSchema = mcpInputSchema[getAuditInput](func(schema *jsonschema.Schema) {
+		setSchemaEnum(schema, "profile", getAuditProfiles)
+		setSchemaEnum(schema, "section", getAuditSections)
+		setSchemaDefault(schema, "profile", "strict")
+		setSchemaDefault(schema, "section", "summary")
+		setSchemaDefault(schema, "offset", 0)
+		setSchemaDefault(schema, "limit", defaultGetAuditLimit)
+	})
+	getArtifactInputSchema = mcpInputSchema[getArtifactInput](func(schema *jsonschema.Schema) {
+		setSchemaEnum(schema, "kind", getArtifactKinds)
+	})
+)
+
+// mcpInputSchema infers an object schema and applies contract-only details.
+func mcpInputSchema[T any](configure func(*jsonschema.Schema)) *jsonschema.Schema {
+	schema, err := jsonschema.For[T](nil)
+	if err != nil {
+		panic(fmt.Sprintf("infer MCP input schema: %v", err))
+	}
+	if configure != nil {
+		configure(schema)
+	}
+	return schema
+}
+
+// schemaProperty returns one named property of an inferred object schema.
+func schemaProperty(schema *jsonschema.Schema, name string) *jsonschema.Schema {
+	property := schema.Properties[name]
+	if property == nil {
+		panic(fmt.Sprintf("MCP input schema has no property %q", name))
+	}
+	return property
+}
+
+// schemaEnumValues converts a string allowlist into JSON Schema enum values.
+func schemaEnumValues(values []string) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
+}
+
+// setSchemaEnum publishes an allowlist for one string property.
+func setSchemaEnum(schema *jsonschema.Schema, name string, values []string) {
+	schemaProperty(schema, name).Enum = schemaEnumValues(values)
+}
+
+// setSchemaItemEnum publishes an allowlist for the items of one array property.
+func setSchemaItemEnum(schema *jsonschema.Schema, name string, values []string) {
+	items := schemaProperty(schema, name).Items
+	if items == nil {
+		panic(fmt.Sprintf("MCP input schema property %q has no item schema", name))
+	}
+	items.Enum = schemaEnumValues(values)
+}
+
+// setSchemaDefault publishes a documented default. The SDK applies defaults
+// before validation and handler execution, so the value must match the handler
+// default exactly.
+func setSchemaDefault(schema *jsonschema.Schema, name string, value any) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(fmt.Sprintf("encode MCP input default %q: %v", name, err))
+	}
+	schemaProperty(schema, name).Default = encoded
+}
+
+// setSchemaRequired replaces the inferred required list. Handlers still
+// validate these fields so a client that ignores the schema gets the same
+// stable error envelope.
+func setSchemaRequired(schema *jsonschema.Schema, names ...string) {
+	schema.Required = append([]string(nil), names...)
 }

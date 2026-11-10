@@ -18,9 +18,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// Tested MCP protocol revision: 2025-06-18, negotiated by the pinned
+// modelcontextprotocol/go-sdk v1.8.0. Server metadata exposes the go-frog build
+// version plus the independent MCP tool-schema version; archive and audit
+// artifact versions intentionally do not share this value.
 const (
-	mcpServerName    = "go-frog"
-	mcpServerVersion = "0.1.0"
+	mcpServerName        = "go-frog"
+	mcpBuildVersion      = "0.1.0"
+	mcpToolSchemaVersion = "1.0.0"
+	mcpServerVersion     = mcpBuildVersion + "+mcp." + mcpToolSchemaVersion
 )
 
 // mcpServer is the thin adapter around the official MCP Go SDK. SDK types and
@@ -56,7 +62,11 @@ func newStructuredLogger(out io.Writer, format string) *slog.Logger {
 	} else {
 		handler = slog.NewTextHandler(out, opts)
 	}
-	return slog.New(handler).With("service", mcpServerName, "version", mcpServerVersion)
+	return slog.New(handler).With(
+		"service", mcpServerName,
+		"version", mcpServerVersion,
+		"mcp_schema_version", mcpToolSchemaVersion,
+	)
 }
 
 // loggerOr returns a usable logger for zero-value or test-constructed servers.
@@ -172,6 +182,19 @@ func newMCPServer(jm *jobManager, cfg MCPConfig, runner crawlRunner, policy *ssr
 // middleware is the only place those failures can be normalized.
 func normalizeSDKValidationErrors(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		// A client may send "arguments": null for a tool whose fields are all
+		// optional. The SDK then applies schema defaults to a nil map and panics
+		// while writing the first default. Treat it as an empty object, which is
+		// the same meaning the handler gives omitted arguments.
+		if method == "tools/call" {
+			if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil {
+				args := bytes.TrimSpace(call.Params.Arguments)
+				if len(args) == 0 || bytes.Equal(args, []byte("null")) {
+					call.Params.Arguments = json.RawMessage(`{}`)
+				}
+			}
+		}
+
 		result, err := next(ctx, method, req)
 		if err != nil || method != "tools/call" {
 			return result, err
@@ -210,7 +233,12 @@ func isStableToolErrorText(text string) bool {
 // both become a field-named invalid_argument.
 func normalizeToolValidationError(text string) *toolError {
 	field := "arguments"
-	if idx := strings.Index(text, "unexpected additional properties ["); idx >= 0 {
+	if idx := strings.Index(text, "required: missing properties: ["); idx >= 0 {
+		rest := strings.TrimLeft(text[idx+len("required: missing properties: ["):], `"`)
+		if end := strings.IndexAny(rest, `",]`); end > 0 {
+			field = rest[:end]
+		}
+	} else if idx := strings.Index(text, "unexpected additional properties ["); idx >= 0 {
 		rest := strings.TrimLeft(text[idx+len("unexpected additional properties ["):], `"`)
 		if end := strings.IndexAny(rest, `",]`); end > 0 {
 			field = rest[:end]

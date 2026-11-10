@@ -1,7 +1,7 @@
 ---
 id: task-021
 title: "[Slice] MCP publishes a stable seven-tool schema contract"
-status: pending
+status: completed
 depends_on: ["task-020"]
 target_files:
   - "mcp_tools.go"

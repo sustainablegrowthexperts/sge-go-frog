@@ -26,66 +26,73 @@ func (s *mcpServer) registerTools() {
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "start_crawl",
 		Description: "Start an asynchronous spider or list crawl with optional keywords, audit, and per-job limits; returns a job ID for polling with get_job.",
+		Annotations: startCrawlAnnotations(),
+		InputSchema: startCrawlInputSchema,
 	}, wrapMCPTool(s, "start_crawl", s.startCrawl))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_job",
 		Description: "Poll an MCP-created job for status, phase, progress, limits, audit state, and artifact readiness.",
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-		},
+		Annotations: readOnlyToolAnnotations(),
+		InputSchema: getJobInputSchema,
 	}, wrapMCPTool(s, "get_job", s.getJob))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "list_jobs",
 		Description: "List MCP-created jobs newest first, optionally filtered by status and mode and paginated with limit/offset.",
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-			OpenWorldHint:  boolPtr(false),
-		},
+		Annotations: readOnlyToolAnnotations(),
+		InputSchema: listJobsInputSchema,
 	}, wrapMCPTool(s, "list_jobs", s.listJobs))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_results",
 		Description: "Retrieve filtered, sorted, and paginated page rows for a completed MCP job, with keyword counts, summary counts, optional manifest depth, and an optional strict-audit join.",
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-			OpenWorldHint:  boolPtr(false),
-		},
+		Annotations: readOnlyToolAnnotations(),
+		InputSchema: getResultsInputSchema,
 	}, wrapMCPTool(s, "get_results", s.getResults))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "search_pages",
 		Description: "Search crawled page metadata without an archive, or archived raw HTML and visible text when the job used audit=true or archive_html=true. Supports literal and RE2 regex patterns, case sensitivity, snippets, pagination, and server caps.",
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-			OpenWorldHint:  boolPtr(false),
-		},
+		Annotations: readOnlyToolAnnotations(),
+		InputSchema: searchPagesInputSchema,
 	}, wrapMCPTool(s, "search_pages", s.searchPages))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_audit",
 		Description: "Read a strict or inclusive audit section for a completed MCP job. Sections include summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, and all. links contains content page links only; external, redirect, and excluded rows are available in the audit ZIP artifact.",
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-			OpenWorldHint:  boolPtr(false),
-		},
+		Annotations: readOnlyToolAnnotations(),
+		InputSchema: getAuditInputSchema,
 	}, wrapMCPTool(s, "get_audit", s.getAudit))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_artifact",
 		Description: "Get a job-scoped download URL, size, and expiry for a completed MCP job's CSV report, strict/inclusive audit ZIP, or strict/inclusive audit JSON. Set inline=true for small CSV and audit JSON content below the server cap.",
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-			OpenWorldHint:  boolPtr(false),
-		},
+		Annotations: readOnlyToolAnnotations(),
+		InputSchema: getArtifactInputSchema,
 	}, wrapMCPTool(s, "get_artifact", s.getArtifact))
+}
+
+// startCrawlAnnotations marks start_crawl as a non-destructive but non-idempotent
+// operation that reaches open-world targets. The explicit false destructive hint
+// keeps the MCP default (true) from mislabeling crawl creation.
+func startCrawlAnnotations() *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    false,
+		DestructiveHint: boolPtr(false),
+		IdempotentHint:  false,
+		OpenWorldHint:   boolPtr(true),
+	}
+}
+
+// readOnlyToolAnnotations is shared by every polling/read tool so the hint set
+// cannot drift between them.
+func readOnlyToolAnnotations() *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:   true,
+		IdempotentHint: true,
+		OpenWorldHint:  boolPtr(false),
+	}
 }
 
 // wrapMCPTool applies the shared panic boundary and tool-call logging to one
