@@ -749,8 +749,10 @@ func jobStatusSummary(out getJobOutput) string {
 func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, error) {
 	limits := s.config.Limits.withDefaults()
 	mode := strings.TrimSpace(in.Mode)
+	policy := s.ssrfGuard()
 
 	settings := WizardSettings{Concurrency: defaultConcurrency}
+	settings.ssrfPolicy = policy
 	settings.ArchiveHTML = in.ArchiveHTML
 	var target string
 	switch mode {
@@ -762,6 +764,10 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 		if err != nil {
 			return startCrawlPlan{}, err
 		}
+		if err := policy.validateURL(context.Background(), start); err != nil {
+			s.logBlockedTarget(err)
+			return startCrawlPlan{}, blockedTargetError("start_url")
+		}
 		settings.Mode = 1
 		settings.StartURL = start
 		target = start
@@ -772,6 +778,12 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 		urls, err := validateListURLs(in.URLs, limits)
 		if err != nil {
 			return startCrawlPlan{}, err
+		}
+		for i, u := range urls {
+			if err := policy.validateURL(context.Background(), u); err != nil {
+				s.logBlockedTarget(err)
+				return startCrawlPlan{}, blockedTargetError(fmt.Sprintf("urls[%d]", i+1))
+			}
 		}
 		settings.Mode = 2
 		settings.listURLs = urls

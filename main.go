@@ -277,6 +277,10 @@ type WizardSettings struct {
 	AuditFilters    *auditpkg.FilterOptions
 
 	listURLs []string
+
+	// ssrfPolicy is an internal test seam. Production settings leave it nil
+	// and the crawl uses the public-only SSRF policy.
+	ssrfPolicy *ssrfPolicy
 }
 
 func main() {

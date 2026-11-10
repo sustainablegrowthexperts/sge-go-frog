@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
@@ -26,6 +27,10 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 		return nil, fmt.Errorf("URL has no host")
 	}
 	allowedHosts := expandedWWWHostVariants(host)
+	policy := s.ssrfGuard()
+	if err := policy.validateURL(context.Background(), start); err != nil {
+		return nil, fmt.Errorf("starting URL: %w", err)
+	}
 
 	inbound := newInboundTracker()
 	store := &pageStore{}
@@ -56,13 +61,13 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 		// Sitemap discovery stays tied to audit for v1; archive_html alone
 		// does not fetch sitemaps.
 		if s.Audit {
-			discovery := discoverSitemap(root, host, s.ProxyURL)
+			discovery := discoverSitemap(root, host, s.ProxyURL, policy)
 			archive.SetSitemap(discovery.Meta)
 			sitemapPages = discovery.Pages
 		}
 	}
 
-	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
+	c := newCollectorAsync(s.Concurrency, s.ProxyURL, policy)
 	c.AllowedDomains = allowedHosts
 
 	attachHTTPTiming(c, starts)
@@ -93,6 +98,10 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 			return
 		}
 		if !hostMatchesSite(u.Hostname(), host) {
+			return
+		}
+		if err := policy.validateURL(context.Background(), abs); err != nil {
+			logBlockedSSRFTarget(nil, err)
 			return
 		}
 		if archive != nil {
@@ -159,6 +168,10 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 				}
 			}
 			if visited, _ := c.HasVisited(sitemapURL); visited {
+				continue
+			}
+			if err := policy.validateURL(context.Background(), sitemapURL); err != nil {
+				logBlockedSSRFTarget(nil, err)
 				continue
 			}
 			if archive != nil {

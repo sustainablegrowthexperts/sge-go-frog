@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -169,7 +168,7 @@ func pageParentAndInlinks(inbound *inboundTracker, pageURL string) (parentURL, i
 	return inbound.parentAndInlinks(pageURL)
 }
 
-func newCollectorAsync(concurrency int, proxyURL string) *colly.Collector {
+func newCollectorAsync(concurrency int, proxyURL string, policy *ssrfPolicy) *colly.Collector {
 	c := colly.NewCollector(colly.Async(true))
 	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	_ = c.Limit(&colly.LimitRule{
@@ -177,23 +176,11 @@ func newCollectorAsync(concurrency int, proxyURL string) *colly.Collector {
 		Parallelism: concurrency,
 	})
 
-	client := &http.Client{
-		Timeout: 60 * time.Second,
-		// Record 3xx (and other non-follow) responses as their own rows instead of following and
-		// only storing the final 200 target.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	// When proxyURL is set, use it explicitly. When empty, leave Transport nil so
-	// Go's default http.ProxyFromEnvironment picks up HTTPS_PROXY/HTTP_PROXY env vars.
-	if proxyURL != "" {
-		if u, err := url.Parse(proxyURL); err == nil {
-			client.Transport = &http.Transport{
-				Proxy: http.ProxyURL(u),
-			}
-		}
+	client := newSSRFHTTPClient(policy, proxyURL, 60*time.Second)
+	// Record 3xx (and other non-follow) responses as their own rows instead of following and
+	// only storing the final 200 target.
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	c.SetClient(client)

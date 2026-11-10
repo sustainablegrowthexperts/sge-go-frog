@@ -23,23 +23,28 @@ type mcpServer struct {
 	config MCPConfig
 	runner crawlRunner
 	quota  *mcpQuota
+	ssrf   *ssrfPolicy
 }
 
 // newMCPServer builds the MCP server metadata, registers the tools, and wraps
 // the Streamable HTTP handler. The handler is mounted on the existing
 // application mux by newApp.
-func newMCPServer(jm *jobManager, cfg MCPConfig, runner crawlRunner) (*mcpServer, error) {
+func newMCPServer(jm *jobManager, cfg MCPConfig, runner crawlRunner, policy *ssrfPolicy) (*mcpServer, error) {
 	sdkServer := mcp.NewServer(&mcp.Implementation{
 		Name:    mcpServerName,
 		Version: mcpServerVersion,
 	}, nil)
 
+	if policy == nil {
+		policy = newSSRFPolicy()
+	}
 	s := &mcpServer{
 		server: sdkServer,
 		jobs:   jm,
 		config: cfg,
 		runner: runner,
 		quota:  newMCPQuota(cfg.Limits),
+		ssrf:   policy,
 	}
 	s.registerTools()
 

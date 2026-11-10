@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,14 +31,19 @@ type sitemapDiscovery struct {
 }
 
 // discoverSitemap reads robots.txt and sitemap documents for the crawl site.
-// Failures are collected as warnings and never abort the crawl.
-func discoverSitemap(root *url.URL, siteHost, proxyURL string) sitemapDiscovery {
+// Failures are collected as warnings and never abort the crawl. Every fetch
+// goes through the SSRF-validated client, and non-public document or page URLs
+// are skipped.
+func discoverSitemap(root *url.URL, siteHost, proxyURL string, policy *ssrfPolicy) sitemapDiscovery {
 	result := sitemapDiscovery{Meta: auditpkg.SitemapMeta{FetchedAt: time.Now().UTC()}}
 	if root == nil {
 		result.Meta.Warnings = append(result.Meta.Warnings, "sitemap discovery skipped: no start URL")
 		return result
 	}
-	client := newSitemapHTTPClient(proxyURL)
+	if policy == nil {
+		policy = newSSRFPolicy()
+	}
+	client := newSSRFHTTPClient(policy, proxyURL, sitemapRequestTimeout)
 	scheme := strings.ToLower(root.Scheme)
 	if scheme != "http" && scheme != "https" {
 		scheme = "https"
@@ -47,10 +53,18 @@ func discoverSitemap(root *url.URL, siteHost, proxyURL string) sitemapDiscovery 
 	robotsURL := siteRoot + "/robots.txt"
 	robotsParsed, _ := url.Parse(robotsURL)
 	var sitemapURLs []string
-	if body, status, err := fetchSitemapDocument(client, robotsURL); err != nil {
+	if err := policy.validateURL(context.Background(), robotsURL); err != nil {
+		result.Meta.Warnings = append(result.Meta.Warnings, fmt.Sprintf("robots.txt target blocked by public-target policy (%s)", blockedClass(err)))
+	} else if body, status, err := fetchSitemapDocument(client, robotsURL); err != nil {
 		result.Meta.Warnings = append(result.Meta.Warnings, fmt.Sprintf("robots.txt fetch failed: %v", err))
 	} else if status >= http.StatusOK && status < http.StatusMultipleChoices {
-		sitemapURLs = append(sitemapURLs, auditpkg.ParseRobotsSitemaps(body, robotsParsed)...)
+		for _, sitemapURL := range auditpkg.ParseRobotsSitemaps(body, robotsParsed) {
+			if err := policy.validateURL(context.Background(), sitemapURL); err != nil {
+				result.Meta.Warnings = append(result.Meta.Warnings, "robots.txt sitemap target blocked by public-target policy")
+				continue
+			}
+			sitemapURLs = append(sitemapURLs, sitemapURL)
+		}
 	} else if status >= http.StatusInternalServerError {
 		result.Meta.Warnings = append(result.Meta.Warnings, fmt.Sprintf("robots.txt returned HTTP %d", status))
 	}
@@ -58,6 +72,10 @@ func discoverSitemap(root *url.URL, siteHost, proxyURL string) sitemapDiscovery 
 	if len(sitemapURLs) == 0 {
 		for _, path := range sitemapFallbackPaths {
 			candidate := siteRoot + path
+			if err := policy.validateURL(context.Background(), candidate); err != nil {
+				result.Meta.Warnings = append(result.Meta.Warnings, fmt.Sprintf("sitemap target blocked by public-target policy (%s)", blockedClass(err)))
+				continue
+			}
 			body, status, err := fetchSitemapDocument(client, candidate)
 			if err != nil {
 				result.Meta.Warnings = append(result.Meta.Warnings, fmt.Sprintf("sitemap fetch failed for %s: %v", candidate, err))
@@ -88,6 +106,10 @@ func discoverSitemap(root *url.URL, siteHost, proxyURL string) sitemapDiscovery 
 	}
 	queue := make([]sitemapJob, 0, len(sitemapURLs))
 	for _, sitemapURL := range sitemapURLs {
+		if err := policy.validateURL(context.Background(), sitemapURL); err != nil {
+			result.Meta.Warnings = append(result.Meta.Warnings, "sitemap target blocked by public-target policy")
+			continue
+		}
 		queue = append(queue, sitemapJob{url: sitemapURL, depth: 1})
 	}
 	visited := make(map[string]struct{})
@@ -103,6 +125,10 @@ func discoverSitemap(root *url.URL, siteHost, proxyURL string) sitemapDiscovery 
 			continue
 		}
 		visited[job.url] = struct{}{}
+		if err := policy.validateURL(context.Background(), job.url); err != nil {
+			result.Meta.Warnings = append(result.Meta.Warnings, "sitemap target blocked by public-target policy")
+			continue
+		}
 
 		body, status, err := fetchSitemapDocument(client, job.url)
 		if err != nil {
@@ -124,25 +150,34 @@ func discoverSitemap(root *url.URL, siteHost, proxyURL string) sitemapDiscovery 
 		rawURLs = append(rawURLs, doc.URLs...)
 		if job.depth < sitemapMaxDepth {
 			for _, child := range doc.Sitemaps {
+				if err := policy.validateURL(context.Background(), child); err != nil {
+					result.Meta.Warnings = append(result.Meta.Warnings, "sitemap target blocked by public-target policy")
+					continue
+				}
 				queue = append(queue, sitemapJob{url: child, depth: job.depth + 1})
 			}
 		}
 	}
 
-	result.Pages = auditpkg.FilterSitemapURLs(rawURLs, siteHost)
+	result.Pages = filterPublicSitemapPages(rawURLs, siteHost, policy, &result)
 	result.Meta.URLs = result.Pages
 	result.Meta.URLCount = len(result.Pages)
 	return result
 }
 
-func newSitemapHTTPClient(proxyURL string) *http.Client {
-	client := &http.Client{Timeout: sitemapRequestTimeout}
-	if proxyURL != "" {
-		if parsed, err := url.Parse(proxyURL); err == nil {
-			client.Transport = &http.Transport{Proxy: http.ProxyURL(parsed)}
+// filterPublicSitemapPages applies the existing same-site/asset filter and then
+// drops any discovered page whose host resolves to a non-public address.
+func filterPublicSitemapPages(rawURLs []string, siteHost string, policy *ssrfPolicy, result *sitemapDiscovery) []string {
+	filtered := auditpkg.FilterSitemapURLs(rawURLs, siteHost)
+	out := filtered[:0]
+	for _, page := range filtered {
+		if err := policy.validateURL(context.Background(), page); err != nil {
+			result.Meta.Warnings = append(result.Meta.Warnings, "sitemap page target blocked by public-target policy")
+			continue
 		}
+		out = append(out, page)
 	}
-	return client
+	return out
 }
 
 func fetchSitemapDocument(client *http.Client, rawURL string) ([]byte, int, error) {

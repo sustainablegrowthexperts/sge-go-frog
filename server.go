@@ -1041,6 +1041,9 @@ type appConfig struct {
 	// Runner overrides the real crawl runner. Tests use a fake runner; a nil
 	// value selects the production implementation.
 	Runner crawlRunner
+	// SSRF overrides the public-target policy. Tests use it to reach httptest
+	// loopback servers; production uses the public-only default.
+	SSRF *ssrfPolicy
 }
 
 type app struct {
@@ -1088,7 +1091,7 @@ func newApp(cfg appConfig) (*app, error) {
 
 	a := &app{jobs: jm, runner: runner, handler: mux}
 	if cfg.MCP.Enabled {
-		ms, err := newMCPServer(jm, cfg.MCP, runner)
+		ms, err := newMCPServer(jm, cfg.MCP, runner, cfg.SSRF)
 		if err != nil {
 			return nil, fmt.Errorf("initialize MCP server: %w", err)
 		}

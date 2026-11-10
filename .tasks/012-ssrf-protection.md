@@ -1,7 +1,7 @@
 ---
 id: task-012
 title: "[Slice] MCP crawl targets are restricted to public HTTP(S)"
-status: pending
+status: completed
 depends_on: ["task-011"]
 target_files:
   - "mcp_ssrf.go"

@@ -45,6 +45,7 @@ func TestSpiderAuditArchiveIntegration(t *testing.T) {
 		Concurrency:     2,
 		Audit:           true,
 		AuditArchiveDir: dir,
+		ssrfPolicy:      testSSRFPolicy(),
 	}
 	pages, err := runSpider(settings, nil)
 	if err != nil {

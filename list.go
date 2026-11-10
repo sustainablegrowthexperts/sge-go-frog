@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"net/url"
@@ -14,6 +15,13 @@ import (
 func runList(urls []string, s WizardSettings, onProgress progressFunc) (pages []Page, err error) {
 	if len(urls) == 0 {
 		return nil, fmt.Errorf("no URLs to visit")
+	}
+
+	policy := s.ssrfGuard()
+	for _, u := range urls {
+		if err := policy.validateURL(context.Background(), u); err != nil {
+			return nil, fmt.Errorf("blocked target: %w", err)
+		}
 	}
 
 	store := &pageStore{}
@@ -44,7 +52,7 @@ func runList(urls []string, s WizardSettings, onProgress progressFunc) (pages []
 		}()
 	}
 
-	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
+	c := newCollectorAsync(s.Concurrency, s.ProxyURL, policy)
 	attachHTTPTiming(c, starts)
 	attachPageRecording(c, starts, nil, store, s.KeywordsRaw, onProgress, archive)
 

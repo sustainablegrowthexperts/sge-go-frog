@@ -31,7 +31,7 @@ func newMCPTestSession(t *testing.T, ctx context.Context, cfg MCPConfig, runner 
 	t.Helper()
 
 	cfg.Enabled = true
-	a, err := newApp(appConfig{MCP: cfg, Runner: runner})
+	a, err := newApp(appConfig{MCP: cfg, Runner: runner, SSRF: testSSRFPolicy()})
 	if err != nil {
 		t.Fatalf("newApp: %v", err)
 	}
