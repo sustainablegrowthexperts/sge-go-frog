@@ -1,0 +1,399 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"go-frog/internal/auditbundle"
+)
+
+// csvArtifactName is the on-disk name of the request-time CSV artifact. The
+// public filename keeps the existing timestamp/slug convention.
+const csvArtifactName = "report.csv"
+
+// artifactJobSnapshot is one consistent copy of the job fields the artifact
+// builder needs. It is taken under the job mutex so status, pages, and audit
+// readiness cannot be mixed from different moments.
+type artifactJobSnapshot struct {
+	status         string
+	settings       WizardSettings
+	pages          []Page
+	createdAt      time.Time
+	finishedAt     time.Time
+	auditEnabled   bool
+	strictReady    bool
+	strictDir      string
+	inclusiveReady bool
+	inclusiveDir   string
+}
+
+func (j *crawlJob) artifactSnapshot() artifactJobSnapshot {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return artifactJobSnapshot{
+		status:         j.status,
+		settings:       j.settings,
+		pages:          append([]Page(nil), j.result...),
+		createdAt:      j.createdAt,
+		finishedAt:     j.finishedAt,
+		auditEnabled:   j.settings.Audit,
+		strictReady:    j.auditReady,
+		strictDir:      j.auditDir,
+		inclusiveReady: j.auditInclusiveReady,
+		inclusiveDir:   j.auditInclusiveDir,
+	}
+}
+
+// artifactDescriptor is the resolved on-disk artifact plus the metadata that
+// describes it to the client. path is never returned in a tool response.
+type artifactDescriptor struct {
+	path        string
+	filename    string
+	contentType string
+	url         string
+	inlineable  bool
+}
+
+// auditBundleCacheEntry records the source directory version that produced a
+// cached ZIP. The source directory mtime invalidates the entry when the audit
+// is rewritten.
+type auditBundleCacheEntry struct {
+	dirModTime time.Time
+	path       string
+}
+
+// auditBundleCache is process-wide. The key is job ID plus profile so two jobs
+// or two profiles never contend for one slot.
+var auditBundleCache = struct {
+	sync.Mutex
+	entries map[string]auditBundleCacheEntry
+}{entries: make(map[string]auditBundleCacheEntry)}
+
+// validateGetArtifactInput checks the job ID and kind before any job lookup.
+// Path-like input is rejected as invalid_argument; it is never interpreted as
+// a filesystem path.
+func validateGetArtifactInput(in getArtifactInput) (jobID, kind string, err error) {
+	jobID = strings.TrimSpace(in.JobID)
+	if jobID == "" {
+		return "", "", fmt.Errorf("invalid_argument: job_id is required")
+	}
+	if looksLikeArtifactPath(jobID) {
+		return "", "", fmt.Errorf("invalid_argument: job_id must not be a path")
+	}
+
+	kind = strings.TrimSpace(in.Kind)
+	if kind == "" {
+		return "", "", fmt.Errorf("invalid_argument: kind is required")
+	}
+	if looksLikeArtifactPath(kind) || !slices.Contains(getArtifactKinds, kind) {
+		return "", "", fmt.Errorf("invalid_argument: kind must be one of %s", strings.Join(getArtifactKinds, ", "))
+	}
+	return jobID, kind, nil
+}
+
+// looksLikeArtifactPath reports whether a value could be mistaken for a
+// filesystem path. Generated job IDs and artifact kinds never contain these
+// characters.
+func looksLikeArtifactPath(value string) bool {
+	if value == "" {
+		return false
+	}
+	if strings.ContainsRune(value, 0) || strings.ContainsAny(value, `/\`) {
+		return true
+	}
+	if value == "." || value == ".." || strings.Contains(value, "..") {
+		return true
+	}
+	return filepath.IsAbs(value)
+}
+
+// buildArtifact resolves and measures one artifact for a completed job. CSV is
+// regenerated on every call; ZIPs are cached until the audit directory changes;
+// audit JSON is read directly from the job-owned report directory.
+func (s *mcpServer) buildArtifact(job *crawlJob, kind string, inline bool) (getArtifactOutput, error) {
+	snapshot := job.artifactSnapshot()
+	if snapshot.status != jobStatusDone {
+		return getArtifactOutput{}, fmt.Errorf(
+			"job_not_finished: job %q is %s; artifacts are available only when the job is done",
+			job.id, snapshot.status,
+		)
+	}
+
+	desc, err := s.resolveArtifact(job.id, kind, snapshot)
+	if err != nil {
+		return getArtifactOutput{}, err
+	}
+	info, err := os.Stat(desc.path)
+	if err != nil {
+		return getArtifactOutput{}, artifactUnavailableError(kind, job.id)
+	}
+
+	out := getArtifactOutput{
+		JobID:       job.id,
+		Kind:        kind,
+		Filename:    desc.filename,
+		ContentType: desc.contentType,
+		SizeBytes:   info.Size(),
+		URL:         desc.url,
+		ExpiresAt:   artifactExpiry(s.jobs.retention.withDefaults().MCPTTL, snapshot),
+	}
+	if inline && desc.inlineable && info.Size() <= s.inlineArtifactCap() {
+		data, err := os.ReadFile(desc.path)
+		if err != nil {
+			return getArtifactOutput{}, artifactUnavailableError(kind, job.id)
+		}
+		out.Inline = true
+		out.Content = string(data)
+	}
+	return out, nil
+}
+
+// resolveArtifact maps a whitelisted kind to its job-owned file and metadata.
+// It never accepts a path from the caller.
+func (s *mcpServer) resolveArtifact(jobID, kind string, snapshot artifactJobSnapshot) (artifactDescriptor, error) {
+	slug := sanitizeFileSlug(resultFileSlug(snapshot.settings))
+
+	switch kind {
+	case "csv":
+		path := filepath.Join(s.jobOwnedDir(jobID), csvArtifactName)
+		if err := writeResultsCSVAtomic(path, snapshot.pages, snapshot.settings.KeywordsRaw); err != nil {
+			// Never echo the writer error: it may contain a temporary path.
+			return artifactDescriptor{}, fmt.Errorf("internal_error: could not generate CSV artifact for job %q", jobID)
+		}
+		reportTime := snapshot.finishedAt
+		if reportTime.IsZero() {
+			reportTime = time.Now().UTC()
+		}
+		return artifactDescriptor{
+			path:        path,
+			filename:    filepath.Base(buildResultsFilename(snapshot.settings, reportTime)),
+			contentType: "text/csv",
+			url:         s.artifactURL(jobID, kind),
+			inlineable:  true,
+		}, nil
+
+	case "audit_strict_zip", "audit_inclusive_zip":
+		profile, dir, ready := auditProfileState(kind, snapshot)
+		if !snapshot.auditEnabled || !ready || strings.TrimSpace(dir) == "" {
+			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+		}
+		path, err := s.auditBundlePath(jobID, profile, dir)
+		if err != nil {
+			// Never echo the builder error: it contains the audit directory.
+			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+		}
+		return artifactDescriptor{
+			path:        path,
+			filename:    slug + "-" + profile + "-audit.zip",
+			contentType: "application/zip",
+			url:         s.artifactURL(jobID, kind),
+			inlineable:  false,
+		}, nil
+
+	case "audit_json_strict", "audit_json_inclusive":
+		profile, dir, ready := auditProfileState(kind, snapshot)
+		if !snapshot.auditEnabled || !ready || strings.TrimSpace(dir) == "" {
+			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+		}
+		clean, err := cleanArtifactDirectory(dir)
+		if err != nil {
+			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+		}
+		path := filepath.Join(clean, strictAuditFileName)
+		if info, err := os.Stat(path); err != nil || info.IsDir() {
+			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+		}
+		return artifactDescriptor{
+			path:        path,
+			filename:    slug + "-" + profile + "-audit.json",
+			contentType: "application/json",
+			url:         s.artifactURL(jobID, kind),
+			inlineable:  true,
+		}, nil
+	}
+
+	return artifactDescriptor{}, fmt.Errorf("invalid_argument: kind must be one of %s", strings.Join(getArtifactKinds, ", "))
+}
+
+// auditProfileState maps a kind to its profile, directory, and readiness flag.
+func auditProfileState(kind string, snapshot artifactJobSnapshot) (profile, dir string, ready bool) {
+	if strings.Contains(kind, "inclusive") {
+		return "inclusive", snapshot.inclusiveDir, snapshot.inclusiveReady
+	}
+	return "strict", snapshot.strictDir, snapshot.strictReady
+}
+
+// auditNotAvailableError is the shared audit artifact error. It deliberately
+// omits the on-disk directory.
+func auditNotAvailableError(kind, jobID string) error {
+	return fmt.Errorf("audit_not_available: %s is not available for job %q", kind, jobID)
+}
+
+// artifactUnavailableError describes a missing artifact without leaking a path.
+func artifactUnavailableError(kind, jobID string) error {
+	if strings.HasPrefix(kind, "audit_") {
+		return auditNotAvailableError(kind, jobID)
+	}
+	return fmt.Errorf("internal_error: %s artifact is missing for job %q", kind, jobID)
+}
+
+// artifactExpiry is the job's retention completion time in RFC 3339 UTC.
+func artifactExpiry(ttl time.Duration, snapshot artifactJobSnapshot) string {
+	anchor := snapshot.finishedAt
+	if anchor.IsZero() {
+		anchor = snapshot.createdAt
+	}
+	if anchor.IsZero() {
+		anchor = time.Now().UTC()
+	}
+	if ttl <= 0 {
+		ttl = defaultMCPJobTTL
+	}
+	return anchor.UTC().Add(ttl).UTC().Format(time.RFC3339)
+}
+
+// inlineArtifactCap returns the configured inline byte cap.
+func (s *mcpServer) inlineArtifactCap() int64 {
+	return s.config.Limits.withDefaults().MaxInlineArtifactBytes
+}
+
+// artifactURL builds the job-scoped download URL. It reuses the start_crawl
+// link builders for the artifacts the web server already serves and adds the
+// audit JSON paths behind the same authenticated deployment.
+func (s *mcpServer) artifactURL(jobID, kind string) string {
+	links := jobLinks(s.config, jobID)
+	base := strings.TrimRight(strings.TrimSpace(s.config.ArtifactBaseURL), "/")
+	crawlPath := base + "/api/crawl/" + jobID
+	switch kind {
+	case "csv":
+		return links.CSV
+	case "audit_strict_zip":
+		return links.AuditStrictZIP
+	case "audit_inclusive_zip":
+		return links.AuditInclusiveZIP
+	case "audit_json_strict":
+		return crawlPath + "/audit/audit.json"
+	case "audit_json_inclusive":
+		return crawlPath + "/audit/inclusive/audit.json"
+	}
+	return ""
+}
+
+// jobOwnedDir returns the validated per-job directory below the configured
+// results directory. It is never exposed to MCP clients.
+func (s *mcpServer) jobOwnedDir(jobID string) string {
+	resultsDir := strings.TrimSpace(s.config.ResultsDir)
+	if resultsDir == "" {
+		resultsDir = defaultMCPResultsDir
+	}
+	return filepath.Join(resultsDir, "jobs", jobID)
+}
+
+// cleanArtifactDirectory validates a job-owned directory before it is used.
+// The path never comes from a client, but malformed persisted state is still
+// rejected rather than followed.
+func cleanArtifactDirectory(dir string) (string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" || strings.ContainsRune(dir, 0) {
+		return "", fmt.Errorf("directory is invalid")
+	}
+	clean := filepath.Clean(dir)
+	if clean == "." || clean == string(filepath.Separator) ||
+		clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("directory is invalid")
+	}
+	return clean, nil
+}
+
+// writeResultsCSVAtomic calls the existing writer through a temporary file in
+// the destination directory and renames it into place. CSV columns stay
+// exactly those produced by writeResultsCSV.
+func writeResultsCSVAtomic(path string, pages []Page, keywordsRaw string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err := writeResultsCSV(tmpName, pages, keywordsRaw); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
+}
+
+// auditBundlePath returns the cached strict/inclusive ZIP for one job. It
+// rebuilds with auditbundle.WriteFile when the audit directory mtime changes
+// or the cached file is missing.
+func (s *mcpServer) auditBundlePath(jobID, profile, dir string) (string, error) {
+	clean, err := cleanArtifactDirectory(dir)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(clean)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("audit directory is unavailable")
+	}
+
+	path := filepath.Join(s.jobOwnedDir(jobID), profile+"-audit.zip")
+	key := jobID + "\x00" + profile
+
+	auditBundleCache.Lock()
+	entry, ok := auditBundleCache.entries[key]
+	auditBundleCache.Unlock()
+	if ok && entry.path == path && entry.dirModTime.Equal(info.ModTime()) {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := auditbundle.WriteFile(clean, path); err != nil {
+		return "", err
+	}
+
+	auditBundleCache.Lock()
+	auditBundleCache.entries[key] = auditBundleCacheEntry{
+		dirModTime: info.ModTime(),
+		path:       path,
+	}
+	auditBundleCache.Unlock()
+	return path, nil
+}
+
+// getArtifactSummaryText renders a short agent-facing summary without a path or
+// token.
+func getArtifactSummaryText(out getArtifactOutput) string {
+	summary := fmt.Sprintf(
+		"%s artifact %s (%d bytes) for job %s.",
+		out.Kind, out.Filename, out.SizeBytes, out.JobID,
+	)
+	if out.Inline {
+		summary += " Content is included inline."
+	}
+	return summary
+}

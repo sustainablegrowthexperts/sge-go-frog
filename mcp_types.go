@@ -562,6 +562,40 @@ type searchPagesOutput struct {
 	Matches      []searchMatch `json:"matches"`
 }
 
+// get_artifact accepted kinds. The list is an allowlist so a client cannot ask
+// the server to read an arbitrary file.
+var getArtifactKinds = []string{
+	"csv",
+	"audit_strict_zip",
+	"audit_inclusive_zip",
+	"audit_json_strict",
+	"audit_json_inclusive",
+}
+
+// getArtifactInput is the typed input for the get_artifact tool. job_id and
+// kind are validated by the handler so missing or path-like values follow the
+// invalid_argument error contract instead of the SDK's schema error.
+type getArtifactInput struct {
+	JobID  string `json:"job_id,omitempty" jsonschema:"job ID returned by start_crawl"`
+	Kind   string `json:"kind,omitempty" jsonschema:"artifact kind: csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, or audit_json_inclusive"`
+	Inline bool   `json:"inline,omitempty" jsonschema:"include the artifact content inline when it is below the server cap"`
+}
+
+// getArtifactOutput is the typed output for get_artifact. URLs are always
+// job-scoped; the output never contains a filesystem path. Content is present
+// only when inline is true.
+type getArtifactOutput struct {
+	JobID       string `json:"job_id"`
+	Kind        string `json:"kind"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	SizeBytes   int64  `json:"size_bytes"`
+	URL         string `json:"url"`
+	ExpiresAt   string `json:"expires_at"`
+	Inline      bool   `json:"inline"`
+	Content     string `json:"content,omitempty"`
+}
+
 // getJobOutput is the typed output for get_job. It deliberately excludes
 // page rows, audit reports, search matches, and artifact payloads.
 type getJobOutput struct {

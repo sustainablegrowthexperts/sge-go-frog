@@ -1,7 +1,7 @@
 ---
 id: task-017
 title: "[Slice] Agent downloads CSV, audit ZIPs, and audit JSON"
-status: pending
+status: completed
 depends_on: ["task-016"]
 target_files:
   - "mcp_artifacts.go"

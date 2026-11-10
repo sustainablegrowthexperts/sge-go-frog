@@ -25,6 +25,7 @@ const (
 	defaultMCPMaxURLLength              = 2048
 	defaultMCPMaxResponseBytes          = 5 << 20
 	defaultMCPMaxRequestBytes           = 1 << 20
+	defaultMCPMaxInlineArtifactBytes    = 1 << 20
 	defaultMCPMaxSearchLimit            = 500
 	defaultMCPRateLimitPerMinute        = 60
 	defaultMCPRateWindow                = time.Minute
@@ -49,6 +50,10 @@ type MCPLimits struct {
 	MaxRequestBytes    int64
 	MaxSearchLimit     int
 	RateLimitPerMinute int
+
+	// MaxInlineArtifactBytes caps get_artifact inline content. Above it the
+	// response falls back to download metadata.
+	MaxInlineArtifactBytes int64
 }
 
 // defaultMCPLimits returns the spec defaults for the MCP safety caps.
@@ -68,6 +73,7 @@ func defaultMCPLimits() MCPLimits {
 		MaxRequestBytes:           defaultMCPMaxRequestBytes,
 		MaxSearchLimit:            defaultMCPMaxSearchLimit,
 		RateLimitPerMinute:        defaultMCPRateLimitPerMinute,
+		MaxInlineArtifactBytes:    defaultMCPMaxInlineArtifactBytes,
 	}
 }
 
@@ -115,6 +121,9 @@ func (l MCPLimits) withDefaults() MCPLimits {
 	}
 	if l.RateLimitPerMinute <= 0 {
 		l.RateLimitPerMinute = defaultMCPRateLimitPerMinute
+	}
+	if l.MaxInlineArtifactBytes <= 0 {
+		l.MaxInlineArtifactBytes = defaultMCPMaxInlineArtifactBytes
 	}
 	return l
 }

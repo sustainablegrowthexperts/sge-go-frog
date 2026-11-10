@@ -200,6 +200,13 @@ func mcpConfigFromEnv(getenv func(string) string) (MCPConfig, error) {
 		}
 		cfg.Limits.MaxSearchLimit = n
 	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_INLINE_ARTIFACT_BYTES")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_INLINE_ARTIFACT_BYTES: %w", err)
+		}
+		cfg.Limits.MaxInlineArtifactBytes = n
+	}
 	if v := strings.TrimSpace(getenv("GOFROG_MCP_RATE_LIMIT")); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -243,6 +250,7 @@ func (c *MCPConfig) registerFlags(fs *flag.FlagSet) {
 	fs.Int64Var(&c.Limits.MaxResponseBytes, "mcp-max-response-bytes", c.Limits.MaxResponseBytes, "maximum MCP response size in bytes")
 	fs.Int64Var(&c.Limits.MaxRequestBytes, "mcp-max-request-bytes", c.Limits.MaxRequestBytes, "maximum MCP request size in bytes")
 	fs.IntVar(&c.Limits.MaxSearchLimit, "mcp-max-search-limit", c.Limits.MaxSearchLimit, "maximum search results per MCP request")
+	fs.Int64Var(&c.Limits.MaxInlineArtifactBytes, "mcp-max-inline-artifact-bytes", c.Limits.MaxInlineArtifactBytes, "maximum inline get_artifact content in bytes")
 	fs.IntVar(&c.Limits.RateLimitPerMinute, "mcp-rate-limit", c.Limits.RateLimitPerMinute, "maximum MCP tool calls per minute")
 	fs.BoolVar(&c.DefaultArchive, "mcp-default-archive", c.DefaultArchive, "archive HTML by default for MCP jobs")
 	fs.StringVar(&c.ArtifactBaseURL, "mcp-artifact-base-url", c.ArtifactBaseURL, "public base URL for MCP artifacts")

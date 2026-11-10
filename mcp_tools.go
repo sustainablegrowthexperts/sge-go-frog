@@ -74,6 +74,16 @@ func (s *mcpServer) registerTools() {
 			OpenWorldHint:  boolPtr(false),
 		},
 	}, s.getAudit)
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "get_artifact",
+		Description: "Get a job-scoped download URL, size, and expiry for a completed MCP job's CSV report, strict/inclusive audit ZIP, or strict/inclusive audit JSON. Set inline=true for small CSV and audit JSON content below the server cap.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+			OpenWorldHint:  boolPtr(false),
+		},
+	}, s.getArtifact)
 }
 
 // startCrawlPlan is the validated request shared by job creation and launch.
@@ -148,11 +158,7 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 // jobArchiveDir returns the job-owned archive directory used for raw HTML and
 // the manifest. It is never exposed to MCP clients.
 func (s *mcpServer) jobArchiveDir(jobID string) string {
-	resultsDir := strings.TrimSpace(s.config.ResultsDir)
-	if resultsDir == "" {
-		resultsDir = defaultMCPResultsDir
-	}
-	return filepath.Join(resultsDir, "jobs", jobID, "archive")
+	return filepath.Join(s.jobOwnedDir(jobID), "archive")
 }
 
 // checkToolRateLimit applies the per-token tool-call bucket to every MCP tool.
@@ -540,6 +546,35 @@ func (s *mcpServer) getAudit(_ context.Context, _ *mcp.CallToolRequest, in getAu
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: getAuditSummaryText(out)}},
+	}, out, nil
+}
+
+// getArtifact returns metadata for one whitelisted artifact of a completed
+// MCP-owned job. CSV is generated at request time; audit ZIPs are built with
+// auditbundle; audit JSON comes from the job-owned report directory. The
+// handler never accepts a filesystem path.
+func (s *mcpServer) getArtifact(_ context.Context, _ *mcp.CallToolRequest, in getArtifactInput) (*mcp.CallToolResult, getArtifactOutput, error) {
+	if err := s.checkToolRateLimit(); err != nil {
+		return nil, getArtifactOutput{}, err
+	}
+
+	jobID, kind, err := validateGetArtifactInput(in)
+	if err != nil {
+		return nil, getArtifactOutput{}, err
+	}
+
+	job := s.jobs.get(jobID)
+	if job == nil || !job.ownedBy(ownerMCP) {
+		return nil, getArtifactOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	}
+
+	out, err := s.buildArtifact(job, kind, in.Inline)
+	if err != nil {
+		return nil, getArtifactOutput{}, err
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: getArtifactSummaryText(out)}},
 	}, out, nil
 }
 

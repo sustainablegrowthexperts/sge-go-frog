@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4086,4 +4088,552 @@ func TestSearchPagesArchive(t *testing.T) {
 			})
 		}
 	})
+}
+
+// writeAuditBundleFixture writes a complete audit output directory: audit.json
+// plus the CSV files auditbundle needs to build a ZIP and workbook.
+func writeAuditBundleFixture(t *testing.T, dir string, result auditpkg.Result) string {
+	t.Helper()
+	path := writeAuditResultFixture(t, dir, result)
+	files := map[string]string{
+		"audit-pages.csv":  "URL,Depth,Status\nhttps://example.com/,0,200\nhttps://example.com/a,1,200\n",
+		"audit-links.csv":  "Source,Target,Decision\nhttps://example.com/,https://example.com/a,content\n",
+		"audit-blocks.csv": "Block ID,Link Count,Decision\nblock-content,1,content\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s fixture: %v", name, err)
+		}
+	}
+	return path
+}
+
+// zipFileNames lists the entries of a ZIP artifact.
+func zipFileNames(t *testing.T, path string) []string {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("open zip %q: %v", path, err)
+	}
+	defer zr.Close()
+	names := make([]string, 0, len(zr.File))
+	for _, file := range zr.File {
+		names = append(names, file.Name)
+	}
+	return names
+}
+
+// readZipFile returns one entry from a ZIP artifact.
+func readZipFile(t *testing.T, path, name string) []byte {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("open zip %q: %v", path, err)
+	}
+	defer zr.Close()
+	for _, file := range zr.File {
+		if file.Name != name {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			t.Fatalf("open zip entry %q: %v", name, err)
+		}
+		data, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			t.Fatalf("read zip entry %q: %v", name, err)
+		}
+		return data
+	}
+	t.Fatalf("zip %q has no entry %q", path, name)
+	return nil
+}
+
+// TestGetArtifact covers the artifact download contract:
+//   - all five kinds return metadata with job-scoped authenticated URLs;
+//   - CSV is generated at request time with the existing columns and can be
+//     returned inline;
+//   - strict and inclusive ZIPs are built with auditbundle.WriteFile and open
+//     with the expected entries, with the cache invalidated by directory mtime;
+//   - audit JSON metadata and inline content work below the cap and fall back to
+//     metadata above it;
+//   - unfinished jobs, unavailable audits, invalid kinds, and path-like input
+//     follow the tool error contract without leaking filesystem paths.
+func TestGetArtifact(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resultsDir := t.TempDir()
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = resultsDir
+	cfg.ArtifactBaseURL = "https://crawler.example.com"
+
+	app, session := newMCPTestSession(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+	report := auditpkg.Result{
+		Version:     auditpkg.AuditVersion,
+		StartURL:    "https://example.com/",
+		Domain:      "example.com",
+		GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+		Summary: auditpkg.AuditSummary{
+			Pages:        2,
+			ContentLinks: 1,
+			GeneratedAt:  time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+		},
+	}
+	strictDir := t.TempDir()
+	inclusiveDir := t.TempDir()
+	writeAuditBundleFixture(t, strictDir, report)
+	writeAuditBundleFixture(t, inclusiveDir, report)
+
+	pages := []Page{
+		{
+			URL:         "https://example.com/",
+			StatusCode:  200,
+			LoadTime:    20 * time.Millisecond,
+			Title:       "Home",
+			Description: "Home page",
+			H1s:         []string{"Home"},
+			Robots:      "index, follow",
+			KeywordHits: []int{2, 1},
+		},
+		{
+			URL:         "https://example.com/a",
+			StatusCode:  200,
+			LoadTime:    10 * time.Millisecond,
+			ParentURL:   "https://example.com/",
+			Inlinks:     `"Home"`,
+			Title:       "A",
+			Description: "Page A",
+			H1s:         []string{"A"},
+			Robots:      "index, follow",
+			KeywordHits: []int{0, 3},
+		},
+	}
+	job := createDoneResultsJob(t, app, "alpha|beta", pages)
+	job.mu.Lock()
+	job.settings.Audit = true
+	job.auditReady = true
+	job.auditDir = strictDir
+	job.auditInclusiveReady = true
+	job.auditInclusiveDir = inclusiveDir
+	finishedAt := job.finishedAt
+	job.mu.Unlock()
+
+	baseURL := "https://crawler.example.com"
+	type artifactCase struct {
+		kind        string
+		contentType string
+		filenameSfx string
+		url         string
+	}
+	cases := []artifactCase{
+		{"csv", "text/csv", "-example.com.csv", baseURL + "/api/crawl/" + job.id + "/download"},
+		{"audit_strict_zip", "application/zip", "example.com-strict-audit.zip", baseURL + "/api/crawl/" + job.id + "/audit/bundle.zip"},
+		{"audit_inclusive_zip", "application/zip", "example.com-inclusive-audit.zip", baseURL + "/api/crawl/" + job.id + "/audit/inclusive/bundle.zip"},
+		{"audit_json_strict", "application/json", "-strict-audit.json", baseURL + "/api/crawl/" + job.id + "/audit/audit.json"},
+		{"audit_json_inclusive", "application/json", "-inclusive-audit.json", baseURL + "/api/crawl/" + job.id + "/audit/inclusive/audit.json"},
+	}
+
+	outputs := make(map[string]map[string]any, len(cases))
+	allowedKeys := map[string]bool{
+		"job_id": true, "kind": true, "filename": true, "content_type": true,
+		"size_bytes": true, "url": true, "expires_at": true, "inline": true,
+		"content": true,
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind+" metadata", func(t *testing.T) {
+			out := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": job.id,
+				"kind":   tc.kind,
+			})
+			outputs[tc.kind] = out
+
+			for key := range out {
+				if !allowedKeys[key] {
+					t.Fatalf("%s returned unexpected key %q", tc.kind, key)
+				}
+			}
+			if out["job_id"] != job.id || out["kind"] != tc.kind {
+				t.Fatalf("identity = job_id:%v kind:%v, want %s/%s", out["job_id"], out["kind"], job.id, tc.kind)
+			}
+			if out["content_type"] != tc.contentType {
+				t.Fatalf("content_type = %v, want %s", out["content_type"], tc.contentType)
+			}
+			filename := auditString(t, out, "filename")
+			if !strings.HasSuffix(filename, tc.filenameSfx) {
+				t.Fatalf("filename = %q, want suffix %q", filename, tc.filenameSfx)
+			}
+			if strings.ContainsAny(filename, `/\`) {
+				t.Fatalf("filename = %q, want no path separators", filename)
+			}
+			if out["inline"] != false {
+				t.Fatalf("inline = %v, want false", out["inline"])
+			}
+			if _, present := out["content"]; present {
+				t.Fatalf("%s returned content without inline=true", tc.kind)
+			}
+			url := auditString(t, out, "url")
+			if url != tc.url {
+				t.Fatalf("url = %q, want %q", url, tc.url)
+			}
+			if !strings.Contains(url, job.id) {
+				t.Fatalf("url = %q, want the job ID", url)
+			}
+			size := auditNumber(t, out, "size_bytes")
+			if size <= 0 {
+				t.Fatalf("size_bytes = %v, want a positive size", size)
+			}
+			expires := assertRFC3339UTC(t, "expires_at", out["expires_at"])
+			wantExpiry := finishedAt.Add(24 * time.Hour)
+			if delta := expires.Sub(wantExpiry); delta < -time.Second || delta > time.Second {
+				t.Fatalf("expires_at = %v, want about %v", expires, wantExpiry)
+			}
+
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal %s output: %v", tc.kind, err)
+			}
+			for _, leaked := range []string{resultsDir, strictDir, inclusiveDir} {
+				if leaked != "" && strings.Contains(string(encoded), leaked) {
+					t.Fatalf("%s output leaked filesystem path %q: %s", tc.kind, leaked, encoded)
+				}
+			}
+		})
+	}
+
+	t.Run("csv is generated at request time with unchanged columns", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+			"inline": true,
+		})
+		if out["inline"] != true {
+			t.Fatalf("inline = %v, want true", out["inline"])
+		}
+		content := auditString(t, out, "content")
+		records, err := csv.NewReader(strings.NewReader(content)).ReadAll()
+		if err != nil {
+			t.Fatalf("decode inline CSV: %v", err)
+		}
+		wantHeader := []string{
+			"URL", "StatusCode", "LoadTime", "ParentURL", "Inlinks", "Title",
+			"Description", "H1s", "img alts", "Robots", "Search: alpha", "Search: beta",
+		}
+		if len(records) == 0 || !slices.Equal(records[0], wantHeader) {
+			t.Fatalf("CSV header = %v, want %v", records[0], wantHeader)
+		}
+		if len(records) != 3 {
+			t.Fatalf("CSV rows = %d, want header plus 2 pages", len(records))
+		}
+		assertNumber(t, "size_bytes", out["size_bytes"], float64(len(content)))
+
+		job.mu.Lock()
+		job.result = append(job.result, Page{
+			URL:         "https://example.com/b",
+			StatusCode:  200,
+			LoadTime:    5 * time.Millisecond,
+			Title:       "B",
+			KeywordHits: []int{1, 0},
+		})
+		job.mu.Unlock()
+
+		refreshed := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+			"inline": true,
+		})
+		refreshedRecords, err := csv.NewReader(strings.NewReader(auditString(t, refreshed, "content"))).ReadAll()
+		if err != nil {
+			t.Fatalf("decode refreshed CSV: %v", err)
+		}
+		if len(refreshedRecords) != 4 {
+			t.Fatalf("refreshed CSV rows = %d, want header plus 3 pages (generated at request time)", len(refreshedRecords))
+		}
+	})
+
+	t.Run("zip bundles open with the expected entries", func(t *testing.T) {
+		bundles := []struct {
+			kind string
+			file string
+		}{
+			{"audit_strict_zip", "strict-audit.zip"},
+			{"audit_inclusive_zip", "inclusive-audit.zip"},
+		}
+		wantEntries := []string{
+			"audit.xlsx", "audit.json", "audit-pages.csv",
+			"audit-links.csv", "audit-blocks.csv", "manifest.txt",
+		}
+		for _, bundle := range bundles {
+			path := filepath.Join(resultsDir, "jobs", job.id, bundle.file)
+			names := zipFileNames(t, path)
+			for _, want := range wantEntries {
+				if !slices.Contains(names, want) {
+					t.Fatalf("%s entries = %v, want %q", bundle.kind, names, want)
+				}
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat %s: %v", bundle.kind, err)
+			}
+			assertNumber(t, bundle.kind+" size_bytes", outputs[bundle.kind]["size_bytes"], float64(info.Size()))
+		}
+	})
+
+	t.Run("audit json returns inline content below the cap", func(t *testing.T) {
+		for _, kind := range []string{"audit_json_strict", "audit_json_inclusive"} {
+			out := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": job.id,
+				"kind":   kind,
+				"inline": true,
+			})
+			if out["inline"] != true {
+				t.Fatalf("%s inline = %v, want true", kind, out["inline"])
+			}
+			content := auditString(t, out, "content")
+			var meta map[string]any
+			if err := json.Unmarshal([]byte(content), &meta); err != nil {
+				t.Fatalf("%s content is not JSON: %v", kind, err)
+			}
+			if meta["domain"] != "example.com" {
+				t.Fatalf("%s domain = %v, want example.com", kind, meta["domain"])
+			}
+			assertNumber(t, kind+" size_bytes", out["size_bytes"], float64(len(content)))
+		}
+	})
+
+	t.Run("inline falls back to metadata above the cap", func(t *testing.T) {
+		largeDir := t.TempDir()
+		largeBody, err := json.Marshal(map[string]any{
+			"version":      1,
+			"start_url":    "https://example.com/",
+			"domain":       "example.com",
+			"generated_at": "2026-11-10T12:00:00Z",
+			"summary":      map[string]any{"pages": 1},
+			"padding":      strings.Repeat("x", (1<<20)+1),
+		})
+		if err != nil {
+			t.Fatalf("marshal large audit fixture: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(largeDir, "audit.json"), largeBody, 0o644); err != nil {
+			t.Fatalf("write large audit fixture: %v", err)
+		}
+
+		largeJob := createDoneResultsJob(t, app, "", pages[:1])
+		largeJob.mu.Lock()
+		largeJob.settings.Audit = true
+		largeJob.auditReady = true
+		largeJob.auditDir = largeDir
+		largeJob.mu.Unlock()
+
+		out := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": largeJob.id,
+			"kind":   "audit_json_strict",
+			"inline": true,
+		})
+		if out["inline"] != false {
+			t.Fatalf("inline = %v, want false above the cap", out["inline"])
+		}
+		if _, present := out["content"]; present {
+			t.Fatal("large artifact returned inline content above the cap")
+		}
+		if size := auditNumber(t, out, "size_bytes"); size <= float64(1<<20) {
+			t.Fatalf("size_bytes = %v, want above 1 MB", size)
+		}
+		if auditString(t, out, "url") == "" {
+			t.Fatal("large artifact returned an empty URL")
+		}
+	})
+
+	t.Run("text summary includes filename and size", func(t *testing.T) {
+		res := callTool(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+		})
+		if res.IsError {
+			t.Fatalf("get_artifact returned an error: %s", toolResultText(res))
+		}
+		out := structuredObject(t, res)
+		filename := auditString(t, out, "filename")
+		size := int64(auditNumber(t, out, "size_bytes"))
+		text := toolResultText(res)
+		if !strings.Contains(text, filename) || !strings.Contains(text, fmt.Sprintf("%d", size)) {
+			t.Fatalf("text summary = %q, want filename %q and size %d", text, filename, size)
+		}
+	})
+
+	t.Run("configured inline cap is enforced", func(t *testing.T) {
+		smallCfg := defaultMCPConfig()
+		smallCfg.ResultsDir = t.TempDir()
+		smallCfg.ArtifactBaseURL = "https://crawler.example.com"
+		smallCfg.Limits.MaxInlineArtifactBytes = 32
+		smallApp, smallSession := newMCPTestSession(t, ctx, smallCfg, newImmediateFakeRunner(nil, nil))
+
+		smallJob := createDoneResultsJob(t, smallApp, "alpha", pages[:1])
+		out := callToolObject(t, ctx, smallSession, "get_artifact", map[string]any{
+			"job_id": smallJob.id,
+			"kind":   "csv",
+			"inline": true,
+		})
+		if out["inline"] != false {
+			t.Fatalf("inline = %v, want false above the configured cap", out["inline"])
+		}
+		if _, present := out["content"]; present {
+			t.Fatal("artifact returned inline content above the configured cap")
+		}
+		if size := auditNumber(t, out, "size_bytes"); size <= 32 {
+			t.Fatalf("size_bytes = %v, want above the configured 32-byte cap", size)
+		}
+	})
+
+	t.Run("audit_not_available when the profile is missing", func(t *testing.T) {
+		noAudit := createDoneResultsJob(t, app, "", pages[:1])
+		for _, kind := range []string{
+			"audit_strict_zip", "audit_inclusive_zip",
+			"audit_json_strict", "audit_json_inclusive",
+		} {
+			res := callTool(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": noAudit.id,
+				"kind":   kind,
+			})
+			if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+				t.Fatalf("%s error = %q, want audit_not_available", kind, toolResultText(res))
+			}
+		}
+
+		notReady := createDoneResultsJob(t, app, "", pages[:1])
+		notReady.mu.Lock()
+		notReady.settings.Audit = true
+		notReady.auditReady = false
+		notReady.auditInclusiveReady = false
+		notReady.mu.Unlock()
+		for _, kind := range []string{
+			"audit_strict_zip", "audit_inclusive_zip",
+			"audit_json_strict", "audit_json_inclusive",
+		} {
+			res := callTool(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": notReady.id,
+				"kind":   kind,
+			})
+			if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+				t.Fatalf("%s error = %q, want audit_not_available", kind, toolResultText(res))
+			}
+		}
+
+		missing := createDoneResultsJob(t, app, "", pages[:1])
+		missing.mu.Lock()
+		missing.settings.Audit = true
+		missing.auditReady = true
+		missing.auditDir = filepath.Join(t.TempDir(), "absent")
+		missing.auditInclusiveReady = true
+		missing.auditInclusiveDir = filepath.Join(t.TempDir(), "absent")
+		missing.mu.Unlock()
+		for _, kind := range []string{
+			"audit_strict_zip", "audit_inclusive_zip",
+			"audit_json_strict", "audit_json_inclusive",
+		} {
+			res := callTool(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": missing.id,
+				"kind":   kind,
+			})
+			if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+				t.Fatalf("%s error = %q, want audit_not_available", kind, toolResultText(res))
+			}
+		}
+	})
+
+	t.Run("rejects invalid arguments and unfinished jobs", func(t *testing.T) {
+		cases := []struct {
+			name string
+			args map[string]any
+			want string
+		}{
+			{"missing job id", map[string]any{"kind": "csv"}, "job_id"},
+			{"path-like job id", map[string]any{"job_id": "../../etc/passwd", "kind": "csv"}, "invalid_argument"},
+			{"missing kind", map[string]any{"job_id": job.id}, "kind"},
+			{"invalid kind", map[string]any{"job_id": job.id, "kind": "pdf"}, "kind"},
+			{"path-like kind", map[string]any{"job_id": job.id, "kind": "../audit"}, "kind"},
+			{"unknown job", map[string]any{"job_id": "missing", "kind": "csv"}, "job_not_found"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "get_artifact", tc.args)
+				if !res.IsError {
+					t.Fatalf("get_artifact accepted invalid input: %v", res.StructuredContent)
+				}
+				if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, tc.want) {
+					t.Fatalf("error = %q, want %q", text, tc.want)
+				}
+			})
+		}
+
+		running := createDoneResultsJob(t, app, "", pages[:1])
+		running.mu.Lock()
+		running.status = jobStatusRunning
+		running.phase = jobPhaseCrawling
+		running.mu.Unlock()
+		res := callTool(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": running.id,
+			"kind":   "csv",
+		})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "job_not_finished") {
+			t.Fatalf("running job error = %q, want job_not_finished", toolResultText(res))
+		}
+	})
+
+	t.Run("zip cache invalidates when the audit directory changes", func(t *testing.T) {
+		// Ensure the bundle exists before reading it.
+		callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "audit_strict_zip",
+		})
+		bundlePath := filepath.Join(resultsDir, "jobs", job.id, "strict-audit.zip")
+		var before map[string]any
+		if err := json.Unmarshal(readZipFile(t, bundlePath, "audit.json"), &before); err != nil {
+			t.Fatalf("decode initial bundled audit.json: %v", err)
+		}
+		if before["domain"] != "example.com" {
+			t.Fatalf("initial bundled domain = %v, want example.com", before["domain"])
+		}
+
+		changed := report
+		changed.Domain = "changed.example.com"
+		writeAuditBundleFixture(t, strictDir, changed)
+		future := time.Now().Add(3 * time.Second)
+		if err := os.Chtimes(strictDir, future, future); err != nil {
+			t.Fatalf("touch audit directory: %v", err)
+		}
+
+		callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "audit_strict_zip",
+		})
+		var after map[string]any
+		if err := json.Unmarshal(readZipFile(t, bundlePath, "audit.json"), &after); err != nil {
+			t.Fatalf("decode refreshed bundled audit.json: %v", err)
+		}
+		if after["domain"] != "changed.example.com" {
+			t.Fatalf("refreshed bundled domain = %v, want changed.example.com", after["domain"])
+		}
+
+		jsonOut := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "audit_json_strict",
+			"inline": true,
+		})
+		if content := auditString(t, jsonOut, "content"); !strings.Contains(content, "changed.example.com") {
+			t.Fatalf("audit JSON content was not refreshed: %s", content)
+		}
+	})
+}
+
+// auditNumber reads a numeric field and fails when it is missing or not a number.
+func auditNumber(t *testing.T, obj map[string]any, key string) float64 {
+	t.Helper()
+	value, ok := obj[key].(float64)
+	if !ok {
+		t.Fatalf("%s = %v (%T), want a number", key, obj[key], obj[key])
+	}
+	return value
 }
