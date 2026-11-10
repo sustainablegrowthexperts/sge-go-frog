@@ -116,6 +116,7 @@ type startCrawlInput struct {
 	Keywords        []string                `json:"keywords,omitempty" jsonschema:"optional keywords whose occurrences are counted on each page"`
 	Concurrency     int                     `json:"concurrency,omitempty" jsonschema:"maximum concurrent requests; defaults to 10"`
 	Audit           bool                    `json:"audit,omitempty" jsonschema:"enable the strict and inclusive internal-linking audit; spider mode only"`
+	ArchiveHTML     bool                    `json:"archive_html,omitempty" jsonschema:"archive raw HTML and a manifest without producing an audit report"`
 	AuditFilters    *startCrawlAuditFilters `json:"audit_filters,omitempty" jsonschema:"optional replacement audit filter profile; parsed only when explicit is true"`
 	Limits          *startCrawlLimits       `json:"limits,omitempty" jsonschema:"optional per-job page, depth, and duration caps"`
 	ClientRequestID string                  `json:"client_request_id,omitempty" jsonschema:"optional idempotency key; retries with identical input return the existing job"`

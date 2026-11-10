@@ -11,7 +11,7 @@ import (
 	"github.com/gocolly/colly/v2"
 )
 
-func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
+func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err error) {
 	start, err := normalizeHTTPURL(s.StartURL)
 	if err != nil {
 		return nil, fmt.Errorf("starting URL: %w", err)
@@ -33,24 +33,33 @@ func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
 
 	var archive *auditpkg.ArchiveWriter
 	var sitemapPages []string
-	if s.Audit {
+	if s.Audit || s.ArchiveHTML {
 		archiveDir := strings.TrimSpace(s.AuditArchiveDir)
 		if archiveDir == "" {
 			archiveDir = buildArchiveDirForHost(host, time.Now())
 		}
-		archive, err = auditpkg.NewArchiveWriter(archiveDir, auditpkg.ArchiveMeta{
+		archive, err = openCrawlArchive(archiveDir, auditpkg.ArchiveMeta{
 			StartURL: start,
 			Host:     host,
 			Mode:     "spider",
 		})
 		if err != nil {
-			return nil, fmt.Errorf("create audit archive: %w", err)
+			return nil, err
 		}
-		defer archive.Close()
+		defer func() {
+			if closeErr := closeCrawlArchive(archive); closeErr != nil && err == nil {
+				err = closeErr
+				pages = nil
+			}
+		}()
 
-		discovery := discoverSitemap(root, host, s.ProxyURL)
-		archive.SetSitemap(discovery.Meta)
-		sitemapPages = discovery.Pages
+		// Sitemap discovery stays tied to audit for v1; archive_html alone
+		// does not fetch sitemaps.
+		if s.Audit {
+			discovery := discoverSitemap(root, host, s.ProxyURL)
+			archive.SetSitemap(discovery.Meta)
+			sitemapPages = discovery.Pages
+		}
 	}
 
 	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
@@ -121,6 +130,12 @@ func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
 
 	if archive != nil {
 		archive.MarkSource(start, "start")
+		// Colly normalizes an empty path to "/" before the request is
+		// recorded, so mark that exact form as well.
+		if u, uErr := url.Parse(start); uErr == nil && u.Path == "" {
+			u.Path = "/"
+			archive.MarkSource(u.String(), "start")
+		}
 	}
 	if err := c.Visit(start); err != nil {
 		return nil, err
@@ -152,12 +167,6 @@ func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
 			_ = c.Visit(sitemapURL)
 		}
 		c.Wait()
-	}
-
-	if archive != nil {
-		if err := archive.Close(); err != nil {
-			return nil, fmt.Errorf("finalize audit archive: %w", err)
-		}
 	}
 
 	return store.snapshot(), nil

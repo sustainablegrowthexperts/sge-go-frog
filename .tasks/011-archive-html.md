@@ -1,7 +1,7 @@
 ---
 id: task-011
 title: "[Slice] archive_html creates a searchable archive without audit"
-status: pending
+status: completed
 depends_on: ["task-010"]
 target_files:
   - "main.go"

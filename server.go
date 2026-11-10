@@ -320,6 +320,7 @@ type crawlFingerprintPayload struct {
 	Keywords         []string                      `json:"keywords,omitempty"`
 	Concurrency      int                           `json:"concurrency"`
 	Audit            bool                          `json:"audit"`
+	ArchiveHTML      bool                          `json:"archive_html,omitempty"`
 	AuditFilters     *crawlFingerprintAuditFilters `json:"audit_filters,omitempty"`
 	MaxPages         int                           `json:"max_pages"`
 	MaxDepth         int                           `json:"max_depth"`
@@ -343,6 +344,7 @@ func canonicalStartCrawlFingerprint(plan startCrawlPlan) string {
 		Keywords:         splitJobKeywords(plan.settings.KeywordsRaw),
 		Concurrency:      plan.settings.Concurrency,
 		Audit:            plan.settings.Audit,
+		ArchiveHTML:      plan.settings.ArchiveHTML || plan.settings.Audit,
 		MaxPages:         plan.limits.MaxPages,
 		MaxDepth:         plan.limits.MaxDepth,
 		MaxDurationNanos: int64(plan.limits.MaxDuration),

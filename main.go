@@ -269,8 +269,10 @@ type WizardSettings struct {
 
 	// Audit is opt-in and spider-only. When true, the crawl also writes a
 	// self-contained HTML archive to AuditArchiveDir for the internal-link
-	// auditor. Existing CSV and page-row behavior is unchanged.
+	// auditor. ArchiveHTML requests the same archive without the audit report.
+	// Existing CSV and page-row behavior is unchanged.
 	Audit           bool
+	ArchiveHTML     bool
 	AuditArchiveDir string
 	AuditFilters    *auditpkg.FilterOptions
 

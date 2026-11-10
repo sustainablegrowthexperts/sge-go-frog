@@ -86,6 +86,7 @@ type jobStoreSettings struct {
 	Concurrency     int                     `json:"concurrency,omitempty"`
 	ProxyURL        string                  `json:"proxy_url,omitempty"`
 	Audit           bool                    `json:"audit,omitempty"`
+	ArchiveHTML     bool                    `json:"archive_html,omitempty"`
 	AuditArchiveDir string                  `json:"audit_archive_dir,omitempty"`
 	AuditFilters    *auditpkg.FilterOptions `json:"audit_filters,omitempty"`
 	ListURLs        []string                `json:"list_urls,omitempty"`
@@ -323,6 +324,7 @@ func jobStoreSettingsFromWizard(settings WizardSettings) jobStoreSettings {
 		Concurrency:     settings.Concurrency,
 		ProxyURL:        settings.ProxyURL,
 		Audit:           settings.Audit,
+		ArchiveHTML:     settings.ArchiveHTML,
 		AuditArchiveDir: settings.AuditArchiveDir,
 		ListURLs:        append([]string(nil), settings.listURLs...),
 	}
@@ -363,6 +365,7 @@ func jobFromStoreRecord(record jobStoreRecord) (*crawlJob, error) {
 		Concurrency:     record.Settings.Concurrency,
 		ProxyURL:        record.Settings.ProxyURL,
 		Audit:           record.Settings.Audit,
+		ArchiveHTML:     record.Settings.ArchiveHTML,
 		AuditArchiveDir: record.Settings.AuditArchiveDir,
 		listURLs:        append([]string(nil), record.Settings.ListURLs...),
 	}

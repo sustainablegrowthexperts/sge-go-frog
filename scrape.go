@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,29 @@ func attachHTTPTiming(c *colly.Collector, starts *requestStartTimes) {
 	c.OnRequest(func(r *colly.Request) {
 		starts.mark(r.ID)
 	})
+}
+
+// openCrawlArchive prepares the shared crawl archive writer used by spider and
+// list mode. An empty directory is rejected here so a job never runs with an
+// implicit archive location.
+func openCrawlArchive(dir string, meta auditpkg.ArchiveMeta) (*auditpkg.ArchiveWriter, error) {
+	archive, err := auditpkg.NewArchiveWriter(strings.TrimSpace(dir), meta)
+	if err != nil {
+		return nil, fmt.Errorf("create crawl archive: %w", err)
+	}
+	return archive, nil
+}
+
+// closeCrawlArchive finalizes the manifest exactly once and surfaces write
+// errors to the caller. A nil writer is a no-op.
+func closeCrawlArchive(archive *auditpkg.ArchiveWriter) error {
+	if archive == nil {
+		return nil
+	}
+	if err := archive.Close(); err != nil {
+		return fmt.Errorf("finalize crawl archive: %w", err)
+	}
+	return nil
 }
 
 func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound *inboundTracker, store *pageStore, keywordsRaw string, onProgress progressFunc, archive *auditpkg.ArchiveWriter) {

@@ -6,9 +6,12 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
+
+	auditpkg "go-frog/internal/audit"
 )
 
-func runList(urls []string, s WizardSettings, onProgress progressFunc) ([]Page, error) {
+func runList(urls []string, s WizardSettings, onProgress progressFunc) (pages []Page, err error) {
 	if len(urls) == 0 {
 		return nil, fmt.Errorf("no URLs to visit")
 	}
@@ -16,9 +19,34 @@ func runList(urls []string, s WizardSettings, onProgress progressFunc) ([]Page, 
 	store := &pageStore{}
 	starts := &requestStartTimes{}
 
+	var archive *auditpkg.ArchiveWriter
+	if s.ArchiveHTML || s.Audit {
+		archiveDir := strings.TrimSpace(s.AuditArchiveDir)
+		if archiveDir == "" {
+			archiveDir = buildArchiveDir(s, time.Now())
+		}
+		meta := auditpkg.ArchiveMeta{
+			StartURL: urls[0],
+			Mode:     "list",
+		}
+		if u, parseErr := url.Parse(urls[0]); parseErr == nil {
+			meta.Host = u.Hostname()
+		}
+		archive, err = openCrawlArchive(archiveDir, meta)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if closeErr := closeCrawlArchive(archive); closeErr != nil && err == nil {
+				err = closeErr
+				pages = nil
+			}
+		}()
+	}
+
 	c := newCollectorAsync(s.Concurrency, s.ProxyURL)
 	attachHTTPTiming(c, starts)
-	attachPageRecording(c, starts, nil, store, s.KeywordsRaw, onProgress, nil)
+	attachPageRecording(c, starts, nil, store, s.KeywordsRaw, onProgress, archive)
 
 	for _, u := range urls {
 		if err := c.Visit(u); err != nil {

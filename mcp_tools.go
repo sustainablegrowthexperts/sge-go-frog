@@ -94,7 +94,7 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 		plan.target,
 		plan.settings,
 		plan.limits,
-		false,
+		plan.settings.ArchiveHTML || plan.settings.Audit,
 		plan.clientRequestID,
 		plan.fingerprint,
 	)
@@ -108,12 +108,31 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 		return nil, s.startCrawlOutput(job), nil
 	}
 
+	// Archives live under the job-owned directory so retention removes them
+	// with the job. Audit and archive_html share this single directory.
+	if plan.settings.ArchiveHTML || plan.settings.Audit {
+		plan.settings.AuditArchiveDir = s.jobArchiveDir(job.id)
+		job.mu.Lock()
+		job.settings = plan.settings
+		job.mu.Unlock()
+	}
+
 	if reservation.queued {
 		job.markQueued()
 	}
 	go runMCPCrawlJob(job, plan.settings, s.runner, reservation)
 
 	return nil, s.startCrawlOutput(job), nil
+}
+
+// jobArchiveDir returns the job-owned archive directory used for raw HTML and
+// the manifest. It is never exposed to MCP clients.
+func (s *mcpServer) jobArchiveDir(jobID string) string {
+	resultsDir := strings.TrimSpace(s.config.ResultsDir)
+	if resultsDir == "" {
+		resultsDir = defaultMCPResultsDir
+	}
+	return filepath.Join(resultsDir, "jobs", jobID, "archive")
 }
 
 // checkToolRateLimit applies the per-token tool-call bucket to every MCP tool.
@@ -732,6 +751,7 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 	mode := strings.TrimSpace(in.Mode)
 
 	settings := WizardSettings{Concurrency: defaultConcurrency}
+	settings.ArchiveHTML = in.ArchiveHTML
 	var target string
 	switch mode {
 	case "spider":
@@ -777,7 +797,6 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 			return startCrawlPlan{}, fmt.Errorf("invalid_argument: audit is only supported for spider mode")
 		}
 		settings.Audit = true
-		settings.AuditArchiveDir = buildArchiveDir(settings, time.Now())
 		if in.AuditFilters != nil && in.AuditFilters.Explicit {
 			settings.AuditFilters = explicitAuditFilters(in.AuditFilters.NavSubstrings, in.AuditFilters.ExcludeSubstrings)
 		}
