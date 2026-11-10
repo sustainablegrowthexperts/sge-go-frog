@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"net/url"
 	"strings"
@@ -325,9 +326,10 @@ type mcpQuota struct {
 	ratePerMinute int
 	rateLimiters  map[string]*mcpTokenBucket
 	clock         func() time.Time
+	logger        *slog.Logger
 }
 
-func newMCPQuota(limits MCPLimits) *mcpQuota {
+func newMCPQuota(limits MCPLimits, logger *slog.Logger) *mcpQuota {
 	limits = limits.withDefaults()
 	return &mcpQuota{
 		maxGlobal:     limits.MaxConcurrentJobs,
@@ -338,7 +340,18 @@ func newMCPQuota(limits MCPLimits) *mcpQuota {
 		ratePerMinute: limits.RateLimitPerMinute,
 		rateLimiters:  make(map[string]*mcpTokenBucket),
 		clock:         time.Now,
+		logger:        logger,
 	}
+}
+
+// logLimitEvent records the stable limit name and retry hint. It never includes
+// the caller's token or request arguments.
+func (q *mcpQuota) logLimitEvent(limit string, retryAfter time.Duration) {
+	ms := retryAfter.Milliseconds()
+	if ms < 1 {
+		ms = 1
+	}
+	loggerOr(q.logger).Warn("limit event", "limit", limit, "retry_after_ms", ms)
 }
 
 // SetClock replaces the clock used by the rate limiter and clears existing
@@ -370,6 +383,7 @@ func (q *mcpQuota) Reserve(key string) (*quotaReservation, error) {
 	if q.globalRunning < q.maxGlobal && q.tokenRunning[key] >= q.maxPerToken {
 		limit = "per_token_jobs"
 	}
+	q.logLimitEvent(limit, defaultMCPJobRetryAfter)
 	return nil, &limitExceededError{Limit: limit, RetryAfter: defaultMCPJobRetryAfter}
 }
 
@@ -461,6 +475,7 @@ func (q *mcpQuota) AllowToolCall(key string) error {
 	if ok {
 		return nil
 	}
+	q.logLimitEvent("rate_limit", retry)
 	return &limitExceededError{Limit: "rate_limit", RetryAfter: retry}
 }
 

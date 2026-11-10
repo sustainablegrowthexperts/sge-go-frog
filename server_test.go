@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -14,11 +15,86 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	auditpkg "go-frog/internal/audit"
 )
+
+// testLogBuffer is a concurrency-safe sink for JSON slog output written by
+// handler and crawl goroutines.
+type testLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *testLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *testLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// newTestJSONLogger returns a JSON slog logger that writes to buf.
+func newTestJSONLogger(buf *testLogBuffer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// parseTestLogRecords decodes one JSON object per line.
+func parseTestLogRecords(t *testing.T, text string) []map[string]any {
+	t.Helper()
+	records := make([]map[string]any, 0)
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		record := make(map[string]any)
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+// findTestLogRecord returns the first record with the message and matching
+// fields, or fails the test when none exists.
+func findTestLogRecord(t *testing.T, records []map[string]any, msg string, match map[string]any) map[string]any {
+	t.Helper()
+	for _, record := range records {
+		if record["msg"] != msg {
+			continue
+		}
+		ok := true
+		for key, want := range match {
+			if record[key] != want {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return record
+		}
+	}
+	t.Fatalf("no %q log record matching %v in %v", msg, match, records)
+	return nil
+}
+
+// testLogNumber reads a numeric slog field.
+func testLogNumber(t *testing.T, record map[string]any, field string) float64 {
+	t.Helper()
+	value, ok := record[field].(float64)
+	if !ok {
+		t.Fatalf("%s = %v (%T), want a number in %v", field, record[field], record[field], record)
+	}
+	return value
+}
 
 func TestIndexTemplatePrefillsAuditFilters(t *testing.T) {
 	var buf bytes.Buffer
@@ -796,6 +872,120 @@ func TestParseAuditFilters(t *testing.T) {
 		})
 		if got := parseAuditFilters(req, "list", true); got != nil {
 			t.Fatalf("parseAuditFilters = %+v, want nil", got)
+		}
+	})
+}
+
+// TestStructuredLogging covers the job lifecycle records and the secret
+// redaction contract. Records are issued through the injected JSON logger, so
+// assertions inspect structured fields rather than rendered prose.
+func TestStructuredLogging(t *testing.T) {
+	const syntheticBody = "SYNTHETIC_PAGE_BODY_MUST_NOT_BE_LOGGED"
+	const bearerToken = "bearer-super-secret-token"
+
+	t.Run("job creation, phases, and completion emit required fields", func(t *testing.T) {
+		var buf testLogBuffer
+		logger := newTestJSONLogger(&buf)
+
+		runner := newImmediateFakeRunner([]Page{{
+			URL:         "https://example.com/page",
+			StatusCode:  200,
+			Title:       syntheticBody,
+			Description: syntheticBody,
+		}}, nil)
+		jm := newJobManager(jobManagerConfig{Logger: logger, DisableReaper: true})
+
+		settings := WizardSettings{Mode: 1, StartURL: "https://example.com/page?access_token=" + bearerToken}
+		limits := jobLimits{MaxPages: 25, MaxDepth: 3, MaxDuration: 2 * time.Minute}
+		job, replay, err := jm.createWithRequest(ownerMCP, "spider", settings.StartURL, settings, limits, false, "", "")
+		if err != nil || replay {
+			t.Fatalf("createWithRequest: job=%v replay=%v err=%v", job, replay, err)
+		}
+		runCrawlJob(job, settings, runner)
+
+		records := parseTestLogRecords(t, buf.String())
+
+		created := findTestLogRecord(t, records, "job created", map[string]any{"job_id": job.id})
+		if created["owner"] != ownerMCP {
+			t.Fatalf("owner = %v, want %q", created["owner"], ownerMCP)
+		}
+		if created["mode"] != "spider" {
+			t.Fatalf("mode = %v, want spider", created["mode"])
+		}
+		if created["target_host"] != "example.com" {
+			t.Fatalf("target_host = %v, want example.com", created["target_host"])
+		}
+		if got := testLogNumber(t, created, "max_pages"); got != 25 {
+			t.Fatalf("max_pages = %v, want 25", got)
+		}
+		if got := testLogNumber(t, created, "max_depth"); got != 3 {
+			t.Fatalf("max_depth = %v, want 3", got)
+		}
+		if got := testLogNumber(t, created, "max_duration_seconds"); got != 120 {
+			t.Fatalf("max_duration_seconds = %v, want 120", got)
+		}
+
+		findTestLogRecord(t, records, "job phase", map[string]any{"job_id": job.id, "phase": jobPhaseCrawling})
+		findTestLogRecord(t, records, "job phase", map[string]any{"job_id": job.id, "phase": jobPhaseDone})
+
+		finished := findTestLogRecord(t, records, "job finished", map[string]any{"job_id": job.id})
+		if got := testLogNumber(t, finished, "pages"); got != 1 {
+			t.Fatalf("pages = %v, want 1", got)
+		}
+		if _, ok := finished["duration_ms"].(float64); !ok {
+			t.Fatalf("duration_ms = %v, want a number", finished["duration_ms"])
+		}
+		if finished["truncated"] != false {
+			t.Fatalf("truncated = %v, want false", finished["truncated"])
+		}
+
+		output := buf.String()
+		for _, secret := range []string{syntheticBody, bearerToken, "Authorization"} {
+			if strings.Contains(output, secret) {
+				t.Fatalf("log output contains forbidden value %q:\n%s", secret, output)
+			}
+		}
+	})
+
+	t.Run("audit transitions emit audit records", func(t *testing.T) {
+		var buf testLogBuffer
+		logger := newTestJSONLogger(&buf)
+		jm := newJobManager(jobManagerConfig{Logger: logger, DisableReaper: true})
+		job := jm.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{Mode: 1, StartURL: "https://example.com", Audit: true})
+		job.limits = jobLimits{MaxPages: 10, MaxDepth: 2, MaxDuration: time.Minute}
+
+		job.beginAudit()
+		job.finishWithAudits(
+			[]Page{{URL: "https://example.com", StatusCode: 200}},
+			&auditpkg.Result{OutputDir: t.TempDir(), Summary: auditpkg.AuditSummary{Pages: 1}},
+			&auditpkg.Result{OutputDir: t.TempDir(), Summary: auditpkg.AuditSummary{Pages: 1}},
+			nil,
+		)
+
+		records := parseTestLogRecords(t, buf.String())
+		findTestLogRecord(t, records, "audit started", map[string]any{"job_id": job.id})
+		finished := findTestLogRecord(t, records, "audit finished", map[string]any{"job_id": job.id})
+		if finished["strict"] != true || finished["inclusive"] != true {
+			t.Fatalf("audit finished strict/inclusive = %v/%v, want true/true", finished["strict"], finished["inclusive"])
+		}
+	})
+
+	t.Run("text and json handlers carry the service identity", func(t *testing.T) {
+		var textBuf, jsonBuf testLogBuffer
+		newStructuredLogger(&textBuf, "").Info("hello", "tool", "start_crawl")
+		newStructuredLogger(&jsonBuf, "json").Info("hello", "tool", "start_crawl")
+
+		text := textBuf.String()
+		for _, want := range []string{"msg=hello", "tool=start_crawl", "service=" + mcpServerName, "version=" + mcpServerVersion} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("text log missing %q:\n%s", want, text)
+			}
+		}
+
+		records := parseTestLogRecords(t, jsonBuf.String())
+		record := findTestLogRecord(t, records, "hello", map[string]any{"tool": "start_crawl"})
+		if record["service"] != mcpServerName || record["version"] != mcpServerVersion {
+			t.Fatalf("json service identity = %v/%v, want %q/%q", record["service"], record["version"], mcpServerName, mcpServerVersion)
 		}
 	})
 }

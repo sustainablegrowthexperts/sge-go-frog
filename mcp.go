@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -30,6 +33,91 @@ type mcpServer struct {
 	runner crawlRunner
 	quota  *mcpQuota
 	ssrf   *ssrfPolicy
+	logger *slog.Logger
+}
+
+// newStructuredLogger builds the process logger. Text is the default format;
+// GOFROG_LOG_FORMAT=json selects the JSON handler. The service/version fields
+// are attached once so every record is attributable.
+func newStructuredLogger(out io.Writer, format string) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	var handler slog.Handler
+	if strings.EqualFold(strings.TrimSpace(format), "json") {
+		handler = slog.NewJSONHandler(out, opts)
+	} else {
+		handler = slog.NewTextHandler(out, opts)
+	}
+	return slog.New(handler).With("service", mcpServerName, "version", mcpServerVersion)
+}
+
+// loggerOr returns a usable logger for zero-value or test-constructed servers.
+func loggerOr(logger *slog.Logger) *slog.Logger {
+	if logger != nil {
+		return logger
+	}
+	return slog.Default()
+}
+
+// toolCallLog is the stable field set for one MCP tool invocation. Optional
+// fields are added only when they are known, so operators can query every
+// record without seeing empty values.
+type toolCallLog struct {
+	Tool       string
+	JobID      string
+	TargetHost string
+	Outcome    string
+	ErrorCode  string
+	ErrorCause string
+	Duration   time.Duration
+	Pages      int
+	HasPages   bool
+	Bytes      int64
+	HasBytes   bool
+}
+
+// logToolCall writes one structured tool-call record.
+func logToolCall(logger *slog.Logger, rec toolCallLog) {
+	attrs := []any{
+		"tool", rec.Tool,
+		"outcome", rec.Outcome,
+		"duration_ms", rec.Duration.Milliseconds(),
+	}
+	if rec.JobID != "" {
+		attrs = append(attrs, "job_id", rec.JobID)
+	}
+	if rec.TargetHost != "" {
+		attrs = append(attrs, "target_host", rec.TargetHost)
+	}
+	if rec.ErrorCode != "" {
+		attrs = append(attrs, "error_code", rec.ErrorCode)
+	}
+	if rec.ErrorCause != "" {
+		attrs = append(attrs, "error", rec.ErrorCause)
+	}
+	if rec.HasPages {
+		attrs = append(attrs, "pages", rec.Pages)
+	}
+	if rec.HasBytes {
+		attrs = append(attrs, "bytes", rec.Bytes)
+	}
+	if rec.Outcome == "error" {
+		loggerOr(logger).Warn("mcp tool call", attrs...)
+		return
+	}
+	loggerOr(logger).Info("mcp tool call", attrs...)
+}
+
+// hostFromURL returns only the host name, never the path, query, or userinfo.
+func hostFromURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
 }
 
 // newMCPServer builds the MCP server metadata, registers the tools, and wraps
@@ -45,13 +133,18 @@ func newMCPServer(jm *jobManager, cfg MCPConfig, runner crawlRunner, policy *ssr
 	if policy == nil {
 		policy = newSSRFPolicy()
 	}
+	logger := slog.Default()
+	if jm != nil {
+		logger = loggerOr(jm.logger)
+	}
 	s := &mcpServer{
 		server: sdkServer,
 		jobs:   jm,
 		config: cfg,
 		runner: runner,
-		quota:  newMCPQuota(cfg.Limits),
+		quota:  newMCPQuota(cfg.Limits, logger),
 		ssrf:   policy,
+		logger: logger,
 	}
 	s.registerTools()
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -87,30 +88,175 @@ func (s *mcpServer) registerTools() {
 	}, wrapMCPTool(s, "get_artifact", s.getArtifact))
 }
 
-// wrapMCPTool applies the shared panic boundary to one typed tool handler. A
-// panic becomes a generic internal_error result, and the sanitized cause is
-// logged server-side without a stack trace, page body, or credential.
+// wrapMCPTool applies the shared panic boundary and tool-call logging to one
+// typed tool handler. A panic becomes a generic internal_error result, and the
+// sanitized cause is logged server-side without a stack trace, page body, or
+// credential.
 func wrapMCPTool[In, Out any](s *mcpServer, tool string, handler func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, Out, error)) func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, Out, error) {
 	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (result *mcp.CallToolResult, out Out, err error) {
+		started := time.Now()
 		defer func() {
 			recovered := recover()
-			if recovered == nil {
-				return
+			if recovered != nil {
+				s.logToolPanic(tool, recovered)
+				var zero Out
+				result, out, err = nil, zero, newToolError(codeInternalError, "the tool failed unexpectedly", map[string]any{"tool": tool})
 			}
-			s.logToolPanic(tool, recovered)
-			var zero Out
-			result, out, err = nil, zero, newToolError(codeInternalError, "the tool failed unexpectedly", map[string]any{"tool": tool})
+			s.logToolCall(tool, in, out, err, time.Since(started))
 		}()
 		return handler(ctx, req, in)
 	}
+}
+
+// logToolCall records the stable tool-call fields from the typed input/output.
+// Only counts and identifiers are logged; page bodies, patterns, and artifact
+// content never enter a record.
+func (s *mcpServer) logToolCall(tool string, in, out any, err error, elapsed time.Duration) {
+	jobID := toolCallJobID(in, out)
+	rec := toolCallLog{
+		Tool:       tool,
+		JobID:      jobID,
+		TargetHost: s.toolCallTargetHost(in, jobID),
+		Outcome:    "ok",
+		Duration:   elapsed,
+	}
+	if err != nil {
+		rec.Outcome = "error"
+		rec.ErrorCode = toolCallErrorCode(err)
+		rec.ErrorCause = s.sanitizedToolError(err)
+	}
+	rec.Pages, rec.HasPages = toolCallPages(out)
+	rec.Bytes, rec.HasBytes = toolCallBytes(out)
+	logToolCall(s.loggerOr(), rec)
+}
+
+// sanitizedToolError returns a bounded, credential-free cause for server logs.
+func (s *mcpServer) sanitizedToolError(err error) string {
+	if err == nil {
+		return ""
+	}
+	cause := sanitizeDiagnosticText(err.Error())
+	if s != nil {
+		if dir := strings.TrimSpace(s.config.ResultsDir); dir != "" {
+			cause = strings.ReplaceAll(cause, dir, "<results>")
+		}
+	}
+	return cause
+}
+
+// loggerOr returns the adapter logger, falling back to the shared job logger.
+func (s *mcpServer) loggerOr() *slog.Logger {
+	if s != nil && s.logger != nil {
+		return s.logger
+	}
+	if s != nil && s.jobs != nil && s.jobs.logger != nil {
+		return s.jobs.logger
+	}
+	return slog.Default()
+}
+
+// toolCallJobID prefers the job identity in the typed output and falls back to
+// the job_id argument so failed lookups remain attributable.
+func toolCallJobID(in, out any) string {
+	var id string
+	switch v := out.(type) {
+	case startCrawlOutput:
+		id = v.JobID
+	case getJobOutput:
+		id = v.JobID
+	case getResultsOutput:
+		id = v.JobID
+	case getAuditOutput:
+		id = v.JobID
+	case getArtifactOutput:
+		id = v.JobID
+	}
+	if id = strings.TrimSpace(id); id != "" {
+		return id
+	}
+	switch v := in.(type) {
+	case getJobInput:
+		id = v.JobID
+	case getResultsInput:
+		id = v.JobID
+	case searchPagesInput:
+		id = v.JobID
+	case getAuditInput:
+		id = v.JobID
+	case getArtifactInput:
+		id = v.JobID
+	}
+	return strings.TrimSpace(id)
+}
+
+// toolCallTargetHost resolves the host only, never the full URL with query.
+func (s *mcpServer) toolCallTargetHost(in any, jobID string) string {
+	if s != nil && s.jobs != nil && jobID != "" {
+		if job := s.jobs.get(jobID); job != nil {
+			if host := job.targetHost(); host != "" {
+				return host
+			}
+		}
+	}
+	switch v := in.(type) {
+	case startCrawlInput:
+		if host := hostFromURL(v.StartURL); host != "" {
+			return host
+		}
+		for _, raw := range v.URLs {
+			if host := hostFromURL(raw); host != "" {
+				return host
+			}
+		}
+	}
+	return ""
+}
+
+// toolCallPages reports the page count carried by read outputs.
+func toolCallPages(out any) (int, bool) {
+	switch v := out.(type) {
+	case getJobOutput:
+		return v.PagesCrawled, true
+	case getResultsOutput:
+		return v.Total, true
+	}
+	return 0, false
+}
+
+// toolCallBytes reports the artifact size carried by a get_artifact output.
+func toolCallBytes(out any) (int64, bool) {
+	if v, ok := out.(getArtifactOutput); ok {
+		return v.SizeBytes, true
+	}
+	return 0, false
+}
+
+// toolCallErrorCode maps a handler error to the stable client-facing code.
+func toolCallErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	var toolErr *toolError
+	if errors.As(err, &toolErr) {
+		return toolErr.Code
+	}
+	var limitErr *limitExceededError
+	if errors.As(err, &limitErr) {
+		return codeLimitExceeded
+	}
+	var conflictErr *idempotencyConflictError
+	if errors.As(err, &conflictErr) {
+		return codeConflict
+	}
+	return codeInternalError
 }
 
 // logToolPanic records the tool and a sanitized cause. Job IDs and tool names
 // are safe; page bodies and raw panic values are not.
 func (s *mcpServer) logToolPanic(tool string, recovered any) {
 	logger := slog.Default()
-	if s != nil && s.jobs != nil && s.jobs.logger != nil {
-		logger = s.jobs.logger
+	if s != nil {
+		logger = s.loggerOr()
 	}
 	cause := sanitizeDiagnosticText(fmt.Sprint(recovered))
 	if s != nil {

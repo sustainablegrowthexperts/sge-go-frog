@@ -1,7 +1,7 @@
 ---
 id: task-019
 title: "[Slice] MCP tool calls and job events emit structured logs"
-status: pending
+status: completed
 depends_on: ["task-018"]
 target_files:
   - "mcp.go"

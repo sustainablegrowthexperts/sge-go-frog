@@ -156,7 +156,25 @@ func (s *mcpServer) buildArtifact(job *crawlJob, kind string, inline bool) (getA
 			out.Content = string(data)
 		}
 	}
+
+	attrs := []any{"kind", kind, "size_bytes", out.SizeBytes, "inline", out.Inline}
+	if profile := artifactProfileForLog(kind); profile != "" {
+		attrs = append(attrs, "profile", profile)
+	}
+	logJobEvent(s.loggerOr(), "artifact served", job.id, attrs...)
 	return out, nil
+}
+
+// artifactProfileForLog maps audit artifact kinds to their report profile.
+func artifactProfileForLog(kind string) string {
+	switch kind {
+	case "audit_strict_zip", "audit_json_strict":
+		return "strict"
+	case "audit_inclusive_zip", "audit_json_inclusive":
+		return "inclusive"
+	default:
+		return ""
+	}
 }
 
 // getArtifactResponseOverhead reserves envelope and metadata bytes when

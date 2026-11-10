@@ -5036,3 +5036,151 @@ func auditNumber(t *testing.T, obj map[string]any, key string) float64 {
 	}
 	return value
 }
+
+// TestStructuredLoggingToolCalls covers one structured record per MCP tool
+// call: identity fields, outcome, duration, page/byte counts, error code, and
+// the guarantee that secrets and page bodies never reach the logs.
+func TestStructuredLoggingToolCalls(t *testing.T) {
+	const syntheticBody = "SYNTHETIC_PAGE_BODY_MUST_NOT_BE_LOGGED"
+	const bearerToken = "bearer-super-secret-token"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var buf testLogBuffer
+	logger := newTestJSONLogger(&buf)
+
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = t.TempDir()
+	runner := newImmediateFakeRunner([]Page{{
+		URL:         "https://example.com/page",
+		StatusCode:  200,
+		Title:       syntheticBody,
+		Description: syntheticBody,
+	}}, nil)
+	jm := newJobManager(jobManagerConfig{Logger: logger, DisableReaper: true})
+
+	server, err := newMCPServer(jm, cfg, runner, testSSRFPolicy())
+	if err != nil {
+		t.Fatalf("newMCPServer: %v", err)
+	}
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "go-frog-log-test", Version: "0.0.1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: ts.URL + cfg.Path}, nil)
+	if err != nil {
+		t.Fatalf("MCP client connect: %v", err)
+	}
+	defer session.Close()
+
+	start := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":      "spider",
+		"start_url": "https://example.com/page?access_token=" + bearerToken,
+	})
+	jobID, _ := start["job_id"].(string)
+	if jobID == "" {
+		t.Fatal("start_crawl did not return a job ID")
+	}
+	waitForJobStatus(t, jm.get(jobID), jobStatusDone)
+
+	callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+	callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": jobID})
+	artifact := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+		"job_id": jobID,
+		"kind":   "csv",
+		"inline": true,
+	})
+	if got := artifact["size_bytes"].(float64); got <= 0 {
+		t.Fatalf("artifact size_bytes = %v, want > 0", got)
+	}
+
+	bad := callTool(t, ctx, session, "get_job", map[string]any{})
+	if !bad.IsError {
+		t.Fatal("get_job without a job ID did not return an error")
+	}
+
+	records := parseTestLogRecords(t, buf.String())
+
+	startRecord := findTestLogRecord(t, records, "mcp tool call", map[string]any{"tool": "start_crawl"})
+	if startRecord["job_id"] != jobID {
+		t.Fatalf("start_crawl job_id = %v, want %q", startRecord["job_id"], jobID)
+	}
+	if startRecord["target_host"] != "example.com" {
+		t.Fatalf("start_crawl target_host = %v, want example.com", startRecord["target_host"])
+	}
+	if startRecord["outcome"] != "ok" {
+		t.Fatalf("start_crawl outcome = %v, want ok", startRecord["outcome"])
+	}
+	if _, ok := startRecord["duration_ms"].(float64); !ok {
+		t.Fatalf("start_crawl duration_ms = %v, want a number", startRecord["duration_ms"])
+	}
+
+	resultsRecord := findTestLogRecord(t, records, "mcp tool call", map[string]any{"tool": "get_results"})
+	if got := testLogNumber(t, resultsRecord, "pages"); got != 1 {
+		t.Fatalf("get_results pages = %v, want 1", got)
+	}
+
+	artifactRecord := findTestLogRecord(t, records, "mcp tool call", map[string]any{"tool": "get_artifact"})
+	if got := testLogNumber(t, artifactRecord, "bytes"); got <= 0 {
+		t.Fatalf("get_artifact bytes = %v, want > 0", got)
+	}
+
+	errorRecord := findTestLogRecord(t, records, "mcp tool call", map[string]any{"tool": "get_job", "outcome": "error"})
+	if errorRecord["error_code"] != codeInvalidArgument {
+		t.Fatalf("get_job error_code = %v, want %q", errorRecord["error_code"], codeInvalidArgument)
+	}
+	if cause, ok := errorRecord["error"].(string); !ok || cause == "" {
+		t.Fatalf("get_job error cause = %v, want a sanitized cause", errorRecord["error"])
+	}
+
+	findTestLogRecord(t, records, "artifact served", map[string]any{"job_id": jobID, "kind": "csv"})
+
+	output := buf.String()
+	for _, secret := range []string{syntheticBody, bearerToken, "Authorization"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("log output contains forbidden value %q:\n%s", secret, output)
+		}
+	}
+}
+
+// TestStructuredLoggingLimits covers the limit/rate event log shape.
+func TestStructuredLoggingLimits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var buf testLogBuffer
+	logger := newTestJSONLogger(&buf)
+
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = t.TempDir()
+	cfg.Limits.RateLimitPerMinute = 1
+	jm := newJobManager(jobManagerConfig{Logger: logger, DisableReaper: true})
+
+	server, err := newMCPServer(jm, cfg, newImmediateFakeRunner(nil, nil), testSSRFPolicy())
+	if err != nil {
+		t.Fatalf("newMCPServer: %v", err)
+	}
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "go-frog-limit-log-test", Version: "0.0.1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: ts.URL + cfg.Path}, nil)
+	if err != nil {
+		t.Fatalf("MCP client connect: %v", err)
+	}
+	defer session.Close()
+
+	callTool(t, ctx, session, "list_jobs", map[string]any{})
+	limited := callTool(t, ctx, session, "list_jobs", map[string]any{})
+	if !limited.IsError {
+		t.Fatal("second list_jobs did not hit the rate limit")
+	}
+
+	records := parseTestLogRecords(t, buf.String())
+	event := findTestLogRecord(t, records, "limit event", map[string]any{"limit": "rate_limit"})
+	if got := testLogNumber(t, event, "retry_after_ms"); got <= 0 {
+		t.Fatalf("retry_after_ms = %v, want > 0", got)
+	}
+	findTestLogRecord(t, records, "mcp tool call", map[string]any{"tool": "list_jobs", "outcome": "error", "error_code": codeLimitExceeded})
+}

@@ -187,6 +187,23 @@ func newJobManager(cfg jobManagerConfig) *jobManager {
 	return jm
 }
 
+// logJobEvent writes one structured lifecycle record with the shared job_id
+// field. Callers supply only identifiers, phases, and counts.
+func logJobEvent(logger *slog.Logger, msg, jobID string, attrs ...any) {
+	fields := make([]any, 0, len(attrs)+2)
+	fields = append(fields, "job_id", jobID)
+	fields = append(fields, attrs...)
+	loggerOr(logger).Info(msg, fields...)
+}
+
+// logJobError writes a sanitized server-side failure record.
+func logJobError(logger *slog.Logger, msg, jobID string, attrs ...any) {
+	fields := make([]any, 0, len(attrs)+2)
+	fields = append(fields, "job_id", jobID)
+	fields = append(fields, attrs...)
+	loggerOr(logger).Error(msg, fields...)
+}
+
 // hydrate restores persisted jobs, cleans expired terminal directories, and
 // marks jobs that were queued or running when the previous process stopped as
 // error/interrupted.
@@ -299,9 +316,41 @@ func (jm *jobManager) createWithRequest(owner, mode, target string, s WizardSett
 	}
 	jm.mu.Unlock()
 
+	logJobEvent(jm.logger, "job created", j.id,
+		"owner", owner,
+		"mode", mode,
+		"target_host", s.targetHost(),
+		"max_pages", limits.MaxPages,
+		"max_depth", limits.MaxDepth,
+		"max_duration_seconds", int(limits.MaxDuration/time.Second),
+	)
+
 	// Persist the early running/queued state so a crash can be recovered.
 	jm.persistJob(j)
 	return j, false, nil
+}
+
+// targetHost returns only the target host for structured logs.
+func (s WizardSettings) targetHost() string {
+	if host := hostFromURL(s.StartURL); host != "" {
+		return host
+	}
+	for _, raw := range s.listURLs {
+		if host := hostFromURL(raw); host != "" {
+			return host
+		}
+	}
+	return ""
+}
+
+// targetHost returns only the job's target host for structured logs.
+func (j *crawlJob) targetHost() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if host := j.settings.targetHost(); host != "" {
+		return host
+	}
+	return hostFromURL(j.target)
 }
 
 // idempotencyKey scopes request IDs to one owner so different callers can use
@@ -751,6 +800,9 @@ func (j *crawlJob) setPhaseLocked(phase string) bool {
 	if isTerminalPhase(phase) && j.finishedAt.IsZero() {
 		j.finishedAt = time.Now().UTC()
 	}
+	if changed {
+		logJobEvent(j.logger, "job phase", j.id, "phase", phase)
+	}
 	return changed
 }
 
@@ -772,6 +824,7 @@ func (j *crawlJob) beginAudit() {
 	j.auditStarted = true
 	j.mu.Unlock()
 	j.persist()
+	logJobEvent(j.logger, "audit started", j.id)
 }
 
 // statusPhase returns a consistent status/phase pair for polling.
@@ -803,6 +856,45 @@ func (j *crawlJob) finish(pages []Page) {
 	j.pages = len(pages)
 	j.mu.Unlock()
 	j.persist()
+	j.logFinished()
+}
+
+// logFinished writes the terminal job record with counts and duration.
+func (j *crawlJob) logFinished() {
+	j.mu.Lock()
+	pages := j.pages
+	truncated := j.truncated
+	limitReason := j.limitReason
+	startedAt := j.startedAt
+	finishedAt := j.finishedAt
+	auditEnabled := j.settings.Audit
+	auditStrict := j.auditReady
+	auditInclusive := j.auditInclusiveReady
+	j.mu.Unlock()
+
+	duration := time.Duration(0)
+	if !startedAt.IsZero() {
+		if finishedAt.IsZero() {
+			duration = time.Since(startedAt)
+		} else {
+			duration = finishedAt.Sub(startedAt)
+		}
+	} else if !j.createdAt.IsZero() {
+		duration = time.Since(j.createdAt)
+	}
+
+	attrs := []any{
+		"pages", pages,
+		"duration_ms", duration.Milliseconds(),
+		"truncated", truncated,
+	}
+	if limitReason != "" {
+		attrs = append(attrs, "limit_reason", limitReason)
+	}
+	if auditEnabled {
+		attrs = append(attrs, "audit_strict_ready", auditStrict, "audit_inclusive_ready", auditInclusive)
+	}
+	logJobEvent(j.logger, "job finished", j.id, attrs...)
 }
 
 // setTruncation records the crawl outcome's cap metadata. A non-truncated
@@ -818,12 +910,32 @@ func (j *crawlJob) setTruncation(truncated bool, reason string) {
 }
 
 func (j *crawlJob) fail(err error) {
+	sanitized := j.sanitizedError(err)
 	j.mu.Lock()
 	j.status = jobStatusError
 	j.setPhaseLocked(jobPhaseError)
 	j.errMsg = err.Error()
 	j.mu.Unlock()
 	j.persist()
+	logJobError(j.logger, "job failed", j.id, "error", sanitized)
+}
+
+// sanitizedError removes known job-owned filesystem prefixes and credentials
+// from a server-side error record.
+func (j *crawlJob) sanitizedError(err error) string {
+	if err == nil {
+		return ""
+	}
+	j.mu.Lock()
+	dirs := []string{j.settings.AuditArchiveDir}
+	j.mu.Unlock()
+	text := sanitizeDiagnosticText(err.Error())
+	for _, dir := range dirs {
+		if dir = strings.TrimSpace(dir); dir != "" {
+			text = strings.ReplaceAll(text, dir, "<job_dir>")
+		}
+	}
+	return text
 }
 
 func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Result, inclusiveErr error) {
@@ -850,9 +962,23 @@ func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Re
 	}
 	j.mu.Unlock()
 	j.persist()
+
+	j.mu.Lock()
+	strictPages := j.auditSummary.Pages
+	inclusivePages := j.auditInclusiveSummary.Pages
+	inclusiveReady := j.auditInclusiveReady
+	j.mu.Unlock()
+	logJobEvent(j.logger, "audit finished", j.id,
+		"strict", true,
+		"inclusive", inclusiveReady,
+		"strict_pages", strictPages,
+		"inclusive_pages", inclusivePages,
+	)
+	j.logFinished()
 }
 
 func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
+	sanitized := j.sanitizedError(err)
 	j.mu.Lock()
 	j.status = jobStatusDone
 	j.setPhaseLocked(jobPhaseDone)
@@ -862,6 +988,8 @@ func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
 	j.auditError = err.Error()
 	j.mu.Unlock()
 	j.persist()
+	logJobError(j.logger, "audit failed", j.id, "error", sanitized)
+	j.logFinished()
 }
 
 type jobView struct {
@@ -1065,6 +1193,9 @@ type appConfig struct {
 	// SSRF overrides the public-target policy. Tests use it to reach httptest
 	// loopback servers; production uses the public-only default.
 	SSRF *ssrfPolicy
+	// Logger is injected into the shared job manager and MCP adapter. A nil
+	// value selects the process logger configured by GOFROG_LOG_FORMAT.
+	Logger *slog.Logger
 }
 
 type app struct {
@@ -1098,6 +1229,11 @@ func newApp(cfg appConfig) (*app, error) {
 		}
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = newStructuredLogger(os.Stderr, os.Getenv("GOFROG_LOG_FORMAT"))
+	}
+
 	jm := newJobManager(jobManagerConfig{
 		Retention: retentionConfig{
 			MCPTTL:             cfg.MCP.JobTTL,
@@ -1105,7 +1241,8 @@ func newApp(cfg appConfig) (*app, error) {
 			ReapInterval:       cfg.MCP.ReapInterval,
 			MaxRetainedMCPJobs: cfg.MCP.MaxRetainedJobs,
 		},
-		Store: store,
+		Store:  store,
+		Logger: logger,
 	})
 	mux := http.NewServeMux()
 	registerWebRoutes(mux, jm, runner)
