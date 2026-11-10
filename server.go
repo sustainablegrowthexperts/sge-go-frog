@@ -76,6 +76,11 @@ type jobManagerConfig struct {
 	Ticker        func(time.Duration) <-chan time.Time
 	Logger        *slog.Logger
 	DisableReaper bool
+
+	// Store enables per-job filesystem persistence. MCP jobs are persisted by
+	// default; UI jobs remain process-local unless PersistUIJobs is set.
+	Store         *jobStore
+	PersistUIJobs bool
 }
 
 type jobManager struct {
@@ -91,6 +96,9 @@ type jobManager struct {
 	now       func() time.Time
 	ticker    func(time.Duration) <-chan time.Time
 	logger    *slog.Logger
+
+	store     *jobStore
+	persistUI bool
 }
 
 // idempotencyEntry records the job owning a request key and the effective
@@ -112,6 +120,14 @@ type crawlJob struct {
 	archiveHTML     bool
 	clientRequestID string
 
+	// store, logger, and persistUI wire persistence hooks. A nil store keeps
+	// the job process-local. persistMu serializes writes for one job so an
+	// older snapshot can never overwrite a newer terminal state.
+	store     *jobStore
+	logger    *slog.Logger
+	persistUI bool
+	persistMu sync.Mutex
+
 	mu         sync.Mutex
 	status     string // "running" | "done" | "error"
 	phase      string // "starting" | "crawling" | "done" | "error"
@@ -120,6 +136,7 @@ type crawlJob struct {
 	pages      int
 	currentURL string
 	errMsg     string
+	errCode    string
 	result     []Page
 	settings   WizardSettings
 
@@ -158,11 +175,61 @@ func newJobManager(cfg jobManagerConfig) *jobManager {
 		now:         now,
 		ticker:      ticker,
 		logger:      logger,
+		store:       cfg.Store,
+		persistUI:   cfg.PersistUIJobs,
+	}
+	if jm.store != nil {
+		jm.hydrate()
 	}
 	if !cfg.DisableReaper {
 		go jm.reapLoop()
 	}
 	return jm
+}
+
+// hydrate restores persisted jobs, cleans expired terminal directories, and
+// marks jobs that were queued or running when the previous process stopped as
+// error/interrupted.
+func (jm *jobManager) hydrate() {
+	if _, err := jm.store.cleanupExpired(jm.now(), jm.retention); err != nil {
+		jm.logger.Warn("job store: cleanup expired jobs failed", "error", err)
+	}
+	jobs, err := jm.store.loadAll()
+	if err != nil {
+		jm.logger.Warn("job store: loading persisted jobs failed", "error", err)
+		return
+	}
+
+	for _, job := range jobs {
+		job.store = jm.store
+		job.logger = jm.logger
+		job.persistUI = jm.persistUI
+
+		job.mu.Lock()
+		interrupted := job.status == jobStatusQueued || job.status == jobStatusRunning
+		if interrupted {
+			job.status = jobStatusError
+			job.phase = jobPhaseError
+			job.errCode = "interrupted"
+			job.errMsg = "job interrupted by server restart"
+			job.finishedAt = jm.now()
+		}
+		job.mu.Unlock()
+
+		jm.jobs[job.id] = job
+		if interrupted {
+			jm.persistJob(job)
+		}
+	}
+}
+
+// persistJob writes one job to the store, respecting the UI opt-in. Persistence
+// failures are logged but do not fail the request that triggered them.
+func (jm *jobManager) persistJob(job *crawlJob) {
+	if jm.store == nil || job == nil {
+		return
+	}
+	job.persist()
 }
 
 // createWithOwner creates an owner-scoped job without an idempotency key.
@@ -183,14 +250,15 @@ func (jm *jobManager) createWithRequest(owner, mode, target string, s WizardSett
 	}
 
 	jm.mu.Lock()
-	defer jm.mu.Unlock()
 
 	if key != "" {
 		if entry, ok := jm.idempotency[key]; ok {
 			if existing := jm.jobs[entry.jobID]; existing != nil {
 				if entry.fingerprint != fingerprint {
+					jm.mu.Unlock()
 					return nil, false, &idempotencyConflictError{ExistingJobID: entry.jobID}
 				}
+				jm.mu.Unlock()
 				return existing, true, nil
 			}
 			// The index entry outlived its job. Drop it and treat the request
@@ -215,6 +283,9 @@ func (jm *jobManager) createWithRequest(owner, mode, target string, s WizardSett
 		limits:          limits,
 		archiveHTML:     archiveHTML,
 		clientRequestID: clientRequestID,
+		store:           jm.store,
+		logger:          jm.logger,
+		persistUI:       jm.persistUI,
 		status:          jobStatusRunning,
 		phase:           jobPhaseStarting,
 		settings:        s,
@@ -226,6 +297,10 @@ func (jm *jobManager) createWithRequest(owner, mode, target string, s WizardSett
 		}
 		jm.idempotency[key] = idempotencyEntry{jobID: j.id, fingerprint: fingerprint}
 	}
+	jm.mu.Unlock()
+
+	// Persist the early running/queued state so a crash can be recovered.
+	jm.persistJob(j)
 	return j, false, nil
 }
 
@@ -395,12 +470,19 @@ func (jm *jobManager) runningCount(owner string) int {
 	return count
 }
 
-// delete removes a job from the manager and purges its idempotency mapping. It
-// reports whether the job existed.
+// delete removes a job from the manager, purges its idempotency mapping, and
+// removes its persisted directory. It reports whether the job existed.
 func (jm *jobManager) delete(id string) bool {
 	jm.mu.Lock()
-	defer jm.mu.Unlock()
-	return jm.deleteLocked(id)
+	ok := jm.deleteLocked(id)
+	jm.mu.Unlock()
+
+	if ok && jm.store != nil {
+		if err := jm.store.delete(id); err != nil {
+			jm.logger.Warn("job store: delete job failed", "job_id", id, "error", err)
+		}
+	}
+	return ok
 }
 
 // deleteLocked removes a job and its mapping. The caller must hold jm.mu.
@@ -585,6 +667,17 @@ func (jm *jobManager) reapAt(now time.Time) {
 		jm.deleteLocked(id)
 	}
 	jm.mu.Unlock()
+
+	// Remove persisted directories only after the manager lock is released.
+	// Running jobs never reach deleteIDs, so their directories are never
+	// touched here.
+	if jm.store != nil {
+		for id := range deleteIDs {
+			if err := jm.store.delete(id); err != nil {
+				jm.logger.Warn("job store: delete reaped job failed", "job_id", id, "error", err)
+			}
+		}
+	}
 }
 
 // logRetentionDecision emits one structured, content-free retention record.
@@ -598,36 +691,62 @@ func (jm *jobManager) logRetentionDecision(decision retentionDecision) {
 	)
 }
 
+// persist writes the current job state to the configured store. A nil store
+// keeps the job process-local. UI jobs are only written when explicitly enabled.
+// The per-job write lock makes every snapshot reflect the state at write time,
+// so a slow earlier write cannot clobber a later terminal transition.
+func (j *crawlJob) persist() {
+	if j.store == nil {
+		return
+	}
+	if j.owner != ownerMCP && !j.persistUI {
+		return
+	}
+	j.persistMu.Lock()
+	defer j.persistMu.Unlock()
+	if err := j.store.save(j); err != nil && j.logger != nil {
+		j.logger.Warn("job store: persist job failed", "job_id", j.id, "error", err)
+	}
+}
+
 // markQueued moves a newly created job into the bounded MCP wait queue. It is
 // only used for MCP jobs; the web UI keeps launching immediately.
 func (j *crawlJob) markQueued() {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	j.status = jobStatusQueued
 	j.phase = jobPhaseQueued
+	j.mu.Unlock()
+	j.persist()
 }
 
 // startFromQueue transitions an admitted queued job to running/starting and
 // records its real start time.
 func (j *crawlJob) startFromQueue() {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	if j.status != jobStatusQueued {
+		j.mu.Unlock()
 		return
 	}
 	j.status = jobStatusRunning
 	j.phase = jobPhaseStarting
 	j.startedAt = time.Now().UTC()
+	j.mu.Unlock()
+	j.persist()
 }
 
 // setPhase moves the job to an active phase and records startedAt the first
-// time it becomes active.
+// time it becomes active. Only a real phase change is persisted; progress
+// callbacks never write.
 func (j *crawlJob) setPhase(phase string) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
+	changed := j.phase != phase
 	j.phase = phase
 	if j.startedAt.IsZero() && phase != jobPhaseDone && phase != jobPhaseError {
 		j.startedAt = time.Now().UTC()
+	}
+	j.mu.Unlock()
+	if changed {
+		j.persist()
 	}
 }
 
@@ -635,8 +754,9 @@ func (j *crawlJob) setPhase(phase string) {
 // a pending audit from one that is running.
 func (j *crawlJob) beginAudit() {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	j.auditStarted = true
+	j.mu.Unlock()
+	j.persist()
 }
 
 // statusPhase returns a consistent status/phase pair for polling.
@@ -662,26 +782,27 @@ func (j *crawlJob) progress(url string) {
 
 func (j *crawlJob) finish(pages []Page) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	j.status = jobStatusDone
 	j.phase = jobPhaseDone
 	j.finishedAt = time.Now().UTC()
 	j.result = pages
 	j.pages = len(pages)
+	j.mu.Unlock()
+	j.persist()
 }
 
 func (j *crawlJob) fail(err error) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	j.status = jobStatusError
 	j.phase = jobPhaseError
 	j.finishedAt = time.Now().UTC()
 	j.errMsg = err.Error()
+	j.mu.Unlock()
+	j.persist()
 }
 
 func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Result, inclusiveErr error) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	j.status = jobStatusDone
 	j.phase = jobPhaseDone
 	j.finishedAt = time.Now().UTC()
@@ -703,11 +824,12 @@ func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Re
 	case inclusiveErr != nil:
 		j.auditInclusiveError = inclusiveErr.Error()
 	}
+	j.mu.Unlock()
+	j.persist()
 }
 
 func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	j.status = jobStatusDone
 	j.phase = jobPhaseDone
 	j.finishedAt = time.Now().UTC()
@@ -715,6 +837,8 @@ func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
 	j.pages = len(pages)
 	j.auditReady = false
 	j.auditError = err.Error()
+	j.mu.Unlock()
+	j.persist()
 }
 
 type jobView struct {
@@ -939,6 +1063,15 @@ func newApp(cfg appConfig) (*app, error) {
 		runner = realCrawlRunner{}
 	}
 
+	var store *jobStore
+	if cfg.MCP.PersistJobs {
+		var err error
+		store, err = newJobStore(cfg.MCP.ResultsDir)
+		if err != nil {
+			return nil, fmt.Errorf("initialize job persistence: %w", err)
+		}
+	}
+
 	jm := newJobManager(jobManagerConfig{
 		Retention: retentionConfig{
 			MCPTTL:             cfg.MCP.JobTTL,
@@ -946,6 +1079,7 @@ func newApp(cfg appConfig) (*app, error) {
 			ReapInterval:       cfg.MCP.ReapInterval,
 			MaxRetainedMCPJobs: cfg.MCP.MaxRetainedJobs,
 		},
+		Store: store,
 	})
 	mux := http.NewServeMux()
 	registerWebRoutes(mux, jm, runner)

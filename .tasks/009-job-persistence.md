@@ -1,7 +1,7 @@
 ---
 id: task-009
 title: "[Slice] Completed MCP jobs survive restarts"
-status: pending
+status: completed
 depends_on: ["task-008"]
 target_files:
   - "job_store.go"

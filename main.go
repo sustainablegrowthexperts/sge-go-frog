@@ -34,6 +34,7 @@ type MCPConfig struct {
 	ReapInterval    time.Duration
 	MaxRetainedJobs int
 	ResultsDir      string
+	PersistJobs     bool
 	Limits          MCPLimits
 	DefaultArchive  bool
 	ArtifactBaseURL string
@@ -48,6 +49,7 @@ func defaultMCPConfig() MCPConfig {
 		ReapInterval:    defaultJobReapInterval,
 		MaxRetainedJobs: defaultMaxRetainedMCPJobs,
 		ResultsDir:      defaultMCPResultsDir,
+		PersistJobs:     false,
 		Limits:          defaultMCPLimits(),
 		DefaultArchive:  false,
 		ArtifactBaseURL: "",
@@ -99,6 +101,13 @@ func mcpConfigFromEnv(getenv func(string) string) (MCPConfig, error) {
 	}
 	if v := strings.TrimSpace(getenv("GOFROG_MCP_RESULTS_DIR")); v != "" {
 		cfg.ResultsDir = v
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_PERSIST")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_PERSIST: %w", err)
+		}
+		cfg.PersistJobs = b
 	}
 	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_PAGES")); v != "" {
 		n, err := strconv.Atoi(v)
@@ -220,6 +229,7 @@ func (c *MCPConfig) registerFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ReapInterval, "job-reap-interval", c.ReapInterval, "how often the job reaper runs")
 	fs.IntVar(&c.MaxRetainedJobs, "mcp-max-retained-jobs", c.MaxRetainedJobs, "maximum finished MCP jobs kept in memory")
 	fs.StringVar(&c.ResultsDir, "mcp-results-dir", c.ResultsDir, "directory for MCP job artifacts")
+	fs.BoolVar(&c.PersistJobs, "mcp-persist", c.PersistJobs, "persist MCP jobs under the results directory")
 	fs.IntVar(&c.Limits.MaxPages, "mcp-max-pages", c.Limits.MaxPages, "maximum pages per MCP crawl")
 	fs.IntVar(&c.Limits.MaxDepth, "mcp-max-depth", c.Limits.MaxDepth, "maximum crawl depth for MCP jobs")
 	fs.IntVar(&c.Limits.MaxListURLs, "mcp-max-list-urls", c.Limits.MaxListURLs, "maximum URLs in an MCP list job")
