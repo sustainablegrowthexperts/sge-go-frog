@@ -6688,6 +6688,114 @@ func TestToolSchemasGolden(t *testing.T) {
 	}
 }
 
+// TestMCPWorkflowGuidance checks that an MCP client can discover the full
+// start_crawl -> get_job -> read -> download workflow from initialize and
+// tools/list alone. It also guards against advertising out-of-scope features.
+func TestMCPWorkflowGuidance(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+	init := session.InitializeResult()
+	if init == nil {
+		t.Fatal("initialize result is missing")
+	}
+	instructions := init.Instructions
+	if strings.TrimSpace(instructions) == "" {
+		t.Fatal("initialize result instructions are empty")
+	}
+
+	workflowMarkers := []string{
+		"start_crawl",
+		"get_job",
+		"get_artifact",
+		"get_results",
+		"get_audit",
+		"search_pages",
+		"done",
+		"archive_html",
+		"audit",
+		"GET",
+		"HEAD",
+	}
+	for _, marker := range workflowMarkers {
+		if !strings.Contains(instructions, marker) {
+			t.Errorf("initialize instructions must mention %q", marker)
+		}
+	}
+
+	artifactKinds := []string{
+		"csv",
+		"audit_strict_zip",
+		"audit_inclusive_zip",
+		"audit_json_strict",
+		"audit_json_inclusive",
+		"audit_xlsx_strict",
+		"audit_xlsx_inclusive",
+	}
+	for _, kind := range artifactKinds {
+		if !strings.Contains(instructions, kind) {
+			t.Errorf("initialize instructions must mention artifact kind %q", kind)
+		}
+	}
+
+	lowerInstructions := strings.ToLower(instructions)
+	for _, unwanted := range []string{"cancel_job", "gofrog://", "stdio"} {
+		if strings.Contains(lowerInstructions, unwanted) {
+			t.Errorf("initialize instructions must not mention %q", unwanted)
+		}
+	}
+	for _, unwanted := range []string{"progress notification", "notifications/progress"} {
+		if strings.Contains(lowerInstructions, unwanted) {
+			t.Errorf("initialize instructions must not promise %q", unwanted)
+		}
+	}
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	byName := make(map[string]*mcp.Tool, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		byName[tool.Name] = tool
+	}
+
+	requireDescription := func(name string, wants ...string) {
+		t.Helper()
+		tool, ok := byName[name]
+		if !ok {
+			t.Fatalf("tool %q is missing", name)
+		}
+		for _, want := range wants {
+			if !strings.Contains(tool.Description, want) {
+				t.Errorf("%s description must mention %q; got %q", name, want, tool.Description)
+			}
+		}
+	}
+
+	requireDescription("start_crawl", "absolute", "get_job")
+	requireDescription("get_job", "poll", "done", "error", "cancelled")
+	requireDescription("search_pages", "archive_html", "audit")
+	requireDescription("get_audit", "audit=true")
+
+	artifactDescription := []string{"absolute", "GET", "HEAD", "done"}
+	artifactDescription = append(artifactDescription, artifactKinds...)
+	requireDescription("get_artifact", artifactDescription...)
+
+	// The seven-kind enum remains the wire contract; this task must not widen it.
+	getArtifact := byName["get_artifact"]
+	schema, ok := getArtifact.InputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("get_artifact.inputSchema = %T, want an object", getArtifact.InputSchema)
+	}
+	kindSchema, ok := schemaProperties(t, "get_artifact.inputSchema", schema)["kind"].(map[string]any)
+	if !ok {
+		t.Fatal("get_artifact.inputSchema.properties.kind is missing or not an object")
+	}
+	assertStringSet(t, "get_artifact.kind.enum", schemaEnum(t, "get_artifact.kind", kindSchema), artifactKinds)
+}
+
 // readContractFile reads one checked-in documentation or deployment file.
 func readContractFile(t *testing.T, name string) string {
 	t.Helper()

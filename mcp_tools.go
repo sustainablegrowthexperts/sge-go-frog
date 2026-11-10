@@ -25,14 +25,14 @@ import (
 func (s *mcpServer) registerTools() {
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "start_crawl",
-		Description: "Start an asynchronous spider or list crawl with optional keywords, audit, and per-job limits; returns a job ID for polling with get_job.",
+		Description: "Start an asynchronous spider or list crawl with optional keywords, audit, archive_html, filters, and per-job limits. Returns a job ID plus absolute artifact links; poll get_job for completion. HTML and text search needs archive_html=true or audit=true, and audit retrieval needs audit=true on a spider job.",
 		Annotations: startCrawlAnnotations(),
 		InputSchema: startCrawlInputSchema,
 	}, wrapMCPTool(s, "start_crawl", s.startCrawl))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_job",
-		Description: "Poll an MCP-created job for status, phase, progress, limits, audit state, and artifact readiness.",
+		Description: "Poll an MCP-created job for completion; this is the polling mechanism to use until the status is terminal (done, error, or cancelled). Returns status, phase, progress, limits, audit state, error, and artifact readiness.",
 		Annotations: readOnlyToolAnnotations(),
 		InputSchema: getJobInputSchema,
 	}, wrapMCPTool(s, "get_job", s.getJob))
@@ -46,7 +46,7 @@ func (s *mcpServer) registerTools() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_results",
-		Description: "Retrieve filtered, sorted, and paginated page rows for a completed MCP job, with keyword counts, summary counts, optional manifest depth, and an optional strict-audit join.",
+		Description: "Retrieve filtered, sorted, and paginated page rows for a done MCP job, with keyword counts, summary counts, optional manifest depth, and an optional strict-audit join.",
 		Annotations: readOnlyToolAnnotations(),
 		InputSchema: getResultsInputSchema,
 	}, wrapMCPTool(s, "get_results", s.getResults))
@@ -60,14 +60,14 @@ func (s *mcpServer) registerTools() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_audit",
-		Description: "Read a strict or inclusive audit section for a completed MCP job. Sections include summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, and all. links contains content page links only; external, redirect, and excluded rows are available in the audit ZIP artifact.",
+		Description: "Read a strict or inclusive audit section for a done MCP job created with audit=true. Sections include summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, and all. links contains content page links only; external, redirect, and excluded rows are available in the audit ZIP artifact.",
 		Annotations: readOnlyToolAnnotations(),
 		InputSchema: getAuditInputSchema,
 	}, wrapMCPTool(s, "get_audit", s.getAudit))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_artifact",
-		Description: "Get a job-scoped download URL, size, and expiry for a completed MCP job's CSV report, strict/inclusive audit ZIP, strict/inclusive audit JSON, or strict/inclusive audit XLSX workbook. Set inline=true for small CSV and audit JSON content below the server cap; XLSX is never returned inline.",
+		Description: "Get an absolute, job-scoped download URL, filename, content type, size, and expiry for a done MCP job. Kinds are csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, audit_json_inclusive, audit_xlsx_strict, and audit_xlsx_inclusive. Download the URL with GET or HEAD; inline=true returns small CSV or audit JSON content below the server cap, and XLSX is never returned inline.",
 		Annotations: readOnlyToolAnnotations(),
 		InputSchema: getArtifactInputSchema,
 	}, wrapMCPTool(s, "get_artifact", s.getArtifact))

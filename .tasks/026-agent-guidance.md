@@ -1,7 +1,7 @@
 ---
 id: task-026
 title: "[Slice] AI discovers the start, poll, read, and download workflow from MCP guidance"
-status: pending
+status: completed
 depends_on: ["task-025"]
 target_files:
   - "mcp.go"

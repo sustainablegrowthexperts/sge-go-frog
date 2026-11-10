@@ -29,6 +29,26 @@ const (
 	mcpServerVersion     = mcpBuildVersion + "+mcp." + mcpToolSchemaVersion
 )
 
+// mcpInstructions is the concise server-level guidance returned by initialize.
+// It describes the start -> poll -> read -> download workflow and the artifact
+// surface without duplicating each tool's description.
+const mcpInstructions = `go-frog crawls public websites in spider or list mode and can audit internal linking.
+
+Workflow: call start_crawl, then poll get_job until the job reaches a terminal status (done, error, or cancelled). Do not assume results are immediately available; use poll_after_ms from start_crawl or get_job between polls.
+
+After completion:
+- get_results returns filtered page rows and keyword counts.
+- get_audit returns strict or inclusive audit sections.
+- search_pages searches page metadata and, when archived, raw HTML or visible text.
+- get_artifact returns a download URL for a generated file; you may also GET that absolute URL directly.
+
+Prerequisites:
+- HTML and text search requires archive_html=true or audit=true.
+- Audit retrieval requires audit=true on a spider job.
+- Artifacts are available only when the job status is done.
+
+Artifacts: csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, audit_json_inclusive, audit_xlsx_strict, audit_xlsx_inclusive. URLs returned by start_crawl and get_artifact are absolute, job-scoped, and under the configured MCP endpoint. Downloads support GET and HEAD; URLs expire with the job retention window. Artifact downloads return 404 for unknown or expired URLs, 409 for unfinished jobs, and 405 for unsupported methods. Page, duration, size, and retention limits are server-enforced.`
+
 // mcpServer is the thin adapter around the official MCP Go SDK. SDK types and
 // transport details stay in this file so the crawl/job code does not depend on
 // the protocol library.
@@ -146,7 +166,7 @@ func newMCPServer(jm *jobManager, cfg MCPConfig, runner crawlRunner, policy *ssr
 	sdkServer := mcp.NewServer(&mcp.Implementation{
 		Name:    mcpServerName,
 		Version: mcpServerVersion,
-	}, nil)
+	}, &mcp.ServerOptions{Instructions: mcpInstructions})
 	sdkServer.AddReceivingMiddleware(normalizeSDKValidationErrors)
 
 	if policy == nil {
