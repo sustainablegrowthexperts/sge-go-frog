@@ -1,9 +1,15 @@
+# Local environment (copy .env.example and fill in locally; never commit)
+.env
+
 # Crawl / list output (created next to the binary when you run the tool)
 results/
 
 # Local “go build” artifacts at repo root (tracked builds live in dist/)
 /go-frog
 /go-frog.exe
+
+# Python virtualenv (task_runner.py)
+.venv/
 
 # Editors & OS
 .idea/

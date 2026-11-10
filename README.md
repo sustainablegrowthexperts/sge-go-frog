@@ -116,6 +116,8 @@ Reports are saved to `results/YYYY-MM-DD-HH-MM-SS-<host>.csv`.
 
 ## Deploy to a server
 
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full guide, including server-side rebuild and rollback steps.
+
 Build locally, load on the server:
 
 ```bash

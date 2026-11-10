@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -211,12 +212,75 @@ func newJobID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// ── http server ──────────────────────────────────────────────────────────────
+// ── application wiring ───────────────────────────────────────────────────────
 
-func startServer(addr string) error {
+// appConfig holds the settings needed to build the shared application: the web
+// UI routes and, when enabled, the MCP endpoint on the same mux.
+type appConfig struct {
+	MCP MCPConfig
+}
+
+type app struct {
+	jobs    *jobManager
+	mcp     *mcpServer
+	handler http.Handler
+}
+
+// newApp builds the job manager and HTTP mux used by both the web UI and the
+// MCP endpoint. MCP is opt-in; when disabled, routing is exactly the previous
+// web-only behavior.
+func newApp(cfg appConfig) (*app, error) {
+	if cfg.MCP.Enabled {
+		if err := cfg.MCP.validate(); err != nil {
+			return nil, err
+		}
+	}
+
 	jm := newJobManager()
 	mux := http.NewServeMux()
+	registerWebRoutes(mux, jm)
 
+	a := &app{jobs: jm, handler: mux}
+	if cfg.MCP.Enabled {
+		ms, err := newMCPServer()
+		if err != nil {
+			return nil, fmt.Errorf("initialize MCP server: %w", err)
+		}
+		mux.Handle(cfg.MCP.Path, ms.Handler())
+		a.mcp = ms
+	}
+
+	return a, nil
+}
+
+func (a *app) Handler() http.Handler {
+	return a.handler
+}
+
+// Close releases application resources. It must be safe to call after the HTTP
+// listener has stopped.
+func (a *app) Close(ctx context.Context) error {
+	if a.mcp != nil {
+		return a.mcp.Close(ctx)
+	}
+	return nil
+}
+
+// serve starts the shared application on the given address.
+func serve(addr string, cfg MCPConfig) error {
+	a, err := newApp(appConfig{MCP: cfg})
+	if err != nil {
+		return err
+	}
+	defer a.Close(context.Background())
+
+	fmt.Printf("go-frog web server listening on %s\n", addr)
+	return http.ListenAndServe(addr, a.Handler())
+}
+
+// ── http server ──────────────────────────────────────────────────────────────
+
+func registerWebRoutes(mux *http.ServeMux, jm *jobManager) {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -378,9 +442,6 @@ func startServer(addr string) error {
 		w.Header().Set("Content-Type", "text/html")
 		writeJobFragment(w, job.view())
 	})
-
-	fmt.Printf("go-frog web server listening on %s\n", addr)
-	return http.ListenAndServe(addr, mux)
 }
 
 // inclusiveAuditFilters returns the filter profile for the less strict report:
