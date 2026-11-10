@@ -18,21 +18,35 @@ const (
 type mcpServer struct {
 	server  *mcp.Server
 	handler http.Handler
+
+	jobs   *jobManager
+	config MCPConfig
+	runner crawlRunner
 }
 
-// newMCPServer builds the MCP server metadata and its Streamable HTTP handler.
-// The handler is mounted on the existing application mux by newApp.
-func newMCPServer() (*mcpServer, error) {
+// newMCPServer builds the MCP server metadata, registers the tools, and wraps
+// the Streamable HTTP handler. The handler is mounted on the existing
+// application mux by newApp.
+func newMCPServer(jm *jobManager, cfg MCPConfig, runner crawlRunner) (*mcpServer, error) {
 	sdkServer := mcp.NewServer(&mcp.Implementation{
 		Name:    mcpServerName,
 		Version: mcpServerVersion,
 	}, nil)
 
+	s := &mcpServer{
+		server: sdkServer,
+		jobs:   jm,
+		config: cfg,
+		runner: runner,
+	}
+	s.registerTools()
+
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return sdkServer
 	}, &mcp.StreamableHTTPOptions{})
 
-	return &mcpServer{server: sdkServer, handler: handler}, nil
+	s.handler = handler
+	return s, nil
 }
 
 // Handler returns the HTTP handler to mount at the configured MCP path.

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,14 +38,27 @@ type crawlJob struct {
 	mode      string // "spider" | "list"
 	target    string
 	createdAt time.Time
+	owner     string // "ui" | "mcp"
+
+	// limits and archiveHTML are immutable after creation; clientRequestID is
+	// reserved for the idempotency slice.
+	limits          jobLimits
+	archiveHTML     bool
+	clientRequestID string
 
 	mu         sync.Mutex
 	status     string // "running" | "done" | "error"
+	phase      string // "starting" | "crawling" | "done" | "error"
+	startedAt  time.Time
+	finishedAt time.Time
 	pages      int
 	currentURL string
 	errMsg     string
 	result     []Page
 	settings   WizardSettings
+
+	truncated   bool
+	limitReason string
 
 	auditReady   bool
 	auditError   string
@@ -63,13 +77,23 @@ func newJobManager() *jobManager {
 	return jm
 }
 
-func (jm *jobManager) create(mode, target string, s WizardSettings) *crawlJob {
+func (jm *jobManager) createWithOwner(owner, mode, target string, s WizardSettings) *crawlJob {
+	var id string
+	if owner == ownerMCP {
+		id = newMCPJobID()
+	} else {
+		id = newJobID()
+	}
+	now := time.Now().UTC()
 	j := &crawlJob{
-		id:        newJobID(),
+		id:        id,
 		mode:      mode,
 		target:    target,
-		createdAt: time.Now(),
-		status:    "running",
+		createdAt: now,
+		owner:     owner,
+		status:    jobStatusRunning,
+		phase:     jobPhaseStarting,
+		startedAt: now,
 		settings:  s,
 	}
 	jm.mu.Lock()
@@ -82,6 +106,83 @@ func (jm *jobManager) get(id string) *crawlJob {
 	jm.mu.RLock()
 	defer jm.mu.RUnlock()
 	return jm.jobs[id]
+}
+
+// jobFilter narrows list results. An empty Owner means MCP-visible jobs only.
+type jobFilter struct {
+	Owner  string
+	Status string
+	Mode   string
+}
+
+// list returns jobs visible to MCP, newest first. Browser-only jobs are hidden
+// unless the caller explicitly asks for another owner.
+func (jm *jobManager) list(filter jobFilter) []*crawlJob {
+	owner := filter.Owner
+	if owner == "" {
+		owner = ownerMCP
+	}
+
+	jm.mu.RLock()
+	jobs := make([]*crawlJob, 0, len(jm.jobs))
+	for _, j := range jm.jobs {
+		if j.owner != owner {
+			continue
+		}
+		jobs = append(jobs, j)
+	}
+	jm.mu.RUnlock()
+
+	out := jobs[:0]
+	for _, j := range jobs {
+		status, _ := j.statusPhase()
+		if filter.Status != "" && status != filter.Status {
+			continue
+		}
+		if filter.Mode != "" && j.mode != filter.Mode {
+			continue
+		}
+		out = append(out, j)
+	}
+	sort.Slice(out, func(i, k int) bool {
+		if out[i].createdAt.Equal(out[k].createdAt) {
+			return out[i].id < out[k].id
+		}
+		return out[i].createdAt.After(out[k].createdAt)
+	})
+	return out
+}
+
+// runningCount returns the number of running jobs for the owner, or for every
+// owner when owner is empty.
+func (jm *jobManager) runningCount(owner string) int {
+	jm.mu.RLock()
+	jobs := make([]*crawlJob, 0, len(jm.jobs))
+	for _, j := range jm.jobs {
+		if owner == "" || j.owner == owner {
+			jobs = append(jobs, j)
+		}
+	}
+	jm.mu.RUnlock()
+
+	count := 0
+	for _, j := range jobs {
+		if status, _ := j.statusPhase(); status == jobStatusRunning {
+			count++
+		}
+	}
+	return count
+}
+
+// delete removes a job from the manager. It reports whether the job existed.
+func (jm *jobManager) delete(id string) bool {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	if _, ok := jm.jobs[id]; !ok {
+		return false
+	}
+	delete(jm.jobs, id)
+	return true
 }
 
 func (jm *jobManager) reapLoop() {
@@ -97,6 +198,24 @@ func (jm *jobManager) reapLoop() {
 	}
 }
 
+// setPhase moves the job to an active phase and records startedAt the first
+// time it becomes active.
+func (j *crawlJob) setPhase(phase string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.phase = phase
+	if j.startedAt.IsZero() && phase != jobPhaseDone && phase != jobPhaseError {
+		j.startedAt = time.Now().UTC()
+	}
+}
+
+// statusPhase returns a consistent status/phase pair for polling.
+func (j *crawlJob) statusPhase() (status, phase string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.status, j.phase
+}
+
 func (j *crawlJob) progress(url string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -107,7 +226,9 @@ func (j *crawlJob) progress(url string) {
 func (j *crawlJob) finish(pages []Page) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.status = "done"
+	j.status = jobStatusDone
+	j.phase = jobPhaseDone
+	j.finishedAt = time.Now().UTC()
 	j.result = pages
 	j.pages = len(pages)
 }
@@ -115,14 +236,18 @@ func (j *crawlJob) finish(pages []Page) {
 func (j *crawlJob) fail(err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.status = "error"
+	j.status = jobStatusError
+	j.phase = jobPhaseError
+	j.finishedAt = time.Now().UTC()
 	j.errMsg = err.Error()
 }
 
 func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Result, inclusiveErr error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.status = "done"
+	j.status = jobStatusDone
+	j.phase = jobPhaseDone
+	j.finishedAt = time.Now().UTC()
 	j.result = pages
 	j.pages = len(pages)
 	j.auditReady = true
@@ -146,7 +271,9 @@ func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Re
 func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.status = "done"
+	j.status = jobStatusDone
+	j.phase = jobPhaseDone
+	j.finishedAt = time.Now().UTC()
 	j.result = pages
 	j.pages = len(pages)
 	j.auditReady = false
@@ -212,16 +339,31 @@ func newJobID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// newMCPJobID returns a 128-bit, lower-case hex job ID for MCP-created jobs.
+func newMCPJobID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand never fails on supported platforms; fall back to the UI
+		// shape rather than returning an empty ID.
+		return newJobID()
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // ── application wiring ───────────────────────────────────────────────────────
 
 // appConfig holds the settings needed to build the shared application: the web
 // UI routes and, when enabled, the MCP endpoint on the same mux.
 type appConfig struct {
 	MCP MCPConfig
+	// Runner overrides the real crawl runner. Tests use a fake runner; a nil
+	// value selects the production implementation.
+	Runner crawlRunner
 }
 
 type app struct {
 	jobs    *jobManager
+	runner  crawlRunner
 	mcp     *mcpServer
 	handler http.Handler
 }
@@ -236,13 +378,18 @@ func newApp(cfg appConfig) (*app, error) {
 		}
 	}
 
+	runner := cfg.Runner
+	if runner == nil {
+		runner = realCrawlRunner{}
+	}
+
 	jm := newJobManager()
 	mux := http.NewServeMux()
-	registerWebRoutes(mux, jm)
+	registerWebRoutes(mux, jm, runner)
 
-	a := &app{jobs: jm, handler: mux}
+	a := &app{jobs: jm, runner: runner, handler: mux}
 	if cfg.MCP.Enabled {
-		ms, err := newMCPServer()
+		ms, err := newMCPServer(jm, cfg.MCP, runner)
 		if err != nil {
 			return nil, fmt.Errorf("initialize MCP server: %w", err)
 		}
@@ -280,7 +427,7 @@ func serve(addr string, cfg MCPConfig) error {
 
 // ── http server ──────────────────────────────────────────────────────────────
 
-func registerWebRoutes(mux *http.ServeMux, jm *jobManager) {
+func registerWebRoutes(mux *http.ServeMux, jm *jobManager, runner crawlRunner) {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -365,47 +512,8 @@ func registerWebRoutes(mux *http.ServeMux, jm *jobManager) {
 			settings.AuditFilters = parseAuditFilters(r, mode, true)
 		}
 
-		job := jm.create(mode, target, settings)
-
-		go func() {
-			var pages []Page
-			var err error
-
-			switch settings.Mode {
-			case 1:
-				pages, err = runSpider(settings, func(url string) {
-					job.progress(url)
-				})
-			case 2:
-				pages, err = runList(settings.listURLs, settings, func(url string) {
-					job.progress(url)
-				})
-			}
-
-			if err != nil {
-				job.fail(err)
-				return
-			}
-
-			if settings.Audit {
-				result, auditErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
-				if auditErr != nil {
-					job.finishWithAuditError(pages, fmt.Errorf("internal linking audit: %w", auditErr))
-					return
-				}
-
-				// Build the inclusive report from the same archive. It keeps the
-				// strict run's navigation filters but counts every other
-				// widget/listing link as content.
-				inclusive, inclusiveErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{
-					Filters: inclusiveAuditFilters(result),
-					OutDir:  filepath.Join(settings.AuditArchiveDir, "inclusive"),
-				})
-				job.finishWithAudits(pages, result, inclusive, inclusiveErr)
-				return
-			}
-			job.finish(pages)
-		}()
+		job := jm.createWithOwner(ownerUI, mode, target, settings)
+		go runCrawlJob(job, settings, runner)
 
 		w.Header().Set("Content-Type", "text/html")
 		writeJobFragment(w, job.view())
@@ -442,6 +550,47 @@ func registerWebRoutes(mux *http.ServeMux, jm *jobManager) {
 		w.Header().Set("Content-Type", "text/html")
 		writeJobFragment(w, job.view())
 	})
+}
+
+// runCrawlJob is the single launch path shared by the web UI and the MCP
+// tools. It runs the crawler and then, when enabled, the strict/inclusive
+// audit pipeline.
+func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
+	job.setPhase(jobPhaseCrawling)
+
+	var pages []Page
+	var err error
+	switch settings.Mode {
+	case 1:
+		pages, err = runner.Spider(context.Background(), settings, job.progress)
+	case 2:
+		pages, err = runner.List(context.Background(), settings.listURLs, settings, job.progress)
+	default:
+		err = fmt.Errorf("unknown mode %d", settings.Mode)
+	}
+	if err != nil {
+		job.fail(err)
+		return
+	}
+
+	if settings.Audit {
+		result, auditErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
+		if auditErr != nil {
+			job.finishWithAuditError(pages, fmt.Errorf("internal linking audit: %w", auditErr))
+			return
+		}
+
+		// Build the inclusive report from the same archive. It keeps the
+		// strict run's navigation filters but counts every other
+		// widget/listing link as content.
+		inclusive, inclusiveErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{
+			Filters: inclusiveAuditFilters(result),
+			OutDir:  filepath.Join(settings.AuditArchiveDir, "inclusive"),
+		})
+		job.finishWithAudits(pages, result, inclusive, inclusiveErr)
+		return
+	}
+	job.finish(pages)
 }
 
 // inclusiveAuditFilters returns the filter profile for the less strict report:

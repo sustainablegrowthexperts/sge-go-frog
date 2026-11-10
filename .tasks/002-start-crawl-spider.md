@@ -1,7 +1,7 @@
 ---
 id: task-002
 title: "[Slice] Agent starts a spider crawl and receives a job ID"
-status: pending
+status: completed
 depends_on: ["task-001"]
 target_files:
   - "server.go"

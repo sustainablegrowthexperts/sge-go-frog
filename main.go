@@ -23,6 +23,7 @@ const (
 	defaultMCPMaxListURLs       = 1000
 	defaultMCPMaxDuration       = 30 * time.Minute
 	defaultMCPMaxConcurrentJobs = 4
+	defaultMCPMaxConcurrency    = 20
 )
 
 // MCPLimits holds the server-enforced caps for MCP-created jobs.
@@ -32,6 +33,7 @@ type MCPLimits struct {
 	MaxListURLs       int
 	MaxDuration       time.Duration
 	MaxConcurrentJobs int
+	MaxConcurrency    int
 }
 
 // MCPConfig is the configuration surface for the embedded MCP server. It is
@@ -59,6 +61,7 @@ func defaultMCPConfig() MCPConfig {
 			MaxListURLs:       defaultMCPMaxListURLs,
 			MaxDuration:       defaultMCPMaxDuration,
 			MaxConcurrentJobs: defaultMCPMaxConcurrentJobs,
+			MaxConcurrency:    defaultMCPMaxConcurrency,
 		},
 		DefaultArchive:  false,
 		ArtifactBaseURL: "",
@@ -125,6 +128,13 @@ func mcpConfigFromEnv(getenv func(string) string) (MCPConfig, error) {
 		}
 		cfg.Limits.MaxConcurrentJobs = n
 	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_CONCURRENCY")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_CONCURRENCY: %w", err)
+		}
+		cfg.Limits.MaxConcurrency = n
+	}
 	if v := strings.TrimSpace(getenv("GOFROG_MCP_DEFAULT_ARCHIVE")); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -149,6 +159,7 @@ func (c *MCPConfig) registerFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.Limits.MaxListURLs, "mcp-max-list-urls", c.Limits.MaxListURLs, "maximum URLs in an MCP list job")
 	fs.DurationVar(&c.Limits.MaxDuration, "mcp-max-duration", c.Limits.MaxDuration, "maximum duration for an MCP job")
 	fs.IntVar(&c.Limits.MaxConcurrentJobs, "mcp-max-jobs", c.Limits.MaxConcurrentJobs, "maximum concurrent MCP jobs")
+	fs.IntVar(&c.Limits.MaxConcurrency, "mcp-max-concurrency", c.Limits.MaxConcurrency, "maximum request concurrency for an MCP crawl")
 	fs.BoolVar(&c.DefaultArchive, "mcp-default-archive", c.DefaultArchive, "archive HTML by default for MCP jobs")
 	fs.StringVar(&c.ArtifactBaseURL, "mcp-artifact-base-url", c.ArtifactBaseURL, "public base URL for MCP artifacts")
 }

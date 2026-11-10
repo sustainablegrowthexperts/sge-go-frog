@@ -3,14 +3,18 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	auditpkg "go-frog/internal/audit"
 )
@@ -222,6 +226,109 @@ func TestServeAuditBundleProfiles(t *testing.T) {
 		if !strings.Contains(pages, profile) {
 			t.Fatalf("%s bundle came from the wrong profile: %q", profile, pages)
 		}
+	}
+}
+
+// TestUIJobFlowUnchanged covers the regression contract for the shared core:
+// the web UI still creates a browser-only job with its original ID shape,
+// renders the job fragment, and polls it through /api/crawl/{id}.
+func TestUIJobFlowUnchanged(t *testing.T) {
+	runner := newFakeCrawlRunner()
+	runner.pages = []Page{{URL: "https://example.com/", StatusCode: 200}}
+	t.Cleanup(runner.Release)
+
+	app, err := newApp(appConfig{MCP: defaultMCPConfig(), Runner: runner})
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	defer app.Close(context.Background())
+
+	ts := httptest.NewServer(app.Handler())
+	defer ts.Close()
+
+	var form bytes.Buffer
+	mw := multipart.NewWriter(&form)
+	for key, value := range map[string]string{
+		"mode":        "spider",
+		"startUrl":    "https://example.com",
+		"keywords":    "pricing",
+		"concurrency": "2",
+	} {
+		if err := mw.WriteField(key, value); err != nil {
+			t.Fatalf("write form field %s: %v", key, err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart form: %v", err)
+	}
+
+	resp, err := http.Post(ts.URL+"/api/crawl", mw.FormDataContentType(), &form)
+	if err != nil {
+		t.Fatalf("POST /api/crawl: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/crawl status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read fragment: %v", err)
+	}
+	fragment := string(body)
+	if !strings.Contains(fragment, `class="job"`) {
+		t.Fatalf("response is not a job fragment:\n%s", fragment)
+	}
+
+	match := regexp.MustCompile(`id="job-([0-9a-f]+)"`).FindStringSubmatch(fragment)
+	if len(match) != 2 {
+		t.Fatalf("fragment does not expose a job ID:\n%s", fragment)
+	}
+	jobID := match[1]
+	if len(jobID) != 12 {
+		t.Fatalf("UI job ID = %q, want the existing 12-character shape", jobID)
+	}
+
+	job := app.jobs.get(jobID)
+	if job == nil {
+		t.Fatalf("UI job %q is not in the manager", jobID)
+	}
+	if job.owner != ownerUI {
+		t.Fatalf("UI job owner = %q, want %q", job.owner, ownerUI)
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("crawl runner was not launched")
+	}
+
+	poll, err := http.Get(ts.URL + "/api/crawl/" + jobID)
+	if err != nil {
+		t.Fatalf("GET /api/crawl/%s: %v", jobID, err)
+	}
+	defer poll.Body.Close()
+	pollBody, err := io.ReadAll(poll.Body)
+	if err != nil {
+		t.Fatalf("read poll fragment: %v", err)
+	}
+	pollFragment := string(pollBody)
+	for _, want := range []string{`id="job-` + jobID + `"`, `hx-get="/api/crawl/` + jobID + `"`} {
+		if !strings.Contains(pollFragment, want) {
+			t.Fatalf("poll fragment is missing %q:\n%s", want, pollFragment)
+		}
+	}
+
+	runner.Release()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status, _ := job.statusPhase()
+		if status == jobStatusDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("UI job did not finish; status = %q", status)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
