@@ -89,6 +89,7 @@ type jobLimits struct {
 	MaxPages    int
 	MaxDepth    int
 	MaxDuration time.Duration
+	MaxListURLs int
 }
 
 // startCrawlAuditFilters replaces the auditor's default class filters when

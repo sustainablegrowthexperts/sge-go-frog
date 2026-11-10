@@ -1,7 +1,7 @@
 ---
 id: task-013
 title: "[Slice] Crawlers stop at page, depth, duration, and URL caps"
-status: pending
+status: completed
 depends_on: ["task-012"]
 target_files:
   - "spider.go"

@@ -127,6 +127,7 @@ func (l MCPLimits) resolveJobLimits(in *startCrawlLimits) (jobLimits, error) {
 		MaxPages:    l.MaxPages,
 		MaxDepth:    l.MaxDepth,
 		MaxDuration: l.MaxDuration,
+		MaxListURLs: l.MaxListURLs,
 	}
 	if in == nil {
 		return out, nil

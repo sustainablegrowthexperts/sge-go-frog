@@ -793,6 +793,18 @@ func (j *crawlJob) finish(pages []Page) {
 	j.persist()
 }
 
+// setTruncation records the crawl outcome's cap metadata. A non-truncated
+// outcome clears any previous reason; terminal paths persist the state.
+func (j *crawlJob) setTruncation(truncated bool, reason string) {
+	if !truncated && reason == "" {
+		return
+	}
+	j.mu.Lock()
+	j.truncated = truncated
+	j.limitReason = reason
+	j.mu.Unlock()
+}
+
 func (j *crawlJob) fail(err error) {
 	j.mu.Lock()
 	j.status = jobStatusError
@@ -1287,13 +1299,20 @@ func runMCPCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner, 
 func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 	job.setPhase(jobPhaseCrawling)
 
-	var pages []Page
+	// Only MCP jobs carry resolved limits. UI and CLI runs keep their current
+	// unbounded behavior.
+	if job.owner == ownerMCP {
+		limits := job.limits
+		settings.limits = &limits
+	}
+
+	var outcome crawlOutcome
 	var err error
 	switch settings.Mode {
 	case 1:
-		pages, err = runner.Spider(context.Background(), settings, job.progress)
+		outcome, err = runner.Spider(context.Background(), settings, job.progress)
 	case 2:
-		pages, err = runner.List(context.Background(), settings.listURLs, settings, job.progress)
+		outcome, err = runner.List(context.Background(), settings.listURLs, settings, job.progress)
 	default:
 		err = fmt.Errorf("unknown mode %d", settings.Mode)
 	}
@@ -1301,8 +1320,16 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 		job.fail(err)
 		return
 	}
+	job.setTruncation(outcome.Truncated, outcome.LimitReason)
+	pages := outcome.Pages
 
 	if settings.Audit {
+		if outcome.Truncated {
+			// A capped crawl leaves an incomplete archive. Never publish it as
+			// a complete audit; keep the partial rows and explain the skip.
+			job.finishWithAuditError(pages, fmt.Errorf("audit skipped: crawl truncated at %s", outcome.LimitReason))
+			return
+		}
 		job.beginAudit()
 		result, auditErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
 		if auditErr != nil {

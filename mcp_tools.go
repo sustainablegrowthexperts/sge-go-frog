@@ -733,6 +733,9 @@ func boolPtr(b bool) *bool {
 // jobStatusSummary renders a short agent-facing summary of a job snapshot.
 func jobStatusSummary(out getJobOutput) string {
 	summary := fmt.Sprintf("Job %s is %s (phase %s): %d page(s) crawled.", out.JobID, out.Status, out.Phase, out.PagesCrawled)
+	if out.Truncated {
+		summary += fmt.Sprintf(" Truncated at %s.", out.LimitReason)
+	}
 	if out.Audit.Enabled {
 		summary += fmt.Sprintf(" Audit: %s.", out.Audit.State)
 	}

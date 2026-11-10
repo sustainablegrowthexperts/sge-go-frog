@@ -278,6 +278,10 @@ type WizardSettings struct {
 
 	listURLs []string
 
+	// limits is the effective per-run cap set. Nil keeps the CLI and web UI
+	// runs unbounded; MCP jobs always carry their resolved limits.
+	limits *jobLimits
+
 	// ssrfPolicy is an internal test seam. Production settings leave it nil
 	// and the crawl uses the public-only SSRF policy.
 	ssrfPolicy *ssrfPolicy

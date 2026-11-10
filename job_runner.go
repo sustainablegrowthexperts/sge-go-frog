@@ -5,44 +5,52 @@ import (
 	"sync"
 )
 
-// crawlRunner starts a crawl and returns its pages. The interface exists so the
-// MCP tools and the web UI share one pipeline while tests can substitute a
-// deterministic fake. Context is threaded now even though the crawlers only
-// check it at their boundaries in this slice.
+// crawlOutcome is the result of one crawl run. Pages is always the partial
+// result set; Truncated and LimitReason describe whether a cap stopped the
+// crawl before it was exhausted.
+type crawlOutcome struct {
+	Pages       []Page
+	Truncated   bool
+	LimitReason string
+}
+
+// crawlRunner starts a crawl and returns its outcome. The interface exists so
+// the MCP tools and the web UI share one pipeline while tests can substitute a
+// deterministic fake. Context is threaded so a caller can bound the run.
 type crawlRunner interface {
-	Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) ([]Page, error)
-	List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) ([]Page, error)
+	Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error)
+	List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error)
 }
 
 // realCrawlRunner adapts the existing crawl implementations to crawlRunner.
 type realCrawlRunner struct{}
 
-func (realCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) ([]Page, error) {
+func (realCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return crawlOutcome{}, err
 	}
-	pages, err := runSpider(settings, onProgress)
+	outcome, err := runSpiderContext(ctx, settings, onProgress)
 	if err != nil {
-		return nil, err
+		return crawlOutcome{}, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if err := ctx.Err(); err != nil && !outcome.Truncated {
+		return crawlOutcome{}, err
 	}
-	return pages, nil
+	return outcome, nil
 }
 
-func (realCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) ([]Page, error) {
+func (realCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return crawlOutcome{}, err
 	}
-	pages, err := runList(urls, settings, onProgress)
+	outcome, err := runListContext(ctx, urls, settings, onProgress)
 	if err != nil {
-		return nil, err
+		return crawlOutcome{}, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if err := ctx.Err(); err != nil && !outcome.Truncated {
+		return crawlOutcome{}, err
 	}
-	return pages, nil
+	return outcome, nil
 }
 
 // fakeCrawlRunner is a controllable runner for tests. Spider and List report
@@ -56,6 +64,8 @@ type fakeCrawlRunner struct {
 	block        bool
 	progressURLs []string
 	pages        []Page
+	truncated    bool
+	limitReason  string
 	err          error
 
 	mu             sync.Mutex
@@ -96,7 +106,7 @@ func (r *fakeCrawlRunner) signalStarted() {
 	}
 }
 
-func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls []string, list bool, onProgress progressFunc) ([]Page, error) {
+func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls []string, list bool, onProgress progressFunc) (crawlOutcome, error) {
 	r.mu.Lock()
 	if list {
 		r.listCalls++
@@ -108,6 +118,8 @@ func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls
 	}
 	block := r.block
 	pages := r.pages
+	truncated := r.truncated
+	limitReason := r.limitReason
 	err := r.err
 	progressURLs := append([]string(nil), r.progressURLs...)
 	r.mu.Unlock()
@@ -123,16 +135,16 @@ func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls
 		select {
 		case <-r.release:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return crawlOutcome{}, ctx.Err()
 		}
 	}
-	return pages, err
+	return crawlOutcome{Pages: pages, Truncated: truncated, LimitReason: limitReason}, err
 }
 
-func (r *fakeCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) ([]Page, error) {
+func (r *fakeCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
 	return r.run(ctx, settings, nil, false, onProgress)
 }
 
-func (r *fakeCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) ([]Page, error) {
+func (r *fakeCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
 	return r.run(ctx, settings, urls, true, onProgress)
 }

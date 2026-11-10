@@ -12,25 +12,41 @@ import (
 	"github.com/gocolly/colly/v2"
 )
 
-func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err error) {
+func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
+	outcome, err := runSpiderContext(context.Background(), s, onProgress)
+	return outcome.Pages, err
+}
+
+// runSpiderContext is the context-aware spider entry point. A non-nil
+// settings.limits enforces the per-job page, depth, and duration caps; a nil
+// limits keeps the CLI/UI behavior unbounded.
+func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progressFunc) (outcome crawlOutcome, err error) {
 	start, err := normalizeHTTPURL(s.StartURL)
 	if err != nil {
-		return nil, fmt.Errorf("starting URL: %w", err)
+		return crawlOutcome{}, fmt.Errorf("starting URL: %w", err)
 	}
 
 	root, err := url.Parse(start)
 	if err != nil {
-		return nil, fmt.Errorf("parse URL: %w", err)
+		return crawlOutcome{}, fmt.Errorf("parse URL: %w", err)
 	}
 	host := strings.ToLower(root.Hostname())
 	if host == "" {
-		return nil, fmt.Errorf("URL has no host")
+		return crawlOutcome{}, fmt.Errorf("URL has no host")
 	}
 	allowedHosts := expandedWWWHostVariants(host)
 	policy := s.ssrfGuard()
 	if err := policy.validateURL(context.Background(), start); err != nil {
-		return nil, fmt.Errorf("starting URL: %w", err)
+		return crawlOutcome{}, fmt.Errorf("starting URL: %w", err)
 	}
+
+	if s.limits != nil && s.limits.MaxDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.limits.MaxDuration)
+		defer cancel()
+	}
+	deadline, _ := ctx.Deadline()
+	budget := newCrawlBudget(s.limits, deadline)
 
 	inbound := newInboundTracker()
 	store := &pageStore{}
@@ -49,12 +65,12 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 			Mode:     "spider",
 		})
 		if err != nil {
-			return nil, err
+			return crawlOutcome{}, err
 		}
 		defer func() {
 			if closeErr := closeCrawlArchive(archive); closeErr != nil && err == nil {
 				err = closeErr
-				pages = nil
+				outcome = crawlOutcome{}
 			}
 		}()
 
@@ -70,8 +86,8 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 	c := newCollectorAsync(s.Concurrency, s.ProxyURL, policy)
 	c.AllowedDomains = allowedHosts
 
-	attachHTTPTiming(c, starts)
-	attachPageRecording(c, starts, inbound, store, s.KeywordsRaw, onProgress, archive)
+	attachHTTPTiming(c, starts, budget)
+	attachPageRecording(c, starts, inbound, store, budget, s.KeywordsRaw, onProgress, archive)
 
 	// Colly does not run OnResponse/OnScraped when it treats 3xx as an HTTP error, so enqueue
 	// redirect targets from OnError (see scrape.go) instead of OnResponse.
@@ -104,6 +120,9 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 			logBlockedSSRFTarget(nil, err)
 			return
 		}
+		if budget.stopForWork() {
+			return
+		}
 		if archive != nil {
 			archive.MarkSource(abs, "redirect")
 		}
@@ -134,6 +153,9 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 		if archive != nil {
 			archive.MarkSource(abs, "link")
 		}
+		if !budget.allowLink(e.Request.Depth) {
+			return
+		}
 		_ = e.Request.Visit(abs)
 	})
 
@@ -146,14 +168,18 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 			archive.MarkSource(u.String(), "start")
 		}
 	}
-	if err := c.Visit(start); err != nil {
-		return nil, err
+	if !budget.stopForWork() {
+		if err := c.Visit(start); err != nil {
+			return crawlOutcome{}, err
+		}
+		c.Wait()
 	}
-	c.Wait()
 
 	// Sitemap coverage runs after link-following so we only fetch pages the
 	// crawl could not reach through links. The collector records them exactly
-	// like any other page, including redirects and 404s.
+	// like any other page, including redirects and 404s. Sitemap-coverage pages
+	// are outside the link frontier, so they are treated as depth 0 and only
+	// the page/duration caps apply.
 	if s.Audit && len(sitemapPages) > 0 {
 		seen := make(map[string]struct{})
 		for _, page := range store.snapshot() {
@@ -162,6 +188,9 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 			}
 		}
 		for _, sitemapURL := range sitemapPages {
+			if budget.stopForWork() {
+				break
+			}
 			if canonical, ok := auditpkg.CanonicalURL(sitemapURL, nil); ok {
 				if _, done := seen[canonical]; done {
 					continue
@@ -182,7 +211,10 @@ func runSpider(s WizardSettings, onProgress progressFunc) (pages []Page, err err
 		c.Wait()
 	}
 
-	return store.snapshot(), nil
+	if ctx.Err() != nil && !deadline.IsZero() {
+		budget.setReason(limitReasonMaxDuration)
+	}
+	return budget.outcome(store.snapshot()), nil
 }
 
 func normalizeHTTPURL(raw string) (string, error) {

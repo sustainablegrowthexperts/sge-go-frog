@@ -1776,12 +1776,12 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-func (r *gatedCrawlRunner) run() ([]Page, error) {
+func (r *gatedCrawlRunner) run() (crawlOutcome, error) {
 	r.mu.Lock()
 	r.calls++
 	if r.open {
 		r.mu.Unlock()
-		return nil, nil
+		return crawlOutcome{}, nil
 	}
 	ch := make(chan struct{})
 	r.releases = append(r.releases, ch)
@@ -1789,14 +1789,14 @@ func (r *gatedCrawlRunner) run() ([]Page, error) {
 
 	r.started <- struct{}{}
 	<-ch
-	return nil, nil
+	return crawlOutcome{}, nil
 }
 
-func (r *gatedCrawlRunner) Spider(_ context.Context, _ WizardSettings, _ progressFunc) ([]Page, error) {
+func (r *gatedCrawlRunner) Spider(_ context.Context, _ WizardSettings, _ progressFunc) (crawlOutcome, error) {
 	return r.run()
 }
 
-func (r *gatedCrawlRunner) List(_ context.Context, _ []string, _ WizardSettings, _ progressFunc) ([]Page, error) {
+func (r *gatedCrawlRunner) List(_ context.Context, _ []string, _ WizardSettings, _ progressFunc) (crawlOutcome, error) {
 	return r.run()
 }
 

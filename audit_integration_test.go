@@ -6,11 +6,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	auditpkg "go-frog/internal/audit"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestSpiderAuditArchiveIntegration(t *testing.T) {
@@ -260,6 +263,238 @@ func TestArchiveHTMLWithoutAudit(t *testing.T) {
 			if _, ok := row["depth"]; !ok {
 				t.Fatalf("list row %v has no depth", row["url"])
 			}
+		}
+	})
+}
+
+// TestCrawlerPageAndDepthLimits covers the crawl-cap slice:
+//   - a spider stops once the page cap is reached and reports max_pages;
+//   - link following stops at the depth cap and reports max_depth;
+//   - a list-mode input above the URL cap is rejected before any visit;
+//   - a duration cap returns a done job with partial (possibly empty) results
+//     and reports max_duration instead of a hard error;
+//   - the CSV columns and page rows stay unchanged for a limited run.
+func TestCrawlerPageAndDepthLimits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.URL.Path == "/many" || strings.HasPrefix(r.URL.Path, "/many/") {
+			var body strings.Builder
+			body.WriteString("<html><head><title>many</title></head><body>")
+			if r.URL.Path == "/many" {
+				for i := 0; i < 20; i++ {
+					link := "/many/" + strconv.Itoa(i)
+					body.WriteString(`<a href="` + link + `">` + link + `</a>`)
+				}
+			}
+			body.WriteString("</body></html>")
+			_, _ = w.Write([]byte(body.String()))
+			return
+		}
+		if r.URL.Path != "/" && r.URL.Path != "/a" && r.URL.Path != "/b" &&
+			r.URL.Path != "/a/1" && r.URL.Path != "/a/2" &&
+			r.URL.Path != "/b/1" && r.URL.Path != "/b/2" {
+			http.NotFound(w, r)
+			return
+		}
+		var links []string
+		switch r.URL.Path {
+		case "/":
+			links = []string{"/a", "/b"}
+		case "/a":
+			links = []string{"/a/1", "/a/2"}
+		case "/b":
+			links = []string{"/b/1", "/b/2"}
+		}
+		var body strings.Builder
+		body.WriteString("<html><head><title>")
+		body.WriteString(r.URL.Path)
+		body.WriteString("</title></head><body>")
+		for _, link := range links {
+			body.WriteString(`<a href="` + link + `">` + link + `</a>`)
+		}
+		body.WriteString("</body></html>")
+		_, _ = w.Write([]byte(body.String()))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	newSession := func(t *testing.T, cfg MCPConfig) (*app, *mcp.ClientSession) {
+		t.Helper()
+		cfg.ResultsDir = t.TempDir()
+		return newMCPTestSession(t, ctx, cfg, realCrawlRunner{})
+	}
+
+	t.Run("page cap stops the crawl and keeps partial rows", func(t *testing.T) {
+		app, session := newSession(t, defaultMCPConfig())
+
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":        "spider",
+			"start_url":   server.URL + "/many",
+			"concurrency": 8,
+			"limits":      map[string]any{"max_pages": 4},
+		})
+		jobID, _ := out["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		waitForJobStatus(t, job, jobStatusDone)
+
+		job.mu.Lock()
+		truncated := job.truncated
+		reason := job.limitReason
+		job.mu.Unlock()
+
+		if !truncated {
+			t.Fatal("truncated = false, want true after the page cap")
+		}
+		if reason != "max_pages" {
+			t.Fatalf("limit_reason = %q, want max_pages", reason)
+		}
+
+		results := callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": jobID})
+		rows := resultRows(t, results)
+		if len(rows) != 4 {
+			t.Fatalf("rows = %d, want the page cap of 4", len(rows))
+		}
+		assertCSVUnchanged(t, job.pageRows())
+	})
+
+	t.Run("depth cap stops link following", func(t *testing.T) {
+		app, session := newSession(t, defaultMCPConfig())
+
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":        "spider",
+			"start_url":   server.URL,
+			"concurrency": 2,
+			"limits":      map[string]any{"max_depth": 1},
+		})
+		jobID, _ := out["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		waitForJobStatus(t, job, jobStatusDone)
+
+		job.mu.Lock()
+		truncated := job.truncated
+		reason := job.limitReason
+		job.mu.Unlock()
+
+		if !truncated {
+			t.Fatal("truncated = false, want true after the depth cap")
+		}
+		if reason != "max_depth" {
+			t.Fatalf("limit_reason = %q, want max_depth", reason)
+		}
+
+		results := callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": jobID})
+		rows := resultRows(t, results)
+		if len(rows) != 3 {
+			t.Fatalf("rows = %d, want start plus depth-1 pages only (3)", len(rows))
+		}
+		for _, row := range rows {
+			if url, _ := row["url"].(string); strings.HasSuffix(url, "/1") || strings.HasSuffix(url, "/2") {
+				t.Fatalf("depth-2 page %q was crawled despite max_depth=1", url)
+			}
+		}
+	})
+
+	t.Run("list URL cap rejects before visiting", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxListURLs = 2
+		_, session := newSession(t, cfg)
+
+		res := callTool(t, ctx, session, "start_crawl", map[string]any{
+			"mode": "list",
+			"urls": []string{
+				server.URL + "/",
+				server.URL + "/a",
+				server.URL + "/b",
+			},
+		})
+		if !res.IsError {
+			t.Fatal("start_crawl succeeded, want the list URL cap rejection")
+		}
+		if text := toolResultText(res); !strings.Contains(text, "maximum is 2") {
+			t.Fatalf("error = %q, want the max_list_urls message", text)
+		}
+	})
+
+	t.Run("duration cap finishes done with a limit reason", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxDuration = time.Nanosecond
+		app, session := newSession(t, cfg)
+
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":        "spider",
+			"start_url":   server.URL,
+			"concurrency": 2,
+		})
+		jobID, _ := out["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		waitForJobStatus(t, job, jobStatusDone)
+
+		job.mu.Lock()
+		truncated := job.truncated
+		reason := job.limitReason
+		errMsg := job.errMsg
+		job.mu.Unlock()
+
+		if errMsg != "" {
+			t.Fatalf("job error = %q, want a completed partial crawl", errMsg)
+		}
+		if !truncated {
+			t.Fatal("truncated = false, want true after the duration cap")
+		}
+		if reason != "max_duration" {
+			t.Fatalf("limit_reason = %q, want max_duration", reason)
+		}
+	})
+
+	t.Run("list runner truncates duplicate URLs before visiting", func(t *testing.T) {
+		limits := jobLimits{MaxListURLs: 2}
+		outcome, err := runListContext(context.Background(), []string{
+			server.URL + "/",
+			server.URL + "/a",
+			server.URL + "/a",
+			server.URL + "/b",
+		}, WizardSettings{
+			Mode:        2,
+			Concurrency: 2,
+			ssrfPolicy:  testSSRFPolicy(),
+			limits:      &limits,
+		}, nil)
+		if err != nil {
+			t.Fatalf("runListContext: %v", err)
+		}
+		if len(outcome.Pages) != 2 {
+			t.Fatalf("pages = %d, want the list cap of 2", len(outcome.Pages))
+		}
+		if !outcome.Truncated || outcome.LimitReason != "max_list_urls" {
+			t.Fatalf("outcome = truncated:%v reason:%q, want max_list_urls", outcome.Truncated, outcome.LimitReason)
+		}
+	})
+
+	t.Run("spider runner without limits stays unbounded", func(t *testing.T) {
+		pages, err := runSpider(WizardSettings{
+			Mode:        1,
+			StartURL:    server.URL,
+			Concurrency: 2,
+			ssrfPolicy:  testSSRFPolicy(),
+		}, nil)
+		if err != nil {
+			t.Fatalf("runSpider: %v", err)
+		}
+		if len(pages) != 7 {
+			t.Fatalf("unbounded pages = %d, want all 7", len(pages))
 		}
 	})
 }

@@ -12,6 +12,135 @@ import (
 	"github.com/gocolly/colly/v2"
 )
 
+// Crawl limit reasons reported through truncated outcomes. The values are part
+// of the MCP get_job contract.
+const (
+	limitReasonMaxPages    = "max_pages"
+	limitReasonMaxDepth    = "max_depth"
+	limitReasonMaxDuration = "max_duration"
+	limitReasonMaxListURLs = "max_list_urls"
+)
+
+// crawlBudget enforces the per-run caps shared by spider and list mode and
+// remembers the first cap reached. Every method is safe for concurrent colly
+// callbacks; page counting and recording are checked under one mutex so the
+// recorded row count can never exceed max_pages. A nil budget is unbounded.
+type crawlBudget struct {
+	mu sync.Mutex
+
+	maxPages    int
+	maxDepth    int
+	hasMaxDepth bool
+	deadline    time.Time
+
+	seen      map[string]struct{}
+	pages     int
+	truncated bool
+	reason    string
+}
+
+func newCrawlBudget(limits *jobLimits, deadline time.Time) *crawlBudget {
+	b := &crawlBudget{seen: make(map[string]struct{}), deadline: deadline}
+	if limits != nil {
+		b.maxPages = limits.MaxPages
+		b.maxDepth = limits.MaxDepth
+		b.hasMaxDepth = true
+	}
+	return b
+}
+
+func (b *crawlBudget) markLocked(reason string) {
+	if b.truncated {
+		return
+	}
+	b.truncated = true
+	b.reason = reason
+}
+
+// setReason records a cap that was detected outside the recording path.
+func (b *crawlBudget) setReason(reason string) {
+	if b == nil || reason == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.markLocked(reason)
+}
+
+// stopForWork reports whether new work must not be scheduled because the page
+// or duration cap was reached. The depth cap is per-branch and is handled by
+// allowLink.
+func (b *crawlBudget) stopForWork() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
+		b.markLocked(limitReasonMaxDuration)
+		return true
+	}
+	if b.maxPages > 0 && b.pages >= b.maxPages {
+		b.markLocked(limitReasonMaxPages)
+		return true
+	}
+	return false
+}
+
+// allowLink reports whether links found on a page at parentDepth may be
+// followed. max_depth counts link hops from the start page (depth 0), while
+// Colly numbers the start request itself as depth 1; a link found on a request
+// at parentDepth is therefore allowed when parentDepth <= maxDepth.
+// Sitemap-coverage pages are outside the link frontier and do not call this
+// helper.
+func (b *crawlBudget) allowLink(parentDepth int) bool {
+	if b == nil {
+		return true
+	}
+	if b.stopForWork() {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.hasMaxDepth && parentDepth > b.maxDepth {
+		b.markLocked(limitReasonMaxDepth)
+		return false
+	}
+	return true
+}
+
+// allowPage reserves a recording slot for a distinct URL. It returns false when
+// the page cap is exhausted; the caller must then skip the row instead of
+// exceeding the cap. The check and the count increment share the budget mutex,
+// so concurrent callbacks can reserve at most max_pages slots between them.
+func (b *crawlBudget) allowPage(u string) bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.maxPages > 0 && b.pages >= b.maxPages {
+		b.markLocked(limitReasonMaxPages)
+		return false
+	}
+	if _, ok := b.seen[u]; ok {
+		return true
+	}
+	b.seen[u] = struct{}{}
+	b.pages++
+	return true
+}
+
+// outcome snapshots the recorded pages and truncation metadata.
+func (b *crawlBudget) outcome(pages []Page) crawlOutcome {
+	if b == nil {
+		return crawlOutcome{Pages: pages}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return crawlOutcome{Pages: pages, Truncated: b.truncated, LimitReason: b.reason}
+}
+
 // pageStore collects Page rows from concurrent colly callbacks.
 type pageStore struct {
 	mu    sync.Mutex
@@ -50,8 +179,16 @@ func (t *requestStartTimes) take(id uint32) (time.Time, bool) {
 	return ts, ok
 }
 
-func attachHTTPTiming(c *colly.Collector, starts *requestStartTimes) {
+// attachHTTPTiming records request start times and aborts queued requests once
+// the page or duration cap is reached. Aborting in OnRequest happens before the
+// HTTP round-trip, so no row, progress event, or archive entry is produced for
+// work scheduled past a cap.
+func attachHTTPTiming(c *colly.Collector, starts *requestStartTimes, budget *crawlBudget) {
 	c.OnRequest(func(r *colly.Request) {
+		if budget.stopForWork() {
+			r.Abort()
+			return
+		}
 		starts.mark(r.ID)
 	})
 }
@@ -79,7 +216,7 @@ func closeCrawlArchive(archive *auditpkg.ArchiveWriter) error {
 	return nil
 }
 
-func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound *inboundTracker, store *pageStore, keywordsRaw string, onProgress progressFunc, archive *auditpkg.ArchiveWriter) {
+func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound *inboundTracker, store *pageStore, budget *crawlBudget, keywordsRaw string, onProgress progressFunc, archive *auditpkg.ArchiveWriter) {
 	// OnScraped runs once per request after a successful HTTP round-trip (including non-2xx
 	// bodies that Colly still parses). Callback/HTML errors after a 2xx still reach OnScraped.
 	c.OnScraped(func(r *colly.Response) {
@@ -90,6 +227,9 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 		}
 		body := append([]byte(nil), r.Body...)
 		u := r.Request.URL.String()
+		if !budget.allowPage(u) {
+			return
+		}
 		if archive != nil {
 			archive.Record(u, r.StatusCode, r.Headers, body, r.Request.Depth)
 		}
@@ -135,6 +275,9 @@ func attachPageRecording(c *colly.Collector, starts *requestStartTimes, inbound 
 		}
 		body := append([]byte(nil), resp.Body...)
 		u := req.URL.String()
+		if !budget.allowPage(u) {
+			return
+		}
 		if archive != nil {
 			// Metadata is kept for redirects and errors; the writer only saves
 			// HTML bodies for 200 responses.
