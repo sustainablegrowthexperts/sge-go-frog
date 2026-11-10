@@ -1,7 +1,7 @@
 ---
 id: task-008
 title: "[Slice] Running jobs are never reaped and MCP retention is 24h"
-status: pending
+status: completed
 depends_on: ["task-007"]
 target_files:
   - "server.go"

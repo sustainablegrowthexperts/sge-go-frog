@@ -15,9 +15,12 @@ import (
 const defaultConcurrency = 10
 
 const (
-	defaultMCPPath       = "/mcp"
-	defaultMCPJobTTL     = 24 * time.Hour
-	defaultMCPResultsDir = "results"
+	defaultMCPPath            = "/mcp"
+	defaultMCPJobTTL          = 24 * time.Hour
+	defaultMCPResultsDir      = "results"
+	defaultUIJobTTL           = 30 * time.Minute
+	defaultJobReapInterval    = 5 * time.Minute
+	defaultMaxRetainedMCPJobs = 100
 )
 
 // MCPConfig is the configuration surface for the embedded MCP server. It is
@@ -27,6 +30,9 @@ type MCPConfig struct {
 	Enabled         bool
 	Path            string
 	JobTTL          time.Duration
+	UITTL           time.Duration
+	ReapInterval    time.Duration
+	MaxRetainedJobs int
 	ResultsDir      string
 	Limits          MCPLimits
 	DefaultArchive  bool
@@ -38,6 +44,9 @@ func defaultMCPConfig() MCPConfig {
 		Enabled:         false,
 		Path:            defaultMCPPath,
 		JobTTL:          defaultMCPJobTTL,
+		UITTL:           defaultUIJobTTL,
+		ReapInterval:    defaultJobReapInterval,
+		MaxRetainedJobs: defaultMaxRetainedMCPJobs,
 		ResultsDir:      defaultMCPResultsDir,
 		Limits:          defaultMCPLimits(),
 		DefaultArchive:  false,
@@ -66,6 +75,27 @@ func mcpConfigFromEnv(getenv func(string) string) (MCPConfig, error) {
 			return cfg, fmt.Errorf("GOFROG_MCP_JOB_TTL: %w", err)
 		}
 		cfg.JobTTL = d
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_UI_JOB_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_UI_JOB_TTL: %w", err)
+		}
+		cfg.UITTL = d
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_JOB_REAP_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_JOB_REAP_INTERVAL: %w", err)
+		}
+		cfg.ReapInterval = d
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_RETAINED_JOBS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_RETAINED_JOBS: %w", err)
+		}
+		cfg.MaxRetainedJobs = n
 	}
 	if v := strings.TrimSpace(getenv("GOFROG_MCP_RESULTS_DIR")); v != "" {
 		cfg.ResultsDir = v
@@ -185,7 +215,10 @@ func mcpConfigFromEnv(getenv func(string) string) (MCPConfig, error) {
 func (c *MCPConfig) registerFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.Enabled, "mcp", c.Enabled, "enable the MCP server")
 	fs.StringVar(&c.Path, "mcp-path", c.Path, "HTTP path for the MCP endpoint")
-	fs.DurationVar(&c.JobTTL, "mcp-job-ttl", c.JobTTL, "retention for MCP jobs")
+	fs.DurationVar(&c.JobTTL, "mcp-job-ttl", c.JobTTL, "retention for finished MCP jobs")
+	fs.DurationVar(&c.UITTL, "ui-job-ttl", c.UITTL, "retention for finished web UI jobs")
+	fs.DurationVar(&c.ReapInterval, "job-reap-interval", c.ReapInterval, "how often the job reaper runs")
+	fs.IntVar(&c.MaxRetainedJobs, "mcp-max-retained-jobs", c.MaxRetainedJobs, "maximum finished MCP jobs kept in memory")
 	fs.StringVar(&c.ResultsDir, "mcp-results-dir", c.ResultsDir, "directory for MCP job artifacts")
 	fs.IntVar(&c.Limits.MaxPages, "mcp-max-pages", c.Limits.MaxPages, "maximum pages per MCP crawl")
 	fs.IntVar(&c.Limits.MaxDepth, "mcp-max-depth", c.Limits.MaxDepth, "maximum crawl depth for MCP jobs")

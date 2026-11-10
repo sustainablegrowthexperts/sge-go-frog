@@ -1551,11 +1551,14 @@ func TestStartCrawlIdempotency(t *testing.T) {
 		if job == nil {
 			t.Fatalf("job %q is not in the manager", jobID)
 		}
+		waitForJobStatus(t, job, jobStatusDone)
+		reapedAt := time.Now().UTC()
 		job.mu.Lock()
-		job.createdAt = time.Now().Add(-time.Hour).UTC()
+		job.createdAt = reapedAt.Add(-25 * time.Hour)
+		job.finishedAt = reapedAt.Add(-25 * time.Hour)
 		job.mu.Unlock()
 
-		app.jobs.reapBefore(time.Now().Add(-30 * time.Minute))
+		app.jobs.reapAt(reapedAt)
 
 		if app.jobs.get(jobID) != nil {
 			t.Fatalf("job %q survived the reaper", jobID)

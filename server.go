@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,6 +32,52 @@ var indexTmpl = template.Must(template.ParseFS(webFS, "web/index.html"))
 
 // ── job manager ──────────────────────────────────────────────────────────────
 
+// retentionConfig is the reaper policy for finished jobs. Running and queued
+// jobs are never subject to it.
+type retentionConfig struct {
+	MCPTTL             time.Duration
+	UITTL              time.Duration
+	ReapInterval       time.Duration
+	MaxRetainedMCPJobs int
+}
+
+func defaultRetentionConfig() retentionConfig {
+	return retentionConfig{
+		MCPTTL:             defaultMCPJobTTL,
+		UITTL:              defaultUIJobTTL,
+		ReapInterval:       defaultJobReapInterval,
+		MaxRetainedMCPJobs: defaultMaxRetainedMCPJobs,
+	}
+}
+
+// withDefaults fills unset or non-positive fields from the contract defaults.
+func (c retentionConfig) withDefaults() retentionConfig {
+	def := defaultRetentionConfig()
+	if c.MCPTTL <= 0 {
+		c.MCPTTL = def.MCPTTL
+	}
+	if c.UITTL <= 0 {
+		c.UITTL = def.UITTL
+	}
+	if c.ReapInterval <= 0 {
+		c.ReapInterval = def.ReapInterval
+	}
+	if c.MaxRetainedMCPJobs <= 0 {
+		c.MaxRetainedMCPJobs = def.MaxRetainedMCPJobs
+	}
+	return c
+}
+
+// jobManagerConfig supplies the retention policy and the clock/ticker seams
+// used by tests. Production uses the zero value.
+type jobManagerConfig struct {
+	Retention     retentionConfig
+	Now           func() time.Time
+	Ticker        func(time.Duration) <-chan time.Time
+	Logger        *slog.Logger
+	DisableReaper bool
+}
+
 type jobManager struct {
 	mu   sync.RWMutex
 	jobs map[string]*crawlJob
@@ -39,6 +86,11 @@ type jobManager struct {
 	// first used the key and the canonical fingerprint of that request. It is
 	// guarded by mu and purged whenever the mapped job is deleted or reaped.
 	idempotency map[string]idempotencyEntry
+
+	retention retentionConfig
+	now       func() time.Time
+	ticker    func(time.Duration) <-chan time.Time
+	logger    *slog.Logger
 }
 
 // idempotencyEntry records the job owning a request key and the effective
@@ -86,12 +138,30 @@ type crawlJob struct {
 	auditInclusiveDir     string
 }
 
-func newJobManager() *jobManager {
+func newJobManager(cfg jobManagerConfig) *jobManager {
+	now := cfg.Now
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+	ticker := cfg.Ticker
+	if ticker == nil {
+		ticker = func(d time.Duration) <-chan time.Time { return time.Tick(d) }
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	jm := &jobManager{
 		jobs:        make(map[string]*crawlJob),
 		idempotency: make(map[string]idempotencyEntry),
+		retention:   cfg.Retention.withDefaults(),
+		now:         now,
+		ticker:      ticker,
+		logger:      logger,
 	}
-	go jm.reapLoop()
+	if !cfg.DisableReaper {
+		go jm.reapLoop()
+	}
 	return jm
 }
 
@@ -357,21 +427,175 @@ func (jm *jobManager) purgeIdempotencyLocked(job *crawlJob) {
 }
 
 func (jm *jobManager) reapLoop() {
-	for range time.Tick(5 * time.Minute) {
-		jm.reapBefore(time.Now().Add(-30 * time.Minute))
+	for range jm.ticker(jm.retention.ReapInterval) {
+		jm.reapAt(jm.now())
 	}
 }
 
-// reapBefore removes every job created before cutoff and purges the matching
-// idempotency entries in the same critical section.
-func (jm *jobManager) reapBefore(cutoff time.Time) {
-	jm.mu.Lock()
-	defer jm.mu.Unlock()
-	for id, j := range jm.jobs {
-		if j.createdAt.Before(cutoff) {
-			jm.deleteLocked(id)
+// jobRetentionSnapshot is the consistent view of a job used to make a
+// retention decision without holding the manager lock.
+type jobRetentionSnapshot struct {
+	id         string
+	owner      string
+	status     string
+	createdAt  time.Time
+	finishedAt time.Time
+}
+
+func (j *crawlJob) retentionSnapshot() jobRetentionSnapshot {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return jobRetentionSnapshot{
+		id:         j.id,
+		owner:      j.owner,
+		status:     j.status,
+		createdAt:  j.createdAt,
+		finishedAt: j.finishedAt,
+	}
+}
+
+const (
+	retentionReasonTTL            = "ttl"
+	retentionReasonCap            = "cap"
+	retentionReasonRunningSkipped = "running_skipped"
+)
+
+type retentionDecision struct {
+	jobID             string
+	owner             string
+	status            string
+	age               time.Duration
+	reason            string
+	reap              bool
+	missingFinishedAt bool
+}
+
+// shouldReap is the pure retention policy decision for one job snapshot.
+// Queued and running jobs are always retained; terminal jobs expire after the
+// owner's TTL measured from finishedAt, or createdAt when finishedAt is unset.
+func shouldReap(job jobRetentionSnapshot, now time.Time, policy retentionConfig) retentionDecision {
+	decision := retentionDecision{
+		jobID:  job.id,
+		owner:  job.owner,
+		status: job.status,
+	}
+	if job.status == jobStatusQueued || job.status == jobStatusRunning {
+		decision.reason = retentionReasonRunningSkipped
+		decision.age = now.Sub(job.createdAt)
+		return decision
+	}
+
+	anchor := job.finishedAt
+	if anchor.IsZero() {
+		anchor = job.createdAt
+		decision.missingFinishedAt = true
+	}
+	decision.age = now.Sub(anchor)
+
+	ttl := policy.UITTL
+	if job.owner == ownerMCP {
+		ttl = policy.MCPTTL
+	}
+	if !anchor.Add(ttl).After(now) {
+		decision.reason = retentionReasonTTL
+		decision.reap = true
+	}
+	return decision
+}
+
+// retentionAnchor is the timestamp that orders finished MCP jobs for the cap.
+func retentionAnchor(job jobRetentionSnapshot) time.Time {
+	if job.finishedAt.IsZero() {
+		return job.createdAt
+	}
+	return job.finishedAt
+}
+
+// reapAt applies the TTL and retained-cap policies at now. Job IDs are
+// collected first and deleted afterwards so the manager lock is never held
+// while future slices clean up on-disk artifacts.
+func (jm *jobManager) reapAt(now time.Time) {
+	jm.mu.RLock()
+	jobs := make([]*crawlJob, 0, len(jm.jobs))
+	for _, job := range jm.jobs {
+		jobs = append(jobs, job)
+	}
+	jm.mu.RUnlock()
+
+	snapshots := make([]jobRetentionSnapshot, 0, len(jobs))
+	for _, job := range jobs {
+		snapshots = append(snapshots, job.retentionSnapshot())
+	}
+
+	type capCandidate struct {
+		decision retentionDecision
+		anchor   time.Time
+	}
+
+	deleteIDs := make(map[string]struct{})
+	finishedMCP := make([]capCandidate, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		decision := shouldReap(snapshot, now, jm.retention)
+		if decision.missingFinishedAt {
+			jm.logger.Warn("retention: terminal job is missing finished_at; falling back to created_at",
+				"job_id", decision.jobID,
+				"owner", decision.owner,
+				"status", decision.status,
+			)
+		}
+		if decision.reap {
+			deleteIDs[decision.jobID] = struct{}{}
+			jm.logRetentionDecision(decision)
+			continue
+		}
+		if decision.reason == retentionReasonRunningSkipped {
+			jm.logRetentionDecision(decision)
+			continue
+		}
+		if snapshot.owner == ownerMCP {
+			finishedMCP = append(finishedMCP, capCandidate{
+				decision: decision,
+				anchor:   retentionAnchor(snapshot),
+			})
 		}
 	}
+
+	if len(finishedMCP) > jm.retention.MaxRetainedMCPJobs {
+		sort.Slice(finishedMCP, func(i, k int) bool {
+			if finishedMCP[i].anchor.Equal(finishedMCP[k].anchor) {
+				return finishedMCP[i].decision.jobID < finishedMCP[k].decision.jobID
+			}
+			return finishedMCP[i].anchor.Before(finishedMCP[k].anchor)
+		})
+		evict := len(finishedMCP) - jm.retention.MaxRetainedMCPJobs
+		for i := 0; i < evict; i++ {
+			decision := finishedMCP[i].decision
+			decision.reason = retentionReasonCap
+			decision.reap = true
+			deleteIDs[decision.jobID] = struct{}{}
+			jm.logRetentionDecision(decision)
+		}
+	}
+
+	if len(deleteIDs) == 0 {
+		return
+	}
+	jm.mu.Lock()
+	for id := range deleteIDs {
+		jm.deleteLocked(id)
+	}
+	jm.mu.Unlock()
+}
+
+// logRetentionDecision emits one structured, content-free retention record.
+func (jm *jobManager) logRetentionDecision(decision retentionDecision) {
+	jm.logger.Info("retention decision",
+		"job_id", decision.jobID,
+		"owner", decision.owner,
+		"status", decision.status,
+		"age", decision.age.String(),
+		"reason", decision.reason,
+	)
 }
 
 // markQueued moves a newly created job into the bounded MCP wait queue. It is
@@ -715,7 +939,14 @@ func newApp(cfg appConfig) (*app, error) {
 		runner = realCrawlRunner{}
 	}
 
-	jm := newJobManager()
+	jm := newJobManager(jobManagerConfig{
+		Retention: retentionConfig{
+			MCPTTL:             cfg.MCP.JobTTL,
+			UITTL:              cfg.MCP.UITTL,
+			ReapInterval:       cfg.MCP.ReapInterval,
+			MaxRetainedMCPJobs: cfg.MCP.MaxRetainedJobs,
+		},
+	})
 	mux := http.NewServeMux()
 	registerWebRoutes(mux, jm, runner)
 

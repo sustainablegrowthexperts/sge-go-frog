@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -329,6 +330,401 @@ func TestUIJobFlowUnchanged(t *testing.T) {
 			t.Fatalf("UI job did not finish; status = %q", status)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// reaperJobSpec describes one job seeded directly into the manager so retention
+// tests can control timestamps, ownership, and status without waiting.
+type reaperJobSpec struct {
+	id              string
+	owner           string
+	status          string
+	createdAt       time.Time
+	finishedAt      time.Time
+	clientRequestID string
+}
+
+// seedReaperJob inserts a job and its optional idempotency mapping.
+func seedReaperJob(jm *jobManager, spec reaperJobSpec) *crawlJob {
+	job := &crawlJob{
+		id:              spec.id,
+		mode:            "spider",
+		target:          "https://example.com",
+		createdAt:       spec.createdAt,
+		owner:           spec.owner,
+		status:          spec.status,
+		phase:           jobPhaseDone,
+		finishedAt:      spec.finishedAt,
+		clientRequestID: spec.clientRequestID,
+	}
+	jm.mu.Lock()
+	jm.jobs[job.id] = job
+	if job.clientRequestID != "" {
+		jm.idempotency[idempotencyKey(job.owner, job.clientRequestID)] = idempotencyEntry{
+			jobID:       job.id,
+			fingerprint: "test-fingerprint",
+		}
+	}
+	jm.mu.Unlock()
+	return job
+}
+
+// TestJobReaperRetention covers the retention contract:
+//   - queued and running jobs are never reaped, however old they are;
+//   - finished MCP jobs expire 24 hours after finishedAt;
+//   - finished UI jobs keep their 30-minute post-completion retention;
+//   - terminal jobs without finishedAt fall back to createdAt;
+//   - the retained MCP cap evicts only the oldest finished MCP jobs, with a
+//     deterministic job-ID tie-breaker;
+//   - every deletion purges the job's idempotency mapping.
+//
+// Every case uses an injected clock/reference time: there are no sleeps.
+func TestJobReaperRetention(t *testing.T) {
+	base := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	policy := retentionConfig{
+		MCPTTL:             defaultMCPJobTTL,
+		UITTL:              30 * time.Minute,
+		ReapInterval:       5 * time.Minute,
+		MaxRetainedMCPJobs: 100,
+	}
+
+	newManager := func(t *testing.T, policy retentionConfig) *jobManager {
+		t.Helper()
+		return newJobManager(jobManagerConfig{
+			Retention:     policy,
+			Now:           func() time.Time { return base },
+			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+			DisableReaper: true,
+		})
+	}
+
+	assertPresent := func(t *testing.T, jm *jobManager, ids ...string) {
+		t.Helper()
+		for _, id := range ids {
+			if jm.get(id) == nil {
+				t.Fatalf("job %q was reaped, want it retained", id)
+			}
+		}
+	}
+	assertGone := func(t *testing.T, jm *jobManager, ids ...string) {
+		t.Helper()
+		for _, id := range ids {
+			if jm.get(id) != nil {
+				t.Fatalf("job %q survived, want it reaped", id)
+			}
+		}
+	}
+
+	t.Run("running and queued jobs are never reaped", func(t *testing.T) {
+		jm := newManager(t, policy)
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "mcp-running",
+			owner:     ownerMCP,
+			status:    jobStatusRunning,
+			createdAt: base.Add(-72 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "mcp-queued",
+			owner:     ownerMCP,
+			status:    jobStatusQueued,
+			createdAt: base.Add(-72 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "ui-running",
+			owner:     ownerUI,
+			status:    jobStatusRunning,
+			createdAt: base.Add(-72 * time.Hour),
+		})
+
+		jm.reapAt(base)
+
+		assertPresent(t, jm, "mcp-running", "mcp-queued", "ui-running")
+	})
+
+	t.Run("MCP TTL uses finishedAt", func(t *testing.T) {
+		jm := newManager(t, policy)
+		seedReaperJob(jm, reaperJobSpec{
+			id:              "mcp-expired",
+			owner:           ownerMCP,
+			status:          jobStatusDone,
+			createdAt:       base.Add(-72 * time.Hour),
+			finishedAt:      base.Add(-25 * time.Hour),
+			clientRequestID: "mcp-expired-request",
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "mcp-recent-finish",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: base.Add(-23 * time.Hour),
+		})
+
+		jm.reapAt(base)
+
+		assertGone(t, jm, "mcp-expired")
+		assertPresent(t, jm, "mcp-recent-finish")
+		if entries := idempotencyEntryCount(jm); entries != 0 {
+			t.Fatalf("idempotency entries after TTL reap = %d, want 0", entries)
+		}
+	})
+
+	t.Run("UI TTL remains 30 minutes after completion", func(t *testing.T) {
+		jm := newManager(t, policy)
+		seedReaperJob(jm, reaperJobSpec{
+			id:              "ui-expired",
+			owner:           ownerUI,
+			status:          jobStatusDone,
+			createdAt:       base.Add(-72 * time.Hour),
+			finishedAt:      base.Add(-31 * time.Minute),
+			clientRequestID: "ui-expired-request",
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "ui-recent-finish",
+			owner:      ownerUI,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: base.Add(-29 * time.Minute),
+		})
+
+		jm.reapAt(base)
+
+		assertGone(t, jm, "ui-expired")
+		assertPresent(t, jm, "ui-recent-finish")
+		if entries := idempotencyEntryCount(jm); entries != 0 {
+			t.Fatalf("idempotency entries after UI TTL reap = %d, want 0", entries)
+		}
+	})
+
+	t.Run("terminal jobs missing finishedAt fall back to createdAt", func(t *testing.T) {
+		jm := newManager(t, policy)
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "mcp-no-finished-expired",
+			owner:     ownerMCP,
+			status:    jobStatusError,
+			createdAt: base.Add(-25 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "mcp-no-finished-recent",
+			owner:     ownerMCP,
+			status:    jobStatusError,
+			createdAt: base.Add(-23 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "ui-no-finished-expired",
+			owner:     ownerUI,
+			status:    jobStatusDone,
+			createdAt: base.Add(-31 * time.Minute),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "ui-no-finished-recent",
+			owner:     ownerUI,
+			status:    jobStatusDone,
+			createdAt: base.Add(-29 * time.Minute),
+		})
+
+		jm.reapAt(base)
+
+		assertGone(t, jm, "mcp-no-finished-expired", "ui-no-finished-expired")
+		assertPresent(t, jm, "mcp-no-finished-recent", "ui-no-finished-recent")
+	})
+
+	t.Run("retained cap evicts only the oldest finished MCP jobs", func(t *testing.T) {
+		capped := policy
+		capped.MaxRetainedMCPJobs = 3
+		jm := newManager(t, capped)
+
+		seedReaperJob(jm, reaperJobSpec{
+			id:              "oldest",
+			owner:           ownerMCP,
+			status:          jobStatusDone,
+			createdAt:       base.Add(-72 * time.Hour),
+			finishedAt:      base.Add(-5 * time.Hour),
+			clientRequestID: "oldest-request",
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "older",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: base.Add(-4 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "middle",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: base.Add(-3 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "newer",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: base.Add(-2 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "newest",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: base.Add(-1 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:        "running-mcp",
+			owner:     ownerMCP,
+			status:    jobStatusRunning,
+			createdAt: base.Add(-72 * time.Hour),
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "finished-ui",
+			owner:      ownerUI,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: base.Add(-10 * time.Minute),
+		})
+
+		jm.reapAt(base)
+
+		assertGone(t, jm, "oldest", "older")
+		assertPresent(t, jm, "middle", "newer", "newest", "running-mcp", "finished-ui")
+		if entries := idempotencyEntryCount(jm); entries != 0 {
+			t.Fatalf("idempotency entries after cap reap = %d, want 0", entries)
+		}
+	})
+
+	t.Run("equal finishedAt timestamps use the job ID as tie-breaker", func(t *testing.T) {
+		capped := policy
+		capped.MaxRetainedMCPJobs = 2
+		jm := newManager(t, capped)
+		finishedAt := base.Add(-time.Hour)
+
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "ccc",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: finishedAt,
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "bbb",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: finishedAt,
+		})
+		seedReaperJob(jm, reaperJobSpec{
+			id:         "aaa",
+			owner:      ownerMCP,
+			status:     jobStatusDone,
+			createdAt:  base.Add(-72 * time.Hour),
+			finishedAt: finishedAt,
+		})
+
+		jm.reapAt(base)
+
+		assertGone(t, jm, "aaa")
+		assertPresent(t, jm, "bbb", "ccc")
+	})
+
+	t.Run("retention defaults match the configured contract", func(t *testing.T) {
+		got := defaultRetentionConfig()
+		if got.MCPTTL != 24*time.Hour {
+			t.Fatalf("MCPTTL = %s, want 24h", got.MCPTTL)
+		}
+		if got.UITTL != 30*time.Minute {
+			t.Fatalf("UITTL = %s, want 30m", got.UITTL)
+		}
+		if got.ReapInterval != 5*time.Minute {
+			t.Fatalf("ReapInterval = %s, want 5m", got.ReapInterval)
+		}
+		if got.MaxRetainedMCPJobs != 100 {
+			t.Fatalf("MaxRetainedMCPJobs = %d, want 100", got.MaxRetainedMCPJobs)
+		}
+	})
+}
+
+// TestJobReaperRetentionDecisionTable exercises the pure shouldReap policy
+// directly, including exact TTL boundaries and the missing-finishedAt fallback.
+func TestJobReaperRetentionDecisionTable(t *testing.T) {
+	base := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	policy := defaultRetentionConfig()
+
+	cases := []struct {
+		name        string
+		job         jobRetentionSnapshot
+		wantReap    bool
+		wantReason  string
+		wantAge     time.Duration
+		wantMissing bool
+	}{
+		{
+			name:       "running MCP job is skipped regardless of age",
+			job:        jobRetentionSnapshot{id: "mcp-running", owner: ownerMCP, status: jobStatusRunning, createdAt: base.Add(-72 * time.Hour)},
+			wantReason: retentionReasonRunningSkipped,
+			wantAge:    72 * time.Hour,
+		},
+		{
+			name:       "queued UI job is skipped regardless of age",
+			job:        jobRetentionSnapshot{id: "ui-queued", owner: ownerUI, status: jobStatusQueued, createdAt: base.Add(-72 * time.Hour)},
+			wantReason: retentionReasonRunningSkipped,
+			wantAge:    72 * time.Hour,
+		},
+		{
+			name:       "MCP job at the 24 hour boundary expires",
+			job:        jobRetentionSnapshot{id: "mcp-boundary", owner: ownerMCP, status: jobStatusDone, createdAt: base.Add(-72 * time.Hour), finishedAt: base.Add(-24 * time.Hour)},
+			wantReap:   true,
+			wantReason: retentionReasonTTL,
+			wantAge:    24 * time.Hour,
+		},
+		{
+			name:    "MCP job inside the 24 hour window survives",
+			job:     jobRetentionSnapshot{id: "mcp-inside", owner: ownerMCP, status: jobStatusDone, createdAt: base.Add(-72 * time.Hour), finishedAt: base.Add(-24*time.Hour + time.Second)},
+			wantAge: 24*time.Hour - time.Second,
+		},
+		{
+			name:       "UI job at the 30 minute boundary expires",
+			job:        jobRetentionSnapshot{id: "ui-boundary", owner: ownerUI, status: jobStatusError, createdAt: base.Add(-72 * time.Hour), finishedAt: base.Add(-30 * time.Minute)},
+			wantReap:   true,
+			wantReason: retentionReasonTTL,
+			wantAge:    30 * time.Minute,
+		},
+		{
+			name:    "UI job inside the 30 minute window survives",
+			job:     jobRetentionSnapshot{id: "ui-inside", owner: ownerUI, status: jobStatusDone, createdAt: base.Add(-72 * time.Hour), finishedAt: base.Add(-30*time.Minute + time.Second)},
+			wantAge: 30*time.Minute - time.Second,
+		},
+		{
+			name:        "MCP terminal job without finishedAt falls back to createdAt",
+			job:         jobRetentionSnapshot{id: "mcp-no-finish", owner: ownerMCP, status: jobStatusError, createdAt: base.Add(-25 * time.Hour)},
+			wantReap:    true,
+			wantReason:  retentionReasonTTL,
+			wantAge:     25 * time.Hour,
+			wantMissing: true,
+		},
+		{
+			name:        "UI terminal job without finishedAt stays inside createdAt window",
+			job:         jobRetentionSnapshot{id: "ui-no-finish", owner: ownerUI, status: jobStatusDone, createdAt: base.Add(-29 * time.Minute)},
+			wantAge:     29 * time.Minute,
+			wantMissing: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldReap(tc.job, base, policy)
+			if got.reap != tc.wantReap {
+				t.Fatalf("reap = %v, want %v", got.reap, tc.wantReap)
+			}
+			if got.reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", got.reason, tc.wantReason)
+			}
+			if got.age != tc.wantAge {
+				t.Fatalf("age = %s, want %s", got.age, tc.wantAge)
+			}
+			if got.missingFinishedAt != tc.wantMissing {
+				t.Fatalf("missingFinishedAt = %v, want %v", got.missingFinishedAt, tc.wantMissing)
+			}
+		})
 	}
 }
 
