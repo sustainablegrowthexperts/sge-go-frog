@@ -1,7 +1,7 @@
 ---
 id: task-020
 title: "[Slice] SIGINT/SIGTERM shuts down MCP work cleanly"
-status: pending
+status: completed
 depends_on: ["task-019"]
 target_files:
   - "main.go"

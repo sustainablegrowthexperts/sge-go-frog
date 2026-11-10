@@ -7,10 +7,12 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	auditpkg "go-frog/internal/audit"
@@ -848,8 +851,23 @@ func (j *crawlJob) progress(url string) {
 	j.currentURL = url
 }
 
+// terminalLocked reports whether the job already reached a terminal state. The
+// caller must hold the job mutex. Terminal transitions are first-writer-wins so
+// a shutdown interruption cannot be overwritten by a late crawl result.
+func (j *crawlJob) terminalLocked() bool {
+	switch j.status {
+	case jobStatusDone, jobStatusError, jobStatusCancelled:
+		return true
+	}
+	return false
+}
+
 func (j *crawlJob) finish(pages []Page) {
 	j.mu.Lock()
+	if j.terminalLocked() {
+		j.mu.Unlock()
+		return
+	}
 	j.status = jobStatusDone
 	j.setPhaseLocked(jobPhaseDone)
 	j.result = pages
@@ -912,12 +930,51 @@ func (j *crawlJob) setTruncation(truncated bool, reason string) {
 func (j *crawlJob) fail(err error) {
 	sanitized := j.sanitizedError(err)
 	j.mu.Lock()
+	if j.terminalLocked() {
+		j.mu.Unlock()
+		return
+	}
 	j.status = jobStatusError
 	j.setPhaseLocked(jobPhaseError)
 	j.errMsg = err.Error()
 	j.mu.Unlock()
 	j.persist()
 	logJobError(j.logger, "job failed", j.id, "error", sanitized)
+}
+
+// interrupt records the shutdown terminal state for a queued or running job. A
+// job that already finished is left untouched. Partial rows recorded before the
+// interruption are preserved.
+func (j *crawlJob) interrupt(message string) bool {
+	if message == "" {
+		message = jobInterruptedMessage
+	}
+	j.mu.Lock()
+	if j.terminalLocked() {
+		j.mu.Unlock()
+		return false
+	}
+	j.status = jobStatusError
+	j.setPhaseLocked(jobPhaseError)
+	j.errMsg = message
+	j.errCode = "interrupted"
+	j.mu.Unlock()
+	j.persist()
+	logJobError(j.logger, "job interrupted", j.id, "reason", "interrupted")
+	return true
+}
+
+// setPartialResults preserves page rows that were already recorded when a run
+// was interrupted. It never changes the terminal status or error code.
+func (j *crawlJob) setPartialResults(pages []Page) {
+	if len(pages) == 0 {
+		return
+	}
+	j.mu.Lock()
+	j.result = append([]Page(nil), pages...)
+	j.pages = len(pages)
+	j.mu.Unlock()
+	j.persist()
 }
 
 // sanitizedError removes known job-owned filesystem prefixes and credentials
@@ -940,6 +997,10 @@ func (j *crawlJob) sanitizedError(err error) string {
 
 func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Result, inclusiveErr error) {
 	j.mu.Lock()
+	if j.terminalLocked() {
+		j.mu.Unlock()
+		return
+	}
 	j.status = jobStatusDone
 	j.setPhaseLocked(jobPhaseDone)
 	j.result = pages
@@ -980,6 +1041,10 @@ func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Re
 func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
 	sanitized := j.sanitizedError(err)
 	j.mu.Lock()
+	if j.terminalLocked() {
+		j.mu.Unlock()
+		return
+	}
 	j.status = jobStatusDone
 	j.setPhaseLocked(jobPhaseDone)
 	j.result = pages
@@ -1196,6 +1261,9 @@ type appConfig struct {
 	// Logger is injected into the shared job manager and MCP adapter. A nil
 	// value selects the process logger configured by GOFROG_LOG_FORMAT.
 	Logger *slog.Logger
+	// ShutdownTimeout bounds the graceful drain of crawls and MCP sessions. A
+	// non-positive value selects defaultShutdownTimeout.
+	ShutdownTimeout time.Duration
 }
 
 type app struct {
@@ -1203,7 +1271,36 @@ type app struct {
 	runner  crawlRunner
 	mcp     *mcpServer
 	handler http.Handler
+
+	// ctx is the parent of every launched crawl. cancel is called exactly once
+	// by shutdown so in-flight runners observe the same interruption.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	shutdownTimeout time.Duration
+
+	// launchMu makes the shutting-down check and crawlWG.Add atomic, so
+	// Shutdown can never race a new crawler into the wait group after it
+	// starts draining.
+	launchMu     sync.Mutex
+	crawlWG      sync.WaitGroup
+	shuttingDown atomic.Bool
+
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
+
+// errShuttingDown is returned to a start request that arrives while the
+// process is draining. The MCP adapter renders it as a retryable
+// internal_error so clients back off instead of retrying the same request
+// immediately.
+var errShuttingDown = newRetryableToolError(codeInternalError,
+	"server is shutting down; retry after it restarts",
+	map[string]any{"reason": "shutting_down"})
+
+// jobInterruptedMessage is the stable, client-visible explanation for a job
+// stopped by shutdown.
+const jobInterruptedMessage = "job interrupted by server shutdown"
 
 // newApp builds the job manager and HTTP mux used by both the web UI and the
 // MCP endpoint. MCP is opt-in; when disabled, routing is exactly the previous
@@ -1244,15 +1341,29 @@ func newApp(cfg appConfig) (*app, error) {
 		Store:  store,
 		Logger: logger,
 	})
+	ctx, cancel := context.WithCancel(context.Background())
+	timeout := cfg.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = defaultShutdownTimeout
+	}
+	a := &app{
+		jobs:            jm,
+		runner:          runner,
+		ctx:             ctx,
+		cancel:          cancel,
+		shutdownTimeout: timeout,
+	}
 	mux := http.NewServeMux()
-	registerWebRoutes(mux, jm, runner)
+	registerWebRoutes(mux, a)
+	a.handler = mux
 
-	a := &app{jobs: jm, runner: runner, handler: mux}
 	if cfg.MCP.Enabled {
 		ms, err := newMCPServer(jm, cfg.MCP, runner, cfg.SSRF)
 		if err != nil {
+			cancel()
 			return nil, fmt.Errorf("initialize MCP server: %w", err)
 		}
+		ms.app = a
 		mux.Handle(cfg.MCP.Path, ms.Handler())
 		a.mcp = ms
 	}
@@ -1264,22 +1375,104 @@ func (a *app) Handler() http.Handler {
 	return a.handler
 }
 
+// launch starts one crawl in the background. It reports false when shutdown has
+// already begun, in which case the caller must not start the work.
+func (a *app) launch(run func(context.Context)) bool {
+	a.launchMu.Lock()
+	if a.shuttingDown.Load() {
+		a.launchMu.Unlock()
+		return false
+	}
+	a.crawlWG.Add(1)
+	a.launchMu.Unlock()
+
+	go func() {
+		defer a.crawlWG.Done()
+		run(a.ctx)
+	}()
+	return true
+}
+
+// Shutdown drains the application exactly once. It stops new starts, marks
+// running and queued MCP jobs interrupted, cancels every runner context, lets
+// in-flight work close its archive writers, then closes MCP sessions. Concurrent
+// and repeated calls share the first result.
+func (a *app) Shutdown(ctx context.Context) error {
+	a.shutdownOnce.Do(func() {
+		a.shutdownErr = a.shutdown(ctx)
+	})
+	return a.shutdownErr
+}
+
+func (a *app) shutdown(ctx context.Context) error {
+	a.launchMu.Lock()
+	a.shuttingDown.Store(true)
+	a.launchMu.Unlock()
+
+	if a.mcp != nil {
+		a.mcp.beginShutdown()
+	}
+
+	// Mark the jobs before cancelling so a runner that wakes from cancellation
+	// cannot replace the interrupted terminal state with a generic failure.
+	for _, job := range a.jobs.list(jobFilter{Owner: ownerMCP}) {
+		job.interrupt(jobInterruptedMessage)
+	}
+
+	if a.cancel != nil {
+		a.cancel()
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		a.crawlWG.Wait()
+		close(drained)
+	}()
+
+	var err error
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+
+	if a.mcp != nil {
+		if closeErr := a.mcp.Close(ctx); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
 // Close releases application resources. It must be safe to call after the HTTP
 // listener has stopped.
 func (a *app) Close(ctx context.Context) error {
+	if a.cancel != nil {
+		a.cancel()
+	}
 	if a.mcp != nil {
 		return a.mcp.Close(ctx)
 	}
 	return nil
 }
 
-// serve starts the shared application on the given address.
+// serve starts the shared application on the given address and drains it when
+// ctx is canceled.
 func serve(addr string, cfg MCPConfig) error {
+	return serveContext(context.Background(), addr, cfg)
+}
+
+func serveContext(ctx context.Context, addr string, cfg MCPConfig) error {
 	a, err := newApp(appConfig{MCP: cfg})
 	if err != nil {
 		return err
 	}
 	defer a.Close(context.Background())
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
 
 	if cfg.Enabled {
 		limits := cfg.Limits.withDefaults()
@@ -1291,12 +1484,60 @@ func serve(addr string, cfg MCPConfig) error {
 		)
 	}
 	fmt.Printf("go-frog web server listening on %s\n", addr)
-	return http.ListenAndServe(addr, a.Handler())
+
+	return serveHTTP(ctx, &http.Server{Handler: a.Handler()}, ln, a)
+}
+
+// serveHTTP serves ln until ctx is canceled, then drains the application and
+// the HTTP server under the configured timeout. A nil return means the shutdown
+// succeeded; a failed drain is returned so the process can exit non-zero.
+func serveHTTP(ctx context.Context, srv *http.Server, ln net.Listener, a *app) error {
+	served := make(chan error, 1)
+	go func() {
+		served <- srv.Serve(ln)
+	}()
+
+	select {
+	case err := <-served:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+
+	timeout := a.shutdownTimeout
+	if timeout <= 0 {
+		timeout = defaultShutdownTimeout
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var appErr, httpErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		appErr = a.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		defer wg.Done()
+		httpErr = srv.Shutdown(shutdownCtx)
+	}()
+	wg.Wait()
+
+	if httpErr != nil && !errors.Is(httpErr, http.ErrServerClosed) {
+		return httpErr
+	}
+	return appErr
 }
 
 // ── http server ──────────────────────────────────────────────────────────────
 
-func registerWebRoutes(mux *http.ServeMux, jm *jobManager, runner crawlRunner) {
+func registerWebRoutes(mux *http.ServeMux, a *app) {
+	jm := a.jobs
+	runner := a.runner
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -1382,7 +1623,13 @@ func registerWebRoutes(mux *http.ServeMux, jm *jobManager, runner crawlRunner) {
 		}
 
 		job := jm.createWithOwner(ownerUI, mode, target, settings)
-		go runCrawlJob(job, settings, runner)
+		if !a.launch(func(ctx context.Context) {
+			runCrawlJobContext(ctx, job, settings, runner)
+		}) {
+			job.interrupt(jobInterruptedMessage)
+			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
 
 		w.Header().Set("Content-Type", "text/html")
 		writeJobFragment(w, job.view())
@@ -1425,18 +1672,21 @@ func registerWebRoutes(mux *http.ServeMux, jm *jobManager, runner crawlRunner) {
 // before the job is created; the deferred release covers done, error, and any
 // future interrupted terminal state. Queued jobs wait for admission, then
 // transition from queued to starting before the crawl begins.
-func runMCPCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner, reservation *quotaReservation) {
+func runMCPCrawlJob(ctx context.Context, job *crawlJob, settings WizardSettings, runner crawlRunner, reservation *quotaReservation) {
 	defer reservation.Release()
 
 	if reservation.queued {
-		if !reservation.Wait() {
+		if !reservation.WaitContext(ctx) {
+			// Shutdown marks the job interrupted before canceling, so this
+			// failure is a no-op for an interrupted job and only reports a
+			// genuinely abandoned queue entry.
 			job.fail(fmt.Errorf("interrupted before start"))
 			return
 		}
 		job.startFromQueue()
 	}
 
-	runCrawlJob(job, settings, runner)
+	runCrawlJobContext(ctx, job, settings, runner)
 }
 
 // auditAnalyze is the audit pipeline entry point. It is a variable so tests
@@ -1444,10 +1694,16 @@ func runMCPCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner, 
 // real archive. Production always uses auditpkg.Analyze.
 var auditAnalyze = auditpkg.Analyze
 
-// runCrawlJob is the single launch path shared by the web UI and the MCP
-// tools. It runs the crawler and then, when enabled, the strict/inclusive
-// audit pipeline.
+// runCrawlJob is the single launch path shared by callers that have no
+// cancelable context.
 func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
+	runCrawlJobContext(context.Background(), job, settings, runner)
+}
+
+// runCrawlJobContext is the single launch path shared by the web UI and the MCP
+// tools. The context is threaded into the crawler so shutdown can stop new work
+// and let in-flight requests finish.
+func runCrawlJobContext(ctx context.Context, job *crawlJob, settings WizardSettings, runner crawlRunner) {
 	job.setPhase(jobPhaseStarting)
 
 	// Only MCP jobs carry resolved limits. UI and CLI runs keep their current
@@ -1463,13 +1719,14 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 	var err error
 	switch settings.Mode {
 	case 1:
-		outcome, err = runner.Spider(context.Background(), settings, job.progress, onPhase)
+		outcome, err = runner.Spider(ctx, settings, job.progress, onPhase)
 	case 2:
-		outcome, err = runner.List(context.Background(), settings.listURLs, settings, job.progress, onPhase)
+		outcome, err = runner.List(ctx, settings.listURLs, settings, job.progress, onPhase)
 	default:
 		err = fmt.Errorf("unknown mode %d", settings.Mode)
 	}
 	if err != nil {
+		job.setPartialResults(outcome.Pages)
 		job.fail(err)
 		return
 	}
@@ -1483,6 +1740,12 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 			job.finishWithAuditError(pages, fmt.Errorf("audit skipped: crawl truncated at %s", outcome.LimitReason))
 			return
 		}
+		if err := ctx.Err(); err != nil {
+			job.setPartialResults(pages)
+			job.fail(err)
+			return
+		}
+
 		// Mark the audit running before the phase write so the persisted
 		// auditing_strict snapshot already reports audit.state=running.
 		job.beginAudit()
@@ -1490,6 +1753,11 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 		result, auditErr := auditAnalyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
 		if auditErr != nil {
 			job.finishWithAuditError(pages, fmt.Errorf("internal linking audit: %w", auditErr))
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			job.setPartialResults(pages)
+			job.fail(err)
 			return
 		}
 

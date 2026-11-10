@@ -86,7 +86,7 @@ func runListContext(ctx context.Context, urls []string, s WizardSettings, onProg
 
 	emitPhase(onPhase, jobPhaseCrawling)
 	for _, u := range urls {
-		if budget.stopForWork() {
+		if ctx.Err() != nil || budget.stopForWork() {
 			break
 		}
 		if err := c.Visit(u); err != nil {

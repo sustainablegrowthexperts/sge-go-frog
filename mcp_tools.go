@@ -298,6 +298,11 @@ type startCrawlPlan struct {
 // idempotent: identical input returns the original job, while different input
 // returns a conflict.
 func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in startCrawlInput) (*mcp.CallToolResult, startCrawlOutput, error) {
+	// Shutdown wins over every other check so a draining process never creates
+	// or replays a job.
+	if s.shuttingDown.Load() {
+		return nil, startCrawlOutput{}, errShuttingDown
+	}
 	if err := s.checkToolRateLimit(); err != nil {
 		return nil, startCrawlOutput{}, err
 	}
@@ -346,7 +351,21 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 	if reservation.queued {
 		job.markQueued()
 	}
-	go runMCPCrawlJob(job, plan.settings, s.runner, reservation)
+
+	run := func(ctx context.Context) {
+		runMCPCrawlJob(ctx, job, plan.settings, s.runner, reservation)
+	}
+	if s.app != nil {
+		if !s.app.launch(run) {
+			// Shutdown began after the initial check. Release the slot and
+			// record the job as interrupted instead of leaving it running.
+			reservation.Release()
+			job.interrupt(jobInterruptedMessage)
+			return nil, startCrawlOutput{}, errShuttingDown
+		}
+	} else {
+		go run(context.Background())
+	}
 
 	return nil, s.startCrawlOutput(job), nil
 }

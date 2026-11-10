@@ -41,10 +41,12 @@ func (realCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onPr
 	}
 	outcome, err := runSpiderContext(ctx, settings, onProgress, onPhase)
 	if err != nil {
-		return crawlOutcome{}, err
+		return outcome, err
 	}
 	if err := ctx.Err(); err != nil && !outcome.Truncated {
-		return crawlOutcome{}, err
+		// Keep any rows recorded before the interruption so a shutdown can
+		// persist partial results.
+		return outcome, err
 	}
 	return outcome, nil
 }
@@ -55,10 +57,12 @@ func (realCrawlRunner) List(ctx context.Context, urls []string, settings WizardS
 	}
 	outcome, err := runListContext(ctx, urls, settings, onProgress, onPhase)
 	if err != nil {
-		return crawlOutcome{}, err
+		return outcome, err
 	}
 	if err := ctx.Err(); err != nil && !outcome.Truncated {
-		return crawlOutcome{}, err
+		// Keep any rows recorded before the interruption so a shutdown can
+		// persist partial results.
+		return outcome, err
 	}
 	return outcome, nil
 }

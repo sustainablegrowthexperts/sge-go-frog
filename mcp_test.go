@@ -5144,6 +5144,322 @@ func TestStructuredLoggingToolCalls(t *testing.T) {
 	}
 }
 
+// assertNoShutdownTempFiles fails when a shutdown leaves an atomic-write
+// temporary file behind anywhere below root.
+func assertNoShutdownTempFiles(t *testing.T, root string) {
+	t.Helper()
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if strings.Contains(filepath.Base(path), ".tmp") {
+			t.Errorf("shutdown left temporary file %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+}
+
+// assertInterruptedJob checks the in-memory and persisted interrupted state.
+func assertInterruptedJob(t *testing.T, jm *jobManager, resultsDir, jobID string) {
+	t.Helper()
+	job := jm.get(jobID)
+	if job == nil {
+		t.Fatalf("job %s is not in the manager", jobID)
+	}
+	status, phase := job.statusPhase()
+	if status != jobStatusError || phase != jobPhaseError {
+		t.Fatalf("job %s status/phase = %s/%s, want %s/%s", jobID, status, phase, jobStatusError, jobPhaseError)
+	}
+	job.mu.Lock()
+	code := job.errCode
+	finishedAt := job.finishedAt
+	job.mu.Unlock()
+	if code != "interrupted" {
+		t.Fatalf("job %s error code = %q, want interrupted", jobID, code)
+	}
+	if finishedAt.IsZero() {
+		t.Fatalf("job %s finishedAt is zero, want a shutdown timestamp", jobID)
+	}
+
+	record, err := readJobStoreRecord(filepath.Join(resultsDir, "jobs", jobID))
+	if err != nil {
+		t.Fatalf("read persisted job %s: %v", jobID, err)
+	}
+	if record.Status != jobStatusError || record.Phase != jobPhaseError || record.ErrorCode != "interrupted" {
+		t.Fatalf("persisted job %s = status %q phase %q code %q, want error/error/interrupted",
+			jobID, record.Status, record.Phase, record.ErrorCode)
+	}
+	if record.FinishedAt.IsZero() {
+		t.Fatalf("persisted job %s finished_at is zero", jobID)
+	}
+}
+
+// TestGracefulShutdownInterruptsRunningAndQueuedJobs is the unit-level shutdown
+// contract: a blocking runner keeps jobs alive, Shutdown marks them interrupted,
+// persists that state, rejects new starts, and leaves no temporary files.
+func TestGracefulShutdownInterruptsRunningAndQueuedJobs(t *testing.T) {
+	cfg := defaultMCPConfig()
+	cfg.Enabled = true
+	cfg.PersistJobs = true
+	cfg.ResultsDir = t.TempDir()
+	cfg.Limits.MaxConcurrentJobs = 1
+	cfg.Limits.MaxConcurrentJobsPerToken = 1
+
+	runner := newFakeCrawlRunner()
+	t.Cleanup(runner.Release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	a, session := newMCPTestSession(t, ctx, cfg, runner)
+
+	first := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":      "spider",
+		"start_url": "https://example.com/",
+	})
+	firstID, _ := first["job_id"].(string)
+	if firstID == "" {
+		t.Fatal("first start_crawl did not return a job ID")
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first crawl runner did not start")
+	}
+
+	second := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":      "spider",
+		"start_url": "https://example.com/other",
+	})
+	secondID, _ := second["job_id"].(string)
+	if secondID == "" {
+		t.Fatal("second start_crawl did not return a job ID")
+	}
+	if status, _ := a.jobs.get(secondID).statusPhase(); status != jobStatusQueued {
+		t.Fatalf("second job status = %q, want %q", status, jobStatusQueued)
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := a.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	for _, jobID := range []string{firstID, secondID} {
+		assertInterruptedJob(t, a.jobs, cfg.ResultsDir, jobID)
+	}
+
+	// A start request that races or arrives after shutdown must receive the
+	// stable retryable shutdown error, not create a new job.
+	_, _, err := a.mcp.startCrawl(context.Background(), nil, startCrawlInput{
+		Mode:     "spider",
+		StartURL: "https://example.com/rejected",
+	})
+	var toolErr *toolError
+	if !errors.As(err, &toolErr) {
+		t.Fatalf("start during shutdown error = %v, want a tool error", err)
+	}
+	if toolErr.Code != codeInternalError || !toolErr.Retryable {
+		t.Fatalf("start during shutdown error = %s (retryable=%t), want %s retryable",
+			toolErr.Code, toolErr.Retryable, codeInternalError)
+	}
+
+	// Shutdown is idempotent.
+	if err := a.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+
+	assertNoShutdownTempFiles(t, cfg.ResultsDir)
+
+	// Restart recovery must keep the already-terminal interrupted state.
+	restarted := newJobManager(jobManagerConfig{Store: a.jobs.store, DisableReaper: true})
+	for _, jobID := range []string{firstID, secondID} {
+		job := restarted.get(jobID)
+		if job == nil {
+			t.Fatalf("job %s disappeared on restart", jobID)
+		}
+		status, phase := job.statusPhase()
+		job.mu.Lock()
+		code := job.errCode
+		job.mu.Unlock()
+		if status != jobStatusError || phase != jobPhaseError || code != "interrupted" {
+			t.Fatalf("restarted job %s = %s/%s/%s, want error/error/interrupted", jobID, status, phase, code)
+		}
+	}
+}
+
+// probeRealRunner delegates to the production crawl path so the shutdown test
+// exercises the real archive writer and its deferred Close.
+type probeRealRunner struct {
+	started chan struct{}
+}
+
+func (r *probeRealRunner) signalStarted() {
+	select {
+	case r.started <- struct{}{}:
+	default:
+	}
+}
+
+func (r *probeRealRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error) {
+	r.signalStarted()
+	return runSpiderContext(ctx, settings, onProgress, onPhase)
+}
+
+func (r *probeRealRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error) {
+	r.signalStarted()
+	return runListContext(ctx, urls, settings, onProgress, onPhase)
+}
+
+// TestGracefulShutdownClosesArchiveWriter proves shutdown reaches the real
+// crawl archive path and leaves a committed manifest with no .tmp files.
+func TestGracefulShutdownClosesArchiveWriter(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, `<html><body><a href="/next">next</a></body></html>`)
+	}))
+	defer site.Close()
+
+	cfg := defaultMCPConfig()
+	cfg.Enabled = true
+	cfg.PersistJobs = true
+	cfg.ResultsDir = t.TempDir()
+
+	runner := &probeRealRunner{started: make(chan struct{}, 1)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	a, session := newMCPTestSession(t, ctx, cfg, runner)
+
+	out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":         "spider",
+		"start_url":    site.URL,
+		"archive_html": true,
+	})
+	jobID, _ := out["job_id"].(string)
+	if jobID == "" {
+		t.Fatal("start_crawl did not return a job ID")
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("archive crawl runner did not start")
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := a.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	jobDir := filepath.Join(cfg.ResultsDir, "jobs", jobID)
+	manifest := filepath.Join(jobDir, "archive", "manifest.json")
+	if _, err := os.Stat(manifest); err != nil {
+		t.Fatalf("shutdown did not commit the archive manifest: %v", err)
+	}
+	assertNoShutdownTempFiles(t, jobDir)
+}
+
+// exitProbeRunner blocks inside Spider until its context is canceled and
+// records the exit so the shutdown test can prove there is no stranded
+// runner goroutine.
+type exitProbeRunner struct {
+	started chan struct{}
+	exited  chan struct{}
+}
+
+func (r *exitProbeRunner) signal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (r *exitProbeRunner) Spider(ctx context.Context, _ WizardSettings, _ progressFunc, _ phaseFunc) (crawlOutcome, error) {
+	r.signal(r.started)
+	<-ctx.Done()
+	r.signal(r.exited)
+	return crawlOutcome{}, ctx.Err()
+}
+
+func (r *exitProbeRunner) List(ctx context.Context, _ []string, _ WizardSettings, _ progressFunc, _ phaseFunc) (crawlOutcome, error) {
+	return r.Spider(ctx, WizardSettings{}, nil, nil)
+}
+
+// TestGracefulShutdownWaitsForRunnerExit verifies Shutdown returns only after
+// the canceled runner has actually stopped.
+func TestGracefulShutdownWaitsForRunnerExit(t *testing.T) {
+	cfg := defaultMCPConfig()
+	cfg.Enabled = true
+
+	runner := &exitProbeRunner{started: make(chan struct{}, 1), exited: make(chan struct{}, 1)}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	a, session := newMCPTestSession(t, ctx, cfg, runner)
+
+	callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":      "spider",
+		"start_url": "https://example.com/",
+	})
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not start")
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := a.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case <-runner.exited:
+	case <-time.After(time.Second):
+		t.Fatal("runner goroutine was still running after Shutdown returned")
+	}
+}
+
+// TestGracefulShutdownConcurrentCalls verifies the single-flight guard is safe
+// when several callers observe the signal at once.
+func TestGracefulShutdownConcurrentCalls(t *testing.T) {
+	a, err := newApp(appConfig{MCP: defaultMCPConfig(), Runner: newImmediateFakeRunner(nil, nil)})
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close(context.Background()) })
+
+	const callers = 4
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			errs <- a.Shutdown(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Shutdown: %v", err)
+		}
+	}
+}
+
 // TestStructuredLoggingLimits covers the limit/rate event log shape.
 func TestStructuredLoggingLimits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

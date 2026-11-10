@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math"
@@ -404,6 +405,13 @@ func (q *mcpQuota) notifyLocked() {
 // Wait blocks until a queued reservation is admitted. It returns false when the
 // reservation was released before admission.
 func (r *quotaReservation) Wait() bool {
+	return r.WaitContext(context.Background())
+}
+
+// WaitContext blocks until a queued reservation is admitted or ctx is done. It
+// returns false when the reservation was released or the caller is shutting
+// down before admission.
+func (r *quotaReservation) WaitContext(ctx context.Context) bool {
 	q := r.q
 	for {
 		q.mu.Lock()
@@ -415,6 +423,10 @@ func (r *quotaReservation) Wait() bool {
 			q.mu.Unlock()
 			return true
 		}
+		if err := ctx.Err(); err != nil {
+			q.mu.Unlock()
+			return false
+		}
 		if q.canAdmitLocked(r.key) {
 			q.queued--
 			q.admitLocked(r.key)
@@ -424,7 +436,11 @@ func (r *quotaReservation) Wait() bool {
 		}
 		changed := q.changed
 		q.mu.Unlock()
-		<-changed
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 

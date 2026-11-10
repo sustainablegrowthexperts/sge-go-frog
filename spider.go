@@ -95,6 +95,9 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 	// Colly does not run OnResponse/OnScraped when it treats 3xx as an HTTP error, so enqueue
 	// redirect targets from OnError (see scrape.go) instead of OnResponse.
 	c.OnError(func(r *colly.Response, _ error) {
+		if ctx.Err() != nil {
+			return
+		}
 		if r == nil || r.Request == nil || r.Headers == nil {
 			return
 		}
@@ -119,7 +122,7 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 		if !hostMatchesSite(u.Hostname(), host) {
 			return
 		}
-		if err := policy.validateURL(context.Background(), abs); err != nil {
+		if err := policy.validateURL(ctx, abs); err != nil {
 			logBlockedSSRFTarget(nil, err)
 			return
 		}
@@ -133,6 +136,9 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 	})
 
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
+		if ctx.Err() != nil {
+			return
+		}
 		href := strings.TrimSpace(e.Attr("href"))
 		if href == "" || strings.HasPrefix(href, "#") {
 			return
@@ -172,7 +178,7 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 		}
 	}
 	emitPhase(onPhase, jobPhaseCrawling)
-	if !budget.stopForWork() {
+	if ctx.Err() == nil && !budget.stopForWork() {
 		if err := c.Visit(start); err != nil {
 			return crawlOutcome{}, err
 		}
@@ -193,7 +199,7 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 			}
 		}
 		for _, sitemapURL := range sitemapPages {
-			if budget.stopForWork() {
+			if ctx.Err() != nil || budget.stopForWork() {
 				break
 			}
 			if canonical, ok := auditpkg.CanonicalURL(sitemapURL, nil); ok {
@@ -204,7 +210,7 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 			if visited, _ := c.HasVisited(sitemapURL); visited {
 				continue
 			}
-			if err := policy.validateURL(context.Background(), sitemapURL); err != nil {
+			if err := policy.validateURL(ctx, sitemapURL); err != nil {
 				logBlockedSSRFTarget(nil, err)
 				continue
 			}

@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	auditpkg "go-frog/internal/audit"
@@ -21,6 +24,7 @@ const (
 	defaultUIJobTTL           = 30 * time.Minute
 	defaultJobReapInterval    = 5 * time.Minute
 	defaultMaxRetainedMCPJobs = 100
+	defaultShutdownTimeout    = 30 * time.Second
 )
 
 // MCPConfig is the configuration surface for the embedded MCP server. It is
@@ -296,7 +300,12 @@ type WizardSettings struct {
 }
 
 func main() {
-	if err := runServer(os.Args[1:]); err != nil {
+	// SIGINT and SIGTERM share one cancelable context. The server drains its
+	// work against that context instead of exiting abruptly.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := runServer(ctx, os.Args[1:]); err != nil {
 		printErr("go-frog: %v\n", err)
 		os.Exit(1)
 	}
@@ -305,7 +314,7 @@ func main() {
 // runServer parses the command line, applying environment-backed defaults, and
 // starts either the CLI wizard or the HTTP server. Errors are returned so a
 // failed listener or MCP mount is visible to the caller.
-func runServer(args []string) error {
+func runServer(ctx context.Context, args []string) error {
 	// Preserve the existing --cli path: it must not depend on MCP
 	// configuration being valid.
 	for _, arg := range args {
@@ -327,7 +336,7 @@ func runServer(args []string) error {
 		return err
 	}
 
-	return serve(*addr, cfg)
+	return serveContext(ctx, *addr, cfg)
 }
 
 func runCLI() {

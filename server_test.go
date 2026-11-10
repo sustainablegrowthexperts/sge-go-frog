@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -874,6 +875,66 @@ func TestParseAuditFilters(t *testing.T) {
 			t.Fatalf("parseAuditFilters = %+v, want nil", got)
 		}
 	})
+}
+
+// TestGracefulShutdownClosesListener proves the signal-driven HTTP shutdown is
+// bounded, closes the listener, and is safe to repeat.
+func TestGracefulShutdownClosesListener(t *testing.T) {
+	runner := newImmediateFakeRunner(nil, nil)
+	a, err := newApp(appConfig{
+		MCP:             defaultMCPConfig(),
+		Runner:          runner,
+		ShutdownTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	defer a.Close(context.Background())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: a.Handler()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	served := make(chan error, 1)
+	go func() { served <- serveHTTP(ctx, srv, ln, a) }()
+
+	baseURL := "http://" + ln.Addr().String()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		resp, err := http.Get(baseURL + "/")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("HTTP server never became ready: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("serveHTTP: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serveHTTP did not return after shutdown")
+	}
+
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		t.Fatal("listener still accepts connections after shutdown")
+	}
+
+	if err := a.Shutdown(context.Background()); err != nil {
+		t.Fatalf("repeat Shutdown: %v", err)
+	}
 }
 
 // TestStructuredLogging covers the job lifecycle records and the secret

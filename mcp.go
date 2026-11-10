@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -34,6 +36,13 @@ type mcpServer struct {
 	quota  *mcpQuota
 	ssrf   *ssrfPolicy
 	logger *slog.Logger
+
+	// app is set when the adapter is mounted on a shared application; it owns
+	// the shutdown context injected into launched crawls.
+	app *app
+
+	shuttingDown atomic.Bool
+	closeOnce    sync.Once
 }
 
 // newStructuredLogger builds the process logger. Text is the default format;
@@ -270,9 +279,25 @@ func (s *mcpServer) Handler() http.Handler {
 	return s.handler
 }
 
-// Close releases MCP sessions. The SDK manages per-request Streamable HTTP
-// sessions, so there is no server-wide close in the pinned SDK version; this
-// hook exists so startup/shutdown code has a single lifecycle entry point.
+// beginShutdown makes every new start_crawl request fail with the stable
+// retryable shutdown error. It is safe to call more than once.
+func (s *mcpServer) beginShutdown() {
+	if s == nil {
+		return
+	}
+	s.shuttingDown.Store(true)
+}
+
+// Close releases MCP sessions. Closing is idempotent so the shutdown path and
+// the deferred cleanup can both call it.
 func (s *mcpServer) Close(_ context.Context) error {
+	if s == nil || s.server == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		for session := range s.server.Sessions() {
+			_ = session.Close()
+		}
+	})
 	return nil
 }
