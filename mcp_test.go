@@ -3558,3 +3558,532 @@ func TestGetAuditSections(t *testing.T) {
 		assertNumber(t, "refreshed summary.pages", nestedObject(t, second, "summary")["pages"], 9)
 	})
 }
+
+// searchMatchList reads the search_pages "matches" array from structured content.
+func searchMatchList(t *testing.T, out map[string]any) []map[string]any {
+	t.Helper()
+	return auditObjectList(t, out, "matches")
+}
+
+// searchSnippets reads one match group's snippets array.
+func searchSnippets(t *testing.T, match map[string]any) []map[string]any {
+	t.Helper()
+	return auditObjectList(t, match, "snippets")
+}
+
+// findSearchMatch returns the match group for an exact URL and field.
+func findSearchMatch(t *testing.T, matches []map[string]any, url, field string) map[string]any {
+	t.Helper()
+	for _, match := range matches {
+		if match["url"] == url && match["field"] == field {
+			return match
+		}
+	}
+	t.Fatalf("no match for %s field %s in %v", url, field, matches)
+	return nil
+}
+
+// searchArchiveFixture is one manifest entry plus its body for archive tests.
+type searchArchiveFixture struct {
+	URL      string
+	BodyFile string
+	Body     string
+}
+
+// writeSearchPagesArchive writes a manifest plus saved HTML bodies for search
+// tests. BodyFile may point outside html/ so path-traversal guards can be
+// exercised too.
+func writeSearchPagesArchive(t *testing.T, dir string, entries []searchArchiveFixture) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "html"), 0o755); err != nil {
+		t.Fatalf("create archive html dir: %v", err)
+	}
+	manifest := auditpkg.Manifest{
+		ArchiveMeta: auditpkg.ArchiveMeta{
+			Version:   auditpkg.ArchiveVersion,
+			StartURL:  "https://example.com/",
+			Host:      "example.com",
+			Mode:      "spider",
+			StartedAt: time.Now().UTC(),
+		},
+	}
+	for i, entry := range entries {
+		bodyFile := entry.BodyFile
+		if bodyFile == "" {
+			bodyFile = filepath.Join("html", fmt.Sprintf("page-%d.html", i))
+		}
+		full := filepath.Join(dir, bodyFile)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("create body dir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(entry.Body), 0o644); err != nil {
+			t.Fatalf("write body %q: %v", bodyFile, err)
+		}
+		manifest.Entries = append(manifest.Entries, auditpkg.ManifestEntry{
+			URL:           entry.URL,
+			StatusCode:    200,
+			ContentType:   "text/html",
+			BodyFile:      bodyFile,
+			BodyBytes:     int64(len(entry.Body)),
+			DiscoveredVia: "link",
+			FetchedAt:     time.Now().UTC(),
+		})
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal search manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0o644); err != nil {
+		t.Fatalf("write search manifest: %v", err)
+	}
+}
+
+// TestSearchPages covers the search contract:
+//   - metadata scope searches URL, title, description, H1s, robots, and
+//     serialized inlinks from page rows without an archive;
+//   - literal search is case-insensitive by default and case-sensitive on
+//     request, with pagination and snippets that respect context_chars;
+//   - RE2 regex search works and invalid patterns are rejected;
+//   - per-page match caps, scope validation, bounds, and unfinished jobs follow
+//     the tool error contract.
+func TestSearchPages(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+	pages := []Page{
+		{
+			URL:         "https://example.com/blog/pricing",
+			StatusCode:  200,
+			Title:       "Pricing Post",
+			Description: "A post about Pricing and plans",
+			H1s:         []string{"Pricing overview"},
+			Inlinks:     `https://example.com/>"Pricing"`,
+			Robots:      "index, follow",
+		},
+		{
+			URL:         "https://example.com/about",
+			StatusCode:  200,
+			Title:       "About",
+			Description: "About us",
+			H1s:         []string{"About us"},
+			Robots:      "index, follow",
+		},
+	}
+	job := createDoneResultsJob(t, app, "", pages)
+
+	t.Run("metadata search works without an archive", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "PRICING",
+		})
+
+		if out["job_id"] != job.id {
+			t.Fatalf("job_id = %v, want %q", out["job_id"], job.id)
+		}
+		if out["pattern"] != "PRICING" {
+			t.Fatalf("pattern = %v, want the requested pattern", out["pattern"])
+		}
+		if out["regex"] != false {
+			t.Fatalf("regex = %v, want false", out["regex"])
+		}
+		assertStringSlice(t, "scope", out["scope"], []string{"metadata"})
+		assertNumber(t, "total_matches", out["total_matches"], 5)
+		assertNumber(t, "offset", out["offset"], 0)
+		assertNumber(t, "limit", out["limit"], 50)
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false", out["has_more"])
+		}
+		if out["truncated"] != false {
+			t.Fatalf("truncated = %v, want false", out["truncated"])
+		}
+
+		matches := searchMatchList(t, out)
+		if len(matches) != 5 {
+			t.Fatalf("matches = %d, want 5 groups", len(matches))
+		}
+		url := "https://example.com/blog/pricing"
+		wantFields := []string{"description", "h1", "inlinks", "title", "url"}
+		for i, field := range wantFields {
+			if matches[i]["field"] != field {
+				t.Fatalf("matches[%d].field = %v, want %q (order must be URL then field)", i, matches[i]["field"], field)
+			}
+			if matches[i]["url"] != url {
+				t.Fatalf("matches[%d].url = %v, want %q", i, matches[i]["url"], url)
+			}
+		}
+
+		title := findSearchMatch(t, matches, url, "title")
+		assertNumber(t, "title count", title["count"], 1)
+		snippets := searchSnippets(t, title)
+		if len(snippets) != 1 {
+			t.Fatalf("title snippets = %d, want 1", len(snippets))
+		}
+		if snippets[0]["before"] != "" || snippets[0]["match"] != "Pricing" || snippets[0]["after"] != " Post" {
+			t.Fatalf("title snippet = %v, want before=\"\" match=Pricing after=\" Post\"", snippets[0])
+		}
+
+		description := findSearchMatch(t, matches, url, "description")
+		snippets = searchSnippets(t, description)
+		if snippets[0]["before"] != "A post about " || snippets[0]["match"] != "Pricing" || snippets[0]["after"] != " and plans" {
+			t.Fatalf("description snippet = %v", snippets[0])
+		}
+
+		if text := strings.ToLower(toolResultText(callTool(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "PRICING",
+		}))); !strings.Contains(text, "5") || !strings.Contains(text, "match") {
+			t.Fatalf("summary = %q, want the match count", text)
+		}
+	})
+
+	t.Run("literal search case sensitivity differs", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":         job.id,
+			"pattern":        "Pricing",
+			"case_sensitive": true,
+		})
+		assertNumber(t, "total_matches", out["total_matches"], 4)
+		for _, match := range searchMatchList(t, out) {
+			if match["field"] == "url" {
+				t.Fatalf("case-sensitive search matched the lowercase URL: %v", match)
+			}
+		}
+
+		out = callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":         job.id,
+			"pattern":        "pricing",
+			"case_sensitive": true,
+		})
+		assertNumber(t, "total_matches", out["total_matches"], 1)
+		matches := searchMatchList(t, out)
+		if matches[0]["field"] != "url" {
+			t.Fatalf("field = %v, want url for the lowercase query", matches[0]["field"])
+		}
+	})
+
+	t.Run("snippets respect context_chars", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":         job.id,
+			"pattern":        "Pricing",
+			"case_sensitive": true,
+			"context_chars":  3,
+		})
+		matches := searchMatchList(t, out)
+		title := findSearchMatch(t, matches, "https://example.com/blog/pricing", "title")
+		snippets := searchSnippets(t, title)
+		if snippets[0]["before"] != "" || snippets[0]["match"] != "Pricing" || snippets[0]["after"] != " Po" {
+			t.Fatalf("snippet = %v, want three context characters after the match", snippets[0])
+		}
+	})
+
+	t.Run("unicode literals and snippets stay on rune boundaries", func(t *testing.T) {
+		unicodeJob := createDoneResultsJob(t, app, "", []Page{{
+			URL:        "https://example.com/unicode",
+			StatusCode: 200,
+			Title:      "Café 日本語 pricing 終わり",
+		}})
+
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":         unicodeJob.id,
+			"pattern":        "日本語",
+			"case_sensitive": true,
+			"context_chars":  2,
+		})
+		matches := searchMatchList(t, out)
+		if len(matches) != 1 {
+			t.Fatalf("matches = %d, want 1", len(matches))
+		}
+		snippets := searchSnippets(t, matches[0])
+		if snippets[0]["before"] != "é " || snippets[0]["match"] != "日本語" || snippets[0]["after"] != " p" {
+			t.Fatalf("unicode snippet = %v, want context cut on rune boundaries", snippets[0])
+		}
+
+		out = callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  unicodeJob.id,
+			"pattern": "CAFÉ",
+		})
+		matches = searchMatchList(t, out)
+		if len(matches) != 1 {
+			t.Fatalf("case-insensitive unicode matches = %d, want 1", len(matches))
+		}
+		snippets = searchSnippets(t, matches[0])
+		if snippets[0]["match"] != "Café" {
+			t.Fatalf("unicode case-insensitive match = %v, want Café", snippets[0]["match"])
+		}
+	})
+
+	t.Run("paginates by match group", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "pricing",
+			"offset":  1,
+			"limit":   2,
+		})
+		matches := searchMatchList(t, out)
+		if len(matches) != 2 {
+			t.Fatalf("matches = %d, want 2", len(matches))
+		}
+		if matches[0]["field"] != "h1" || matches[1]["field"] != "inlinks" {
+			t.Fatalf("paged fields = %v, %v, want h1 then inlinks", matches[0]["field"], matches[1]["field"])
+		}
+		assertNumber(t, "total_matches", out["total_matches"], 5)
+		assertNumber(t, "offset", out["offset"], 1)
+		assertNumber(t, "limit", out["limit"], 2)
+		if out["has_more"] != true {
+			t.Fatalf("has_more = %v, want true", out["has_more"])
+		}
+
+		out = callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "pricing",
+			"limit":   999,
+		})
+		assertNumber(t, "clamped limit", out["limit"], 200)
+	})
+
+	t.Run("caps matches per page and sets truncated", func(t *testing.T) {
+		capped := createDoneResultsJob(t, app, "", []Page{{
+			URL:        "https://example.com/repeats",
+			StatusCode: 200,
+			Title:      "pricing pricing pricing",
+		}})
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":               capped.id,
+			"pattern":              "pricing",
+			"max_matches_per_page": 2,
+		})
+		matches := searchMatchList(t, out)
+		if len(matches) != 1 {
+			t.Fatalf("matches = %d, want 1 group", len(matches))
+		}
+		assertNumber(t, "count", matches[0]["count"], 2)
+		if got := len(searchSnippets(t, matches[0])); got != 2 {
+			t.Fatalf("snippets = %d, want the per-page cap of 2", got)
+		}
+		if out["truncated"] != true {
+			t.Fatalf("truncated = %v, want true after the per-page cap", out["truncated"])
+		}
+	})
+
+	t.Run("regex search works and invalid regex fails", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":         job.id,
+			"pattern":        `Pric[a-z]+ Post`,
+			"regex":          true,
+			"case_sensitive": true,
+		})
+		if out["regex"] != true {
+			t.Fatalf("regex = %v, want true", out["regex"])
+		}
+		matches := searchMatchList(t, out)
+		if len(matches) != 1 {
+			t.Fatalf("matches = %d, want 1", len(matches))
+		}
+		snippets := searchSnippets(t, matches[0])
+		if snippets[0]["match"] != "Pricing Post" {
+			t.Fatalf("regex match = %v, want Pricing Post", snippets[0]["match"])
+		}
+
+		res := callTool(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "(",
+			"regex":   true,
+		})
+		if !res.IsError {
+			t.Fatal("search_pages accepted an invalid regex")
+		}
+		if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "invalid_argument") {
+			t.Fatalf("error = %q, want invalid_argument", text)
+		}
+	})
+
+	t.Run("rejects invalid arguments", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			args    map[string]any
+			wantSub string
+		}{
+			{"missing job id", map[string]any{"pattern": "pricing"}, "job_id"},
+			{"unknown job", map[string]any{"job_id": "missing", "pattern": "pricing"}, "job_not_found"},
+			{"missing pattern", map[string]any{"job_id": job.id}, "pattern"},
+			{"pattern too long", map[string]any{"job_id": job.id, "pattern": strings.Repeat("a", 513)}, "pattern"},
+			{"invalid scope", map[string]any{"job_id": job.id, "pattern": "pricing", "scope": []string{"body"}}, "scope"},
+			{"negative offset", map[string]any{"job_id": job.id, "pattern": "pricing", "offset": -1}, "offset"},
+			{"negative limit", map[string]any{"job_id": job.id, "pattern": "pricing", "limit": -1}, "limit"},
+			{"negative context", map[string]any{"job_id": job.id, "pattern": "pricing", "context_chars": -1}, "context_chars"},
+			{"context too large", map[string]any{"job_id": job.id, "pattern": "pricing", "context_chars": 501}, "context_chars"},
+			{"negative page cap", map[string]any{"job_id": job.id, "pattern": "pricing", "max_matches_per_page": -1}, "max_matches_per_page"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "search_pages", tc.args)
+				if !res.IsError {
+					t.Fatalf("search_pages accepted invalid input: %v", res.StructuredContent)
+				}
+				if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, tc.wantSub) {
+					t.Fatalf("error = %q, want %q", text, tc.wantSub)
+				}
+			})
+		}
+	})
+
+	t.Run("requires a completed job", func(t *testing.T) {
+		running := app.jobs.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{
+			Mode:     1,
+			StartURL: "https://example.com",
+		})
+		running.mu.Lock()
+		running.status = jobStatusRunning
+		running.phase = jobPhaseCrawling
+		running.result = []Page{{URL: "https://example.com/partial", Title: "pricing"}}
+		running.mu.Unlock()
+
+		res := callTool(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  running.id,
+			"pattern": "pricing",
+		})
+		if !res.IsError {
+			t.Fatal("search_pages accepted a running job")
+		}
+		if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "job_not_finished") {
+			t.Fatalf("error = %q, want job_not_finished", text)
+		}
+	})
+}
+
+// TestSearchPagesArchive covers archive-backed search:
+//   - scope=html searches raw HTML and scope=text searches visible text with
+//     script/style content removed;
+//   - scope=all combines metadata and both archive scopes;
+//   - html, text, and all without an archive return search_not_available with a
+//     hint to enable audit or archive_html;
+//   - a manifest body path that escapes the archive is never read.
+func TestSearchPagesArchive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+	const guideURL = "https://example.com/guide"
+	dir := t.TempDir()
+	writeSearchPagesArchive(t, dir, []searchArchiveFixture{
+		{
+			URL: guideURL,
+			Body: `<!doctype html><html><head><title>Guide</title></head><body>
+<h1>Affiliate Disclosure</h1>
+<p>The affiliate disclosure is at the top.</p>
+<script>var phrase = "affiliate disclosure";</script>
+</body></html>`,
+		},
+		{
+			URL:  "https://example.com/other",
+			Body: `<html><body><p>Unrelated page.</p></body></html>`,
+		},
+		{
+			URL:      "https://example.com/escape",
+			BodyFile: "../secret.html",
+			Body:     `TOP-SECRET affiliate disclosure`,
+		},
+	})
+
+	job := createDoneResultsJob(t, app, "", []Page{
+		{URL: guideURL, StatusCode: 200, Title: "Guide", H1s: []string{"Affiliate Disclosure"}},
+		{URL: "https://example.com/other", StatusCode: 200, Title: "Other"},
+	})
+	job.mu.Lock()
+	job.settings.AuditArchiveDir = dir
+	job.mu.Unlock()
+
+	t.Run("html scope searches raw html", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "affiliate disclosure",
+			"scope":   []string{"html"},
+		})
+		assertStringSlice(t, "scope", out["scope"], []string{"html"})
+		matches := searchMatchList(t, out)
+		if len(matches) != 1 {
+			t.Fatalf("matches = %d, want one html group", len(matches))
+		}
+		if matches[0]["url"] != guideURL || matches[0]["field"] != "html" {
+			t.Fatalf("match = %v, want %s field html", matches[0], guideURL)
+		}
+		assertNumber(t, "html count", matches[0]["count"], 3)
+		if got := len(searchSnippets(t, matches[0])); got != 3 {
+			t.Fatalf("snippets = %d, want 3 raw HTML occurrences", got)
+		}
+		for _, match := range matches {
+			if match["url"] == "https://example.com/escape" {
+				t.Fatal("search read a body path outside the archive")
+			}
+		}
+	})
+
+	t.Run("text scope searches visible text only", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "AFFILIATE DISCLOSURE",
+			"scope":   []string{"text"},
+		})
+		matches := searchMatchList(t, out)
+		if len(matches) != 1 {
+			t.Fatalf("matches = %d, want one text group", len(matches))
+		}
+		if matches[0]["field"] != "text" {
+			t.Fatalf("field = %v, want text", matches[0]["field"])
+		}
+		assertNumber(t, "text count", matches[0]["count"], 2)
+		for _, match := range matches {
+			if match["url"] == "https://example.com/escape" {
+				t.Fatal("text search read a body path outside the archive")
+			}
+		}
+	})
+
+	t.Run("all combines metadata and archive scopes", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "search_pages", map[string]any{
+			"job_id":  job.id,
+			"pattern": "affiliate disclosure",
+			"scope":   []string{"all"},
+		})
+		assertStringSlice(t, "scope", out["scope"], []string{"all"})
+		matches := searchMatchList(t, out)
+		fields := make([]string, 0, len(matches))
+		for _, match := range matches {
+			fields = append(fields, match["field"].(string))
+		}
+		want := []string{"h1", "html", "text"}
+		if !slices.Equal(fields, want) {
+			t.Fatalf("fields = %v, want %v (URL then field ordering)", fields, want)
+		}
+		assertNumber(t, "total_matches", out["total_matches"], 3)
+	})
+
+	t.Run("archive scopes without an archive return search_not_available", func(t *testing.T) {
+		plain := createDoneResultsJob(t, app, "", []Page{{
+			URL:        "https://example.com/plain",
+			StatusCode: 200,
+			Title:      "Plain",
+		}})
+		for _, scope := range []string{"html", "text", "all"} {
+			t.Run(scope, func(t *testing.T) {
+				res := callTool(t, ctx, session, "search_pages", map[string]any{
+					"job_id":  plain.id,
+					"pattern": "plain",
+					"scope":   []string{scope},
+				})
+				if !res.IsError {
+					t.Fatalf("search_pages accepted scope %q without an archive", scope)
+				}
+				text := strings.ToLower(toolResultText(res))
+				for _, want := range []string{"search_not_available", "archive_html"} {
+					if !strings.Contains(text, want) {
+						t.Fatalf("error = %q, want %q", text, want)
+					}
+				}
+			})
+		}
+	})
+}

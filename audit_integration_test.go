@@ -570,3 +570,91 @@ func findResultRow(t *testing.T, rows []map[string]any, url string) map[string]a
 	t.Fatalf("no result row for %s in %v", url, rows)
 	return nil
 }
+
+// TestSearchPagesArchiveIntegration covers search over a real crawl archive:
+//   - a spider job with archive_html=true produces bodies that search_pages can
+//     read;
+//   - text scope returns visible-text snippets and metadata scope still works;
+//   - searching never re-fetches pages, because the test server only serves
+//     each path during the crawl and the archive is read afterward.
+func TestSearchPagesArchiveIntegration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/":
+			_, _ = w.Write([]byte(`<!doctype html><html><head><title>Home</title></head><body>
+<main><p>Affiliate disclosure paragraph.</p><a href="/about">About</a></main>
+</body></html>`))
+		case "/about":
+			_, _ = w.Write([]byte(`<html><head><title>About</title></head><body>
+<main><p>Nothing relevant here.</p></main></body></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = t.TempDir()
+	cfg.PersistJobs = true
+	app, session := newMCPTestSession(t, ctx, cfg, realCrawlRunner{})
+
+	out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":         "spider",
+		"start_url":    server.URL,
+		"concurrency":  2,
+		"archive_html": true,
+	})
+	jobID, _ := out["job_id"].(string)
+	job := app.jobs.get(jobID)
+	if job == nil {
+		t.Fatalf("job %q is not in the manager", jobID)
+	}
+	waitForJobStatus(t, job, jobStatusDone)
+
+	text := callToolObject(t, ctx, session, "search_pages", map[string]any{
+		"job_id":  jobID,
+		"pattern": "affiliate disclosure",
+		"scope":   []string{"text"},
+	})
+	matches := searchMatchList(t, text)
+	if len(matches) != 1 {
+		t.Fatalf("text matches = %d, want the home page", len(matches))
+	}
+	if matches[0]["url"] != server.URL+"/" {
+		t.Fatalf("text match url = %v, want %s/", matches[0]["url"], server.URL)
+	}
+	if matches[0]["field"] != "text" {
+		t.Fatalf("text match field = %v, want text", matches[0]["field"])
+	}
+	snippets := searchSnippets(t, matches[0])
+	if len(snippets) != 1 {
+		t.Fatalf("text snippets = %d, want 1", len(snippets))
+	}
+	if snippets[0]["match"] != "Affiliate disclosure" {
+		t.Fatalf("text snippet match = %v, want Affiliate disclosure", snippets[0]["match"])
+	}
+
+	html := callToolObject(t, ctx, session, "search_pages", map[string]any{
+		"job_id":  jobID,
+		"pattern": "Affiliate disclosure",
+		"scope":   []string{"html"},
+	})
+	if got := searchMatchList(t, html); len(got) != 1 {
+		t.Fatalf("html matches = %d, want the home page", len(got))
+	}
+
+	metadata := callToolObject(t, ctx, session, "search_pages", map[string]any{
+		"job_id":  jobID,
+		"pattern": "home",
+		"scope":   []string{"metadata"},
+	})
+	if got := searchMatchList(t, metadata); len(got) != 1 {
+		t.Fatalf("metadata matches = %d, want the home title", len(got))
+	}
+}

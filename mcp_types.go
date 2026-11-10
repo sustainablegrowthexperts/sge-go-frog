@@ -498,6 +498,70 @@ type getAuditOutput struct {
 	Sections   *[]getAuditSectionStatus `json:"sections,omitempty"`
 }
 
+// search_pages defaults, bounds, and accepted scope values.
+const (
+	defaultSearchLimit          = 50
+	maxSearchLimit              = 200
+	defaultSearchContextChars   = 120
+	maxSearchContextChars       = 500
+	maxSearchPatternLength      = 512
+	defaultSearchMatchesPerPage = 100
+	maxSearchMatchesPerPage     = 100
+	searchWorkerCount           = 8
+	maxSearchBodyBytes          = 5 << 20
+	searchPagesResponseOverhead = 512
+)
+
+var searchScopes = []string{"metadata", "html", "text", "all"}
+
+// searchPagesInput is the typed input for the search_pages tool. Scope is a
+// list so one call can combine metadata and archive-backed scopes.
+type searchPagesInput struct {
+	JobID             string   `json:"job_id,omitempty" jsonschema:"job ID returned by start_crawl"`
+	Pattern           string   `json:"pattern,omitempty" jsonschema:"literal text or RE2 regular expression to search for"`
+	Regex             bool     `json:"regex,omitempty" jsonschema:"treat pattern as a Go RE2 regular expression"`
+	CaseSensitive     bool     `json:"case_sensitive,omitempty" jsonschema:"match case exactly; literal search is case-insensitive by default"`
+	Scope             []string `json:"scope,omitempty" jsonschema:"search scopes: metadata, html, text, or all; defaults to metadata"`
+	ContextChars      int      `json:"context_chars,omitempty" jsonschema:"characters of context before and after each match; defaults to 120 and is capped at 500"`
+	Offset            int      `json:"offset,omitempty" jsonschema:"number of match groups to skip; defaults to 0"`
+	Limit             int      `json:"limit,omitempty" jsonschema:"maximum match groups to return; defaults to 50 and is capped at 200"`
+	MaxMatchesPerPage int      `json:"max_matches_per_page,omitempty" jsonschema:"maximum occurrences collected per page; defaults to 100 and is capped at 100"`
+}
+
+// searchSnippet is the context around one occurrence. Match is the exact text
+// that matched; before and after hold up to context_chars on each side.
+type searchSnippet struct {
+	Before string `json:"before"`
+	Match  string `json:"match"`
+	After  string `json:"after"`
+}
+
+// searchMatch is one page/field match group. Count is the number of
+// non-overlapping occurrences collected for that field; Snippets holds one
+// snippet per collected occurrence.
+type searchMatch struct {
+	URL      string          `json:"url"`
+	Field    string          `json:"field"`
+	Count    int             `json:"count"`
+	Snippets []searchSnippet `json:"snippets"`
+}
+
+// searchPagesOutput is the typed output for search_pages. TotalMatches counts
+// match groups after truncation and before pagination, so pagination is by
+// page/field group rather than by page row.
+type searchPagesOutput struct {
+	JobID        string        `json:"job_id"`
+	Pattern      string        `json:"pattern"`
+	Regex        bool          `json:"regex"`
+	Scope        []string      `json:"scope"`
+	TotalMatches int           `json:"total_matches"`
+	Offset       int           `json:"offset"`
+	Limit        int           `json:"limit"`
+	HasMore      bool          `json:"has_more"`
+	Truncated    bool          `json:"truncated"`
+	Matches      []searchMatch `json:"matches"`
+}
+
 // getJobOutput is the typed output for get_job. It deliberately excludes
 // page rows, audit reports, search matches, and artifact payloads.
 type getJobOutput struct {

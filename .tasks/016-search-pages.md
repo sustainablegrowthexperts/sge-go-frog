@@ -1,7 +1,7 @@
 ---
 id: task-016
 title: "[Slice] Agent searches crawl metadata, HTML, and visible text"
-status: pending
+status: completed
 depends_on: ["task-015"]
 target_files:
   - "mcp_search.go"

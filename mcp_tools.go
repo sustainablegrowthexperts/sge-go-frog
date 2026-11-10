@@ -56,6 +56,16 @@ func (s *mcpServer) registerTools() {
 	}, s.getResults)
 
 	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "search_pages",
+		Description: "Search crawled page metadata without an archive, or archived raw HTML and visible text when the job used audit=true or archive_html=true. Supports literal and RE2 regex patterns, case sensitivity, snippets, pagination, and server caps.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+			OpenWorldHint:  boolPtr(false),
+		},
+	}, s.searchPages)
+
+	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_audit",
 		Description: "Read a strict or inclusive audit section for a completed MCP job. Sections include summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, and all. links contains content page links only; external, redirect, and excluded rows are available in the audit ZIP artifact.",
 		Annotations: &mcp.ToolAnnotations{
