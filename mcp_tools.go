@@ -67,7 +67,7 @@ func (s *mcpServer) registerTools() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_artifact",
-		Description: "Get a job-scoped download URL, size, and expiry for a completed MCP job's CSV report, strict/inclusive audit ZIP, or strict/inclusive audit JSON. Set inline=true for small CSV and audit JSON content below the server cap.",
+		Description: "Get a job-scoped download URL, size, and expiry for a completed MCP job's CSV report, strict/inclusive audit ZIP, strict/inclusive audit JSON, or strict/inclusive audit XLSX workbook. Set inline=true for small CSV and audit JSON content below the server cap; XLSX is never returned inline.",
 		Annotations: readOnlyToolAnnotations(),
 		InputSchema: getArtifactInputSchema,
 	}, wrapMCPTool(s, "get_artifact", s.getArtifact))

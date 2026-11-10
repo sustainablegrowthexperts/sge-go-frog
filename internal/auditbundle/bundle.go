@@ -159,29 +159,68 @@ func WriteFile(srcDir, outPath string) error {
 	return nil
 }
 
+// WriteWorkbook builds the standalone multi-sheet workbook at outPath from the
+// same rows and builder as the workbook inside the ZIP. It writes to a
+// temporary file in the destination directory and renames it into place, so a
+// partial XLSX is never published.
+func WriteWorkbook(srcDir, outPath string) error {
+	srcDir = filepath.Clean(srcDir)
+	if fi, err := os.Stat(srcDir); err != nil {
+		return fmt.Errorf("audit workbook source: %w", err)
+	} else if !fi.IsDir() {
+		return fmt.Errorf("audit workbook source %q is not a directory", srcDir)
+	}
+
+	data, err := workbookBytes(srcDir)
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(outPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create workbook destination: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".audit-workbook-*.xlsx")
+	if err != nil {
+		return fmt.Errorf("create workbook: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write workbook: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close workbook: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return fmt.Errorf("set workbook permissions: %w", err)
+	}
+	if err := os.Rename(tmpName, outPath); err != nil {
+		return fmt.Errorf("publish workbook: %w", err)
+	}
+	return nil
+}
+
 // Build streams a ZIP bundle to w.
 func Build(w io.Writer, srcDir string) error {
 	srcDir = filepath.Clean(srcDir)
-	meta, err := readReportMeta(filepath.Join(srcDir, AuditJSON))
+	meta, counts, err := readWorkbookInputs(srcDir)
 	if err != nil {
 		return err
 	}
 
-	counts, err := countRows(srcDir)
+	data, err := buildWorkbook(srcDir, meta, counts)
 	if err != nil {
 		return err
 	}
 
-	workbookBytes, err := buildWorkbook(srcDir, meta, counts)
-	if err != nil {
-		return err
-	}
-
-	manifest := buildManifest(srcDir, counts, meta, len(workbookBytes))
+	manifest := buildManifest(srcDir, counts, meta, len(data))
 	modTime := time.Now().UTC()
 
 	zw := zip.NewWriter(w)
-	if err := addBytes(zw, Workbook, workbookBytes, modTime); err != nil {
+	if err := addBytes(zw, Workbook, data, modTime); err != nil {
 		zw.Close()
 		return err
 	}
@@ -197,6 +236,30 @@ func Build(w io.Writer, srcDir string) error {
 		return err
 	}
 	return zw.Close()
+}
+
+// readWorkbookInputs loads the report metadata and row counts shared by the
+// ZIP and standalone workbook paths.
+func readWorkbookInputs(srcDir string) (reportMeta, rowCounts, error) {
+	meta, err := readReportMeta(filepath.Join(srcDir, AuditJSON))
+	if err != nil {
+		return reportMeta{}, rowCounts{}, err
+	}
+	counts, err := countRows(srcDir)
+	if err != nil {
+		return reportMeta{}, rowCounts{}, err
+	}
+	return meta, counts, nil
+}
+
+// workbookBytes builds the shared workbook in memory for the standalone
+// export. Build calls the same inputs and builder for the ZIP entry.
+func workbookBytes(srcDir string) ([]byte, error) {
+	meta, counts, err := readWorkbookInputs(srcDir)
+	if err != nil {
+		return nil, err
+	}
+	return buildWorkbook(srcDir, meta, counts)
 }
 
 func readReportMeta(path string) (reportMeta, error) {

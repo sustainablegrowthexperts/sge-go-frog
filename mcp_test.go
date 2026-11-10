@@ -23,6 +23,7 @@ import (
 	auditpkg "go-frog/internal/audit"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/xuri/excelize/v2"
 )
 
 // mcpJobIDPattern matches the 128-bit lower-case hex IDs used by MCP jobs.
@@ -1132,7 +1133,10 @@ func TestGetJobStatus(t *testing.T) {
 		}
 
 		artifacts := nestedObject(t, out, "artifacts")
-		for _, key := range []string{"csv_ready", "audit_strict_ready", "audit_inclusive_ready"} {
+		for _, key := range []string{
+			"csv_ready", "audit_strict_ready", "audit_inclusive_ready",
+			"audit_xlsx_strict_ready", "audit_xlsx_inclusive_ready",
+		} {
 			if artifacts[key] != false {
 				t.Fatalf("artifacts.%s = %v, want false", key, artifacts[key])
 			}
@@ -1263,6 +1267,12 @@ func TestGetJobStatus(t *testing.T) {
 		}
 		if artifacts["audit_inclusive_ready"] != false {
 			t.Fatalf("artifacts.audit_inclusive_ready = %v, want false", artifacts["audit_inclusive_ready"])
+		}
+		if artifacts["audit_xlsx_strict_ready"] != true {
+			t.Fatalf("artifacts.audit_xlsx_strict_ready = %v, want true", artifacts["audit_xlsx_strict_ready"])
+		}
+		if artifacts["audit_xlsx_inclusive_ready"] != false {
+			t.Fatalf("artifacts.audit_xlsx_inclusive_ready = %v, want false", artifacts["audit_xlsx_inclusive_ready"])
 		}
 	})
 
@@ -4650,6 +4660,170 @@ func TestGetArtifact(t *testing.T) {
 	})
 }
 
+// TestGetArtifactXLSX covers the standalone workbook contract:
+//   - strict and inclusive audit XLSX artifacts resolve with the Excel MIME type,
+//     a profile-specific filename, a non-zero size, and the absolute MCP URL;
+//   - the file is written into the job-owned directory and contains the four
+//     workbook sheets;
+//   - XLSX is never returned inline, even when inline=true;
+//   - a job without an audit returns audit_not_available for both kinds;
+//   - get_job.artifacts reports XLSX readiness for both profiles.
+func TestGetArtifactXLSX(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const xlsxContentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	resultsDir := t.TempDir()
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = resultsDir
+	cfg.ArtifactBaseURL = "https://crawler.example.com"
+
+	app, session := newMCPTestSession(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+	report := auditpkg.Result{
+		Version:     auditpkg.AuditVersion,
+		StartURL:    "https://example.com/",
+		Domain:      "example.com",
+		GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+		Summary:     auditpkg.AuditSummary{Pages: 2},
+	}
+	strictDir := t.TempDir()
+	inclusiveDir := t.TempDir()
+	writeAuditBundleFixture(t, strictDir, report)
+	writeAuditBundleFixture(t, inclusiveDir, report)
+
+	pages := []Page{{URL: "https://example.com/", StatusCode: 200}}
+	job := createDoneResultsJob(t, app, "", pages)
+	job.mu.Lock()
+	job.settings.Audit = true
+	job.auditReady = true
+	job.auditDir = strictDir
+	job.auditInclusiveReady = true
+	job.auditInclusiveDir = inclusiveDir
+	job.mu.Unlock()
+
+	baseURL := "https://crawler.example.com"
+	cases := []struct {
+		kind    string
+		profile string
+		suffix  string
+	}{
+		{"audit_xlsx_strict", "strict", "-strict-audit.xlsx"},
+		{"audit_xlsx_inclusive", "inclusive", "-inclusive-audit.xlsx"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.kind+" metadata", func(t *testing.T) {
+			out := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": job.id,
+				"kind":   tc.kind,
+			})
+			if out["job_id"] != job.id || out["kind"] != tc.kind {
+				t.Fatalf("identity = job_id:%v kind:%v, want %s/%s", out["job_id"], out["kind"], job.id, tc.kind)
+			}
+			if out["content_type"] != xlsxContentType {
+				t.Fatalf("content_type = %v, want %s", out["content_type"], xlsxContentType)
+			}
+			filename := auditString(t, out, "filename")
+			if !strings.HasSuffix(filename, tc.suffix) {
+				t.Fatalf("filename = %q, want suffix %q", filename, tc.suffix)
+			}
+			if strings.ContainsAny(filename, `/\`) {
+				t.Fatalf("filename = %q, want no path separators", filename)
+			}
+			wantURL := baseURL + "/mcp/artifacts/" + job.id + "/" + tc.kind
+			if url := auditString(t, out, "url"); url != wantURL {
+				t.Fatalf("url = %q, want %q", url, wantURL)
+			}
+			if size := auditNumber(t, out, "size_bytes"); size <= 0 {
+				t.Fatalf("size_bytes = %v, want a positive size", size)
+			}
+			if out["inline"] != false {
+				t.Fatalf("inline = %v, want false", out["inline"])
+			}
+			if _, present := out["content"]; present {
+				t.Fatalf("%s returned content without inline=true", tc.kind)
+			}
+
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal %s output: %v", tc.kind, err)
+			}
+			for _, leaked := range []string{resultsDir, strictDir, inclusiveDir} {
+				if leaked != "" && strings.Contains(string(encoded), leaked) {
+					t.Fatalf("%s output leaked filesystem path %q: %s", tc.kind, leaked, encoded)
+				}
+			}
+		})
+
+		t.Run(tc.kind+" never inline", func(t *testing.T) {
+			out := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": job.id,
+				"kind":   tc.kind,
+				"inline": true,
+			})
+			if out["inline"] != false {
+				t.Fatalf("inline = %v, want false even with inline=true", out["inline"])
+			}
+			if _, present := out["content"]; present {
+				t.Fatalf("%s returned inline content", tc.kind)
+			}
+		})
+
+		t.Run(tc.kind+" workbook sheets", func(t *testing.T) {
+			path := filepath.Join(resultsDir, "jobs", job.id, tc.profile+"-audit.xlsx")
+			f, err := excelize.OpenFile(path)
+			if err != nil {
+				t.Fatalf("open generated workbook: %v", err)
+			}
+			defer f.Close()
+			sheets := map[string]bool{}
+			for _, name := range f.GetSheetList() {
+				sheets[name] = true
+			}
+			for _, name := range []string{"Summary", "Pages", "Links", "Blocks"} {
+				if !sheets[name] {
+					t.Fatalf("%s workbook missing sheet %s: %v", tc.kind, name, f.GetSheetList())
+				}
+			}
+		})
+	}
+
+	t.Run("audit_not_available without an audit", func(t *testing.T) {
+		noAudit := createDoneResultsJob(t, app, "", pages)
+		for _, kind := range []string{"audit_xlsx_strict", "audit_xlsx_inclusive"} {
+			res := callTool(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": noAudit.id,
+				"kind":   kind,
+			})
+			if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+				t.Fatalf("%s error = %q, want audit_not_available", kind, toolResultText(res))
+			}
+		}
+	})
+
+	t.Run("get_job reports xlsx readiness", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": job.id})
+		artifacts := nestedObject(t, out, "artifacts")
+		if artifacts["audit_xlsx_strict_ready"] != true {
+			t.Fatalf("artifacts.audit_xlsx_strict_ready = %v, want true", artifacts["audit_xlsx_strict_ready"])
+		}
+		if artifacts["audit_xlsx_inclusive_ready"] != true {
+			t.Fatalf("artifacts.audit_xlsx_inclusive_ready = %v, want true", artifacts["audit_xlsx_inclusive_ready"])
+		}
+
+		noAudit := createDoneResultsJob(t, app, "", pages)
+		out = callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": noAudit.id})
+		artifacts = nestedObject(t, out, "artifacts")
+		for _, key := range []string{"audit_xlsx_strict_ready", "audit_xlsx_inclusive_ready"} {
+			if artifacts[key] != false {
+				t.Fatalf("artifacts.%s = %v, want false", key, artifacts[key])
+			}
+		}
+	})
+}
+
 // TestArtifactURLContract covers the absolute, MCP-scoped artifact URL contract:
 //   - every start_crawl link is absolute and job-scoped under the MCP path;
 //   - configured bases win, request-derived origins are used otherwise, and
@@ -4667,6 +4841,8 @@ func TestArtifactURLContract(t *testing.T) {
 		"audit_inclusive_zip",
 		"audit_json_strict",
 		"audit_json_inclusive",
+		"audit_xlsx_strict",
+		"audit_xlsx_inclusive",
 	}
 
 	// startAuditedJob runs a real start_crawl, waits for completion, and attaches
@@ -6103,7 +6279,7 @@ func TestToolSchemasGolden(t *testing.T) {
 			required:    nil,
 			fields: map[string]goldenField{
 				"job_id": stringField(),
-				"kind":   stringEnum("csv", "audit_strict_zip", "audit_inclusive_zip", "audit_json_strict", "audit_json_inclusive"),
+				"kind":   stringEnum("csv", "audit_strict_zip", "audit_inclusive_zip", "audit_json_strict", "audit_json_inclusive", "audit_xlsx_strict", "audit_xlsx_inclusive"),
 				"inline": boolField(),
 			},
 		},

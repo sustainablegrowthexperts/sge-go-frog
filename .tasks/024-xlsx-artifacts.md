@@ -1,7 +1,7 @@
 ---
 id: task-024
 title: "[Slice] AI retrieves standalone strict and inclusive audit XLSX workbooks"
-status: pending
+status: completed
 depends_on: ["task-023"]
 target_files:
   - "internal/auditbundle/bundle.go"

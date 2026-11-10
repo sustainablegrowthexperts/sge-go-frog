@@ -75,6 +75,20 @@ var auditBundleCache = struct {
 	entries map[string]auditBundleCacheEntry
 }{entries: make(map[string]auditBundleCacheEntry)}
 
+// auditXLSXCacheEntry records the source directory version that produced a
+// cached standalone workbook.
+type auditXLSXCacheEntry struct {
+	dirModTime time.Time
+	path       string
+}
+
+// auditXLSXCache mirrors auditBundleCache without sharing its slots, so the ZIP
+// and standalone workbook invalidate independently.
+var auditXLSXCache = struct {
+	sync.Mutex
+	entries map[string]auditXLSXCacheEntry
+}{entries: make(map[string]auditXLSXCacheEntry)}
+
 // validateGetArtifactInput checks the job ID and kind before any job lookup.
 // Path-like input is rejected as invalid_argument; it is never interpreted as
 // a filesystem path.
@@ -169,9 +183,9 @@ func (s *mcpServer) buildArtifact(ctx context.Context, job *crawlJob, kind strin
 // artifactProfileForLog maps audit artifact kinds to their report profile.
 func artifactProfileForLog(kind string) string {
 	switch kind {
-	case "audit_strict_zip", "audit_json_strict":
+	case "audit_strict_zip", "audit_json_strict", "audit_xlsx_strict":
 		return "strict"
-	case "audit_inclusive_zip", "audit_json_inclusive":
+	case "audit_inclusive_zip", "audit_json_inclusive", "audit_xlsx_inclusive":
 		return "inclusive"
 	default:
 		return ""
@@ -245,6 +259,24 @@ func (s *mcpServer) resolveArtifact(ctx context.Context, jobID, kind string, sna
 			contentType: "application/json",
 			url:         url,
 			inlineable:  true,
+		}, nil
+
+	case "audit_xlsx_strict", "audit_xlsx_inclusive":
+		profile, dir, ready := auditProfileState(kind, snapshot)
+		if !snapshot.auditEnabled || !ready || strings.TrimSpace(dir) == "" {
+			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+		}
+		path, err := s.auditWorkbookPath(jobID, kind, profile, dir)
+		if err != nil {
+			// Never echo the builder error: it contains the audit directory.
+			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+		}
+		return artifactDescriptor{
+			path:        path,
+			filename:    slug + "-" + profile + "-audit.xlsx",
+			contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			url:         url,
+			inlineable:  false,
 		}, nil
 	}
 
@@ -391,6 +423,47 @@ func (s *mcpServer) auditBundlePath(jobID, profile, dir string) (string, error) 
 		path:       path,
 	}
 	auditBundleCache.Unlock()
+	return path, nil
+}
+
+// auditWorkbookPath returns the cached standalone XLSX for one job. It rebuilds
+// with auditbundle.WriteWorkbook when the audit directory mtime changes or the
+// cached file is missing.
+func (s *mcpServer) auditWorkbookPath(jobID, kind, profile, dir string) (string, error) {
+	clean, err := cleanArtifactDirectory(dir)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(clean)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("audit directory is unavailable")
+	}
+
+	path := filepath.Join(s.jobOwnedDir(jobID), profile+"-audit.xlsx")
+	key := jobID + "\x00" + kind + "\x00" + profile
+
+	auditXLSXCache.Lock()
+	entry, ok := auditXLSXCache.entries[key]
+	auditXLSXCache.Unlock()
+	if ok && entry.path == path && entry.dirModTime.Equal(info.ModTime()) {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := auditbundle.WriteWorkbook(clean, path); err != nil {
+		return "", err
+	}
+
+	auditXLSXCache.Lock()
+	auditXLSXCache.entries[key] = auditXLSXCacheEntry{
+		dirModTime: info.ModTime(),
+		path:       path,
+	}
+	auditXLSXCache.Unlock()
 	return path, nil
 }
 

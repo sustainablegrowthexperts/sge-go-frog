@@ -167,6 +167,79 @@ func TestWriteFilePackagesCSVsAndWorkbook(t *testing.T) {
 	assertCell(t, f, "Summary", "B1", "example.com")
 }
 
+func TestWriteWorkbook(t *testing.T) {
+	dir := newFixture(t)
+	out := filepath.Join(t.TempDir(), "audit.xlsx")
+	if err := WriteWorkbook(dir, out); err != nil {
+		t.Fatalf("WriteWorkbook: %v", err)
+	}
+
+	f, err := excelize.OpenFile(out)
+	if err != nil {
+		t.Fatalf("open standalone workbook: %v", err)
+	}
+	defer f.Close()
+
+	sheets := map[string]bool{}
+	for _, name := range f.GetSheetList() {
+		sheets[name] = true
+	}
+	for _, name := range []string{"Summary", "Pages", "Links", "Blocks"} {
+		if !sheets[name] {
+			t.Fatalf("standalone workbook missing sheet %s: %v", name, f.GetSheetList())
+		}
+	}
+
+	// The standalone file must be built from the same workbook as the ZIP, so
+	// representative cells and row counts have to match exactly.
+	zipPath := filepath.Join(t.TempDir(), "audit.zip")
+	if err := WriteFile(dir, zipPath); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	files := readBundle(t, zipPath)
+	bundled, err := excelize.OpenReader(bytes.NewReader(files[Workbook]))
+	if err != nil {
+		t.Fatalf("open bundled workbook: %v", err)
+	}
+	defer bundled.Close()
+
+	for _, cell := range []struct{ sheet, ref string }{
+		{"Summary", "B1"},
+		{"Pages", "A2"},
+		{"Pages", "D2"},
+		{"Links", "C2"},
+		{"Links", "C3"},
+		{"Blocks", "C2"},
+	} {
+		got, want := mustCell(t, f, cell.sheet, cell.ref), mustCell(t, bundled, cell.sheet, cell.ref)
+		if got != want {
+			t.Fatalf("%s!%s = %q, want %q from the bundled workbook", cell.sheet, cell.ref, got, want)
+		}
+	}
+
+	for _, sheet := range []string{"Summary", "Pages", "Links", "Blocks"} {
+		gotRows, err := f.GetRows(sheet)
+		if err != nil {
+			t.Fatalf("read standalone %s rows: %v", sheet, err)
+		}
+		wantRows, err := bundled.GetRows(sheet)
+		if err != nil {
+			t.Fatalf("read bundled %s rows: %v", sheet, err)
+		}
+		if len(gotRows) != len(wantRows) {
+			t.Fatalf("%s rows = %d, want %d from the bundled workbook", sheet, len(gotRows), len(wantRows))
+		}
+	}
+
+	info, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("stat standalone workbook: %v", err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("standalone workbook mode = %o, want 644", info.Mode().Perm())
+	}
+}
+
 func TestWriteFileRejectsMissingAuditJSON(t *testing.T) {
 	dir := t.TempDir()
 	if err := WriteFile(dir, filepath.Join(t.TempDir(), "audit.zip")); err == nil {

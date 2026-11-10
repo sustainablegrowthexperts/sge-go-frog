@@ -267,6 +267,8 @@ type startCrawlLinks struct {
 	AuditInclusiveZIP  string `json:"audit_inclusive_zip"`
 	AuditJSONStrict    string `json:"audit_json_strict"`
 	AuditJSONInclusive string `json:"audit_json_inclusive"`
+	AuditXLSXStrict    string `json:"audit_xlsx_strict"`
+	AuditXLSXInclusive string `json:"audit_xlsx_inclusive"`
 }
 
 // startCrawlOutput is the typed output for the start_crawl tool. It describes
@@ -328,6 +330,8 @@ func jobLinks(base, mcpPath, id string) startCrawlLinks {
 		AuditInclusiveZIP:  absoluteArtifactURL(base, mcpPath, id, "audit_inclusive_zip"),
 		AuditJSONStrict:    absoluteArtifactURL(base, mcpPath, id, "audit_json_strict"),
 		AuditJSONInclusive: absoluteArtifactURL(base, mcpPath, id, "audit_json_inclusive"),
+		AuditXLSXStrict:    absoluteArtifactURL(base, mcpPath, id, "audit_xlsx_strict"),
+		AuditXLSXInclusive: absoluteArtifactURL(base, mcpPath, id, "audit_xlsx_inclusive"),
 	}
 }
 
@@ -361,9 +365,11 @@ type getJobAudit struct {
 
 // getJobArtifacts reports which download artifacts are ready.
 type getJobArtifacts struct {
-	CSVReady            bool `json:"csv_ready"`
-	AuditStrictReady    bool `json:"audit_strict_ready"`
-	AuditInclusiveReady bool `json:"audit_inclusive_ready"`
+	CSVReady                bool `json:"csv_ready"`
+	AuditStrictReady        bool `json:"audit_strict_ready"`
+	AuditInclusiveReady     bool `json:"audit_inclusive_ready"`
+	AuditXLSXStrictReady    bool `json:"audit_xlsx_strict_ready"`
+	AuditXLSXInclusiveReady bool `json:"audit_xlsx_inclusive_ready"`
 }
 
 // listJobsInput is the typed input for the list_jobs tool. Empty status or
@@ -714,6 +720,8 @@ var getArtifactKinds = []string{
 	"audit_inclusive_zip",
 	"audit_json_strict",
 	"audit_json_inclusive",
+	"audit_xlsx_strict",
+	"audit_xlsx_inclusive",
 }
 
 // getArtifactInput is the typed input for the get_artifact tool. job_id and
@@ -721,7 +729,7 @@ var getArtifactKinds = []string{
 // invalid_argument error contract instead of the SDK's schema error.
 type getArtifactInput struct {
 	JobID  string `json:"job_id,omitempty" jsonschema:"job ID returned by start_crawl"`
-	Kind   string `json:"kind,omitempty" jsonschema:"artifact kind: csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, or audit_json_inclusive"`
+	Kind   string `json:"kind,omitempty" jsonschema:"artifact kind: csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, audit_json_inclusive, audit_xlsx_strict, or audit_xlsx_inclusive"`
 	Inline bool   `json:"inline,omitempty" jsonschema:"include the artifact content inline when it is below the server cap"`
 }
 

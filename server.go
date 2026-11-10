@@ -1148,9 +1148,11 @@ func (j *crawlJob) statusSnapshot() getJobOutput {
 			),
 		},
 		Artifacts: getJobArtifacts{
-			CSVReady:            j.status == jobStatusDone && len(j.result) > 0,
-			AuditStrictReady:    j.auditReady,
-			AuditInclusiveReady: j.auditInclusiveReady,
+			CSVReady:                j.status == jobStatusDone && len(j.result) > 0,
+			AuditStrictReady:        j.auditReady,
+			AuditInclusiveReady:     j.auditInclusiveReady,
+			AuditXLSXStrictReady:    j.auditReady,
+			AuditXLSXInclusiveReady: j.auditInclusiveReady,
 		},
 	}
 	if j.settings.Audit {
