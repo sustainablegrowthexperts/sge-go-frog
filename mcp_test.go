@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1733,4 +1735,327 @@ func TestCanonicalStartCrawlFingerprint(t *testing.T) {
 			}
 		})
 	}
+}
+
+// gatedCrawlRunner blocks every crawl until the test releases that specific
+// call. releaseAll opens the gate for calls that are already running and for
+// any job admitted later, so a queued job cannot leak a goroutine at cleanup.
+type gatedCrawlRunner struct {
+	mu       sync.Mutex
+	releases []chan struct{}
+	calls    int
+	open     bool
+	started  chan struct{}
+}
+
+func newGatedCrawlRunner() *gatedCrawlRunner {
+	return &gatedCrawlRunner{started: make(chan struct{}, 128)}
+}
+
+// fakeClock is a mutex-guarded clock for deterministic quota tests.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+func (r *gatedCrawlRunner) run() ([]Page, error) {
+	r.mu.Lock()
+	r.calls++
+	if r.open {
+		r.mu.Unlock()
+		return nil, nil
+	}
+	ch := make(chan struct{})
+	r.releases = append(r.releases, ch)
+	r.mu.Unlock()
+
+	r.started <- struct{}{}
+	<-ch
+	return nil, nil
+}
+
+func (r *gatedCrawlRunner) Spider(_ context.Context, _ WizardSettings, _ progressFunc) ([]Page, error) {
+	return r.run()
+}
+
+func (r *gatedCrawlRunner) List(_ context.Context, _ []string, _ WizardSettings, _ progressFunc) ([]Page, error) {
+	return r.run()
+}
+
+func (r *gatedCrawlRunner) startCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+func (r *gatedCrawlRunner) releaseCall(index int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index < 0 || index >= len(r.releases) || r.releases[index] == nil {
+		return false
+	}
+	close(r.releases[index])
+	r.releases[index] = nil
+	return true
+}
+
+func (r *gatedCrawlRunner) releaseAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.open = true
+	for i, ch := range r.releases {
+		if ch != nil {
+			close(ch)
+			r.releases[i] = nil
+		}
+	}
+}
+
+// waitForRunnerStarts blocks until the gated runner has started want crawls.
+func waitForRunnerStarts(t *testing.T, runner *gatedCrawlRunner, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for runner.startCount() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("runner started %d crawls, want %d", runner.startCount(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestStartCrawlConcurrencyLimit covers the task-007 contract:
+//   - at most the global running-job cap launches crawls at once;
+//   - additional starts are admitted to a bounded queue with status/phase queued;
+//   - queue overflow returns limit_exceeded naming the limit and retry_after_ms;
+//   - releasing a running job admits the oldest queued request;
+//   - the per-token cap limits one shared token even when the global cap is free.
+func TestStartCrawlConcurrencyLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	startArgs := func(i int) map[string]any {
+		return map[string]any{
+			"mode":      "spider",
+			"start_url": fmt.Sprintf("https://example.com/job-%d", i),
+		}
+	}
+
+	t.Run("global cap queues then rejects overflow", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxConcurrentJobs = 4
+		// Isolate the global semaphore: the shared token may use the whole
+		// global cap in this subtest.
+		cfg.Limits.MaxConcurrentJobsPerToken = 4
+
+		runner := newGatedCrawlRunner()
+		t.Cleanup(runner.releaseAll)
+		app, session := newMCPTestSession(t, ctx, cfg, runner)
+
+		var ids []string
+		for i := 0; i < 4; i++ {
+			out := callToolObject(t, ctx, session, "start_crawl", startArgs(i))
+			ids = append(ids, out["job_id"].(string))
+			if out["status"] != jobStatusRunning {
+				t.Fatalf("job %d status = %v, want %q", i, out["status"], jobStatusRunning)
+			}
+		}
+		waitForRunnerStarts(t, runner, 4)
+
+		// The next global-limit-many requests fit in the bounded queue and
+		// report queued without launching a crawl.
+		const queueCapacity = 8 // 2 * global cap
+		for i := 4; i < 4+queueCapacity; i++ {
+			out := callToolObject(t, ctx, session, "start_crawl", startArgs(i))
+			ids = append(ids, out["job_id"].(string))
+			if out["status"] != jobStatusQueued {
+				t.Fatalf("job %d status = %v, want %q", i, out["status"], jobStatusQueued)
+			}
+			if out["phase"] != "queued" {
+				t.Fatalf("job %d phase = %v, want queued", i, out["phase"])
+			}
+		}
+		if got := runner.startCount(); got != 4 {
+			t.Fatalf("runner started %d crawls while the queue was full, want 4", got)
+		}
+		if got := len(app.jobs.list(jobFilter{})); got != 4+queueCapacity {
+			t.Fatalf("manager holds %d jobs, want %d", got, 4+queueCapacity)
+		}
+
+		res := callTool(t, ctx, session, "start_crawl", startArgs(4+queueCapacity))
+		if !res.IsError {
+			t.Fatalf("queue overflow was accepted: %v", res.StructuredContent)
+		}
+		text := strings.ToLower(toolResultText(res))
+		for _, want := range []string{"limit_exceeded", "retry_after_ms", "global_jobs", "retryable=true"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("overflow error = %q, want %q", text, want)
+			}
+		}
+		if got := len(app.jobs.list(jobFilter{})); got != 4+queueCapacity {
+			t.Fatalf("overflow created a job; manager holds %d jobs, want %d", got, 4+queueCapacity)
+		}
+
+		// Releasing one slot admits one queued job, which leaves the queued
+		// phase and starts running. The queue is not required to be FIFO.
+		if !runner.releaseCall(0) {
+			t.Fatal("releaseCall(0) = false")
+		}
+		waitForRunnerStarts(t, runner, 5)
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			var admitted *crawlJob
+			for _, id := range ids[4:] {
+				job := app.jobs.get(id)
+				if job == nil {
+					t.Fatalf("queued job %q is not in the manager", id)
+				}
+				status, phase := job.statusPhase()
+				if status == jobStatusRunning && phase != "queued" {
+					admitted = job
+					break
+				}
+			}
+			if admitted != nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("releasing a slot did not admit a queued job")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		runner.releaseAll()
+	})
+
+	t.Run("per-token cap names the token limit on overflow", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxConcurrentJobs = 4
+		cfg.Limits.MaxConcurrentJobsPerToken = 2
+
+		runner := newGatedCrawlRunner()
+		t.Cleanup(runner.releaseAll)
+		app, session := newMCPTestSession(t, ctx, cfg, runner)
+
+		for i := 0; i < 2; i++ {
+			out := callToolObject(t, ctx, session, "start_crawl", startArgs(i))
+			if out["status"] != jobStatusRunning {
+				t.Fatalf("job %d status = %v, want %q", i, out["status"], jobStatusRunning)
+			}
+		}
+		waitForRunnerStarts(t, runner, 2)
+
+		// Fill the queue: the token cap, not the global cap, is exhausted.
+		for i := 2; i < 2+8; i++ {
+			out := callToolObject(t, ctx, session, "start_crawl", startArgs(i))
+			if out["status"] != jobStatusQueued {
+				t.Fatalf("job %d status = %v, want %q", i, out["status"], jobStatusQueued)
+			}
+		}
+		res := callTool(t, ctx, session, "start_crawl", startArgs(10))
+		if !res.IsError {
+			t.Fatalf("queue overflow was accepted: %v", res.StructuredContent)
+		}
+		text := strings.ToLower(toolResultText(res))
+		for _, want := range []string{"limit_exceeded", "retry_after_ms", "per_token_jobs"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("overflow error = %q, want %q", text, want)
+			}
+		}
+		if got := len(app.jobs.list(jobFilter{})); got != 10 {
+			t.Fatalf("overflow created a job; manager holds %d jobs, want 10", got)
+		}
+	})
+
+	t.Run("a failed job releases its slot", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxConcurrentJobs = 1
+		cfg.Limits.MaxConcurrentJobsPerToken = 1
+
+		runner := newImmediateFakeRunner(nil, errors.New("boom"))
+		app, session := newMCPTestSession(t, ctx, cfg, runner)
+
+		first := callToolObject(t, ctx, session, "start_crawl", startArgs(0))
+		firstID := first["job_id"].(string)
+		waitForJobStatus(t, app.jobs.get(firstID), jobStatusError)
+
+		second := callToolObject(t, ctx, session, "start_crawl", startArgs(1))
+		if second["status"] != jobStatusRunning {
+			t.Fatalf("second job status = %v, want %q after the first failed", second["status"], jobStatusRunning)
+		}
+	})
+}
+
+// TestToolRateLimit covers the task-007 contract:
+//   - every MCP tool call consumes one token from the per-token bucket;
+//   - the 61st call in a simulated minute is rejected with limit_exceeded,
+//     retry_after_ms, and the rate_limit detail;
+//   - a rejected start_crawl has no side effects;
+//   - advancing the injectable clock admits the next call again.
+func TestToolRateLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	cfg := defaultMCPConfig()
+	runner := newImmediateFakeRunner(nil, nil)
+	app, session := newMCPTestSession(t, ctx, cfg, runner)
+
+	clock := &fakeClock{now: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)}
+	app.mcp.quota.SetClock(clock.Now)
+
+	for i := 0; i < cfg.Limits.RateLimitPerMinute; i++ {
+		// Mix read tools so the test also proves they share the same bucket.
+		if i%2 == 0 {
+			callToolObject(t, ctx, session, "list_jobs", nil)
+		} else {
+			callTool(t, ctx, session, "get_job", map[string]any{"job_id": "missing"})
+		}
+	}
+
+	res := callTool(t, ctx, session, "start_crawl", map[string]any{
+		"mode":      "spider",
+		"start_url": "https://example.com",
+	})
+	if !res.IsError {
+		t.Fatalf("61st tool call was accepted: %v", res.StructuredContent)
+	}
+	text := strings.ToLower(toolResultText(res))
+	for _, want := range []string{"limit_exceeded", "retry_after_ms", "rate_limit", "retryable=true"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("rate-limit error = %q, want %q", text, want)
+		}
+	}
+	if got := len(app.jobs.list(jobFilter{})); got != 0 {
+		t.Fatalf("rejected start_crawl created %d jobs, want 0", got)
+	}
+	runner.mu.Lock()
+	spiderCalls := runner.spiderCalls
+	runner.mu.Unlock()
+	if spiderCalls != 0 {
+		t.Fatalf("rejected start_crawl launched %d crawls, want 0", spiderCalls)
+	}
+
+	// get_job is rate-limited too, not only start_crawl.
+	res = callTool(t, ctx, session, "get_job", map[string]any{"job_id": "missing"})
+	if !res.IsError {
+		t.Fatal("get_job was accepted after the rate limit was exhausted")
+	}
+	if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "rate_limit") {
+		t.Fatalf("get_job error = %q, want rate_limit", text)
+	}
+
+	// The clock is injectable: refilling for one second admits the next call.
+	clock.Advance(time.Second)
+	callToolObject(t, ctx, session, "list_jobs", nil)
 }

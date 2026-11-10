@@ -105,6 +105,13 @@ func mcpConfigFromEnv(getenv func(string) string) (MCPConfig, error) {
 		}
 		cfg.Limits.MaxConcurrentJobs = n
 	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_JOBS_PER_TOKEN")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_JOBS_PER_TOKEN: %w", err)
+		}
+		cfg.Limits.MaxConcurrentJobsPerToken = n
+	}
 	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_CONCURRENCY")); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -185,6 +192,7 @@ func (c *MCPConfig) registerFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.Limits.MaxListURLs, "mcp-max-list-urls", c.Limits.MaxListURLs, "maximum URLs in an MCP list job")
 	fs.DurationVar(&c.Limits.MaxDuration, "mcp-max-duration", c.Limits.MaxDuration, "maximum duration for an MCP job")
 	fs.IntVar(&c.Limits.MaxConcurrentJobs, "mcp-max-jobs", c.Limits.MaxConcurrentJobs, "maximum concurrent MCP jobs")
+	fs.IntVar(&c.Limits.MaxConcurrentJobsPerToken, "mcp-max-jobs-per-token", c.Limits.MaxConcurrentJobsPerToken, "maximum concurrent MCP jobs per token")
 	fs.IntVar(&c.Limits.MaxConcurrency, "mcp-max-concurrency", c.Limits.MaxConcurrency, "maximum request concurrency for an MCP crawl")
 	fs.IntVar(&c.Limits.MaxKeywords, "mcp-max-keywords", c.Limits.MaxKeywords, "maximum keywords per MCP crawl")
 	fs.IntVar(&c.Limits.MaxKeywordLength, "mcp-max-keyword-length", c.Limits.MaxKeywordLength, "maximum characters per MCP keyword")

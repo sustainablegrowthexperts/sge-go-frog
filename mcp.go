@@ -22,6 +22,7 @@ type mcpServer struct {
 	jobs   *jobManager
 	config MCPConfig
 	runner crawlRunner
+	quota  *mcpQuota
 }
 
 // newMCPServer builds the MCP server metadata, registers the tools, and wraps
@@ -38,6 +39,7 @@ func newMCPServer(jm *jobManager, cfg MCPConfig, runner crawlRunner) (*mcpServer
 		jobs:   jm,
 		config: cfg,
 		runner: runner,
+		quota:  newMCPQuota(cfg.Limits),
 	}
 	s.registerTools()
 

@@ -1,7 +1,7 @@
 ---
 id: task-007
 title: "[Slice] Start requests are bounded by job and rate limits"
-status: pending
+status: completed
 depends_on: ["task-006"]
 target_files:
   - "mcp_limits.go"

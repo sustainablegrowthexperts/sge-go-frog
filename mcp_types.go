@@ -35,9 +35,10 @@ const (
 	maxListJobsLimit     = 100
 )
 
-// Job phase values. A job moves from starting to crawling and ends in done or
-// error.
+// Job phase values. A job moves from queued to starting, then crawling, and
+// ends in done or error.
 const (
+	jobPhaseQueued   = "queued"
 	jobPhaseStarting = "starting"
 	jobPhaseCrawling = "crawling"
 	jobPhaseDone     = "done"

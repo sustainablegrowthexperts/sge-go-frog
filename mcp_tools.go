@@ -56,7 +56,18 @@ type startCrawlPlan struct {
 // idempotent: identical input returns the original job, while different input
 // returns a conflict.
 func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in startCrawlInput) (*mcp.CallToolResult, startCrawlOutput, error) {
+	if err := s.checkToolRateLimit(); err != nil {
+		return nil, startCrawlOutput{}, err
+	}
+
 	plan, err := s.validateStartCrawl(in)
+	if err != nil {
+		return nil, startCrawlOutput{}, err
+	}
+
+	// Acquire the job slot (or a place in the bounded queue) before creating
+	// the job so rejected requests never leave an un-runnable job behind.
+	reservation, err := s.quota.Reserve(mcpQuotaKey())
 	if err != nil {
 		return nil, startCrawlOutput{}, err
 	}
@@ -72,14 +83,30 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 		plan.fingerprint,
 	)
 	if err != nil {
+		reservation.Release()
 		return nil, startCrawlOutput{}, err
 	}
-
-	if !replay {
-		go runCrawlJob(job, plan.settings, s.runner)
+	if replay {
+		// A replay returns the existing job and does not consume a slot.
+		reservation.Release()
+		return nil, s.startCrawlOutput(job), nil
 	}
 
+	if reservation.queued {
+		job.markQueued()
+	}
+	go runMCPCrawlJob(job, plan.settings, s.runner, reservation)
+
 	return nil, s.startCrawlOutput(job), nil
+}
+
+// checkToolRateLimit applies the per-token tool-call bucket to every MCP tool.
+// A rejected call returns before the handler performs any side effect.
+func (s *mcpServer) checkToolRateLimit() error {
+	if s.quota == nil {
+		return nil
+	}
+	return s.quota.AllowToolCall(mcpQuotaKey())
 }
 
 // startCrawlOutput builds the start response from a job snapshot. Replays use
@@ -109,6 +136,10 @@ func (s *mcpServer) startCrawlOutput(job *crawlJob) startCrawlOutput {
 // getJob returns a consistent snapshot of an MCP-owned job. Unknown and
 // browser-owned IDs intentionally produce the same job_not_found error.
 func (s *mcpServer) getJob(_ context.Context, _ *mcp.CallToolRequest, in getJobInput) (*mcp.CallToolResult, getJobOutput, error) {
+	if err := s.checkToolRateLimit(); err != nil {
+		return nil, getJobOutput{}, err
+	}
+
 	jobID := strings.TrimSpace(in.JobID)
 	if jobID == "" {
 		return nil, getJobOutput{}, fmt.Errorf("invalid_argument: job_id is required")
@@ -128,6 +159,10 @@ func (s *mcpServer) getJob(_ context.Context, _ *mcp.CallToolRequest, in getJobI
 // listJobs returns a page of MCP-owned jobs, newest first, with optional
 // status and mode filters. Unknown and browser-owned jobs are never included.
 func (s *mcpServer) listJobs(_ context.Context, _ *mcp.CallToolRequest, in listJobsInput) (*mcp.CallToolResult, listJobsOutput, error) {
+	if err := s.checkToolRateLimit(); err != nil {
+		return nil, listJobsOutput{}, err
+	}
+
 	status := strings.TrimSpace(in.Status)
 	mode := strings.TrimSpace(in.Mode)
 	if err := validateJobEnum("status", status, listJobStatuses); err != nil {

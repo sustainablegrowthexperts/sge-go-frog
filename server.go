@@ -374,6 +374,28 @@ func (jm *jobManager) reapBefore(cutoff time.Time) {
 	}
 }
 
+// markQueued moves a newly created job into the bounded MCP wait queue. It is
+// only used for MCP jobs; the web UI keeps launching immediately.
+func (j *crawlJob) markQueued() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.status = jobStatusQueued
+	j.phase = jobPhaseQueued
+}
+
+// startFromQueue transitions an admitted queued job to running/starting and
+// records its real start time.
+func (j *crawlJob) startFromQueue() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.status != jobStatusQueued {
+		return
+	}
+	j.status = jobStatusRunning
+	j.phase = jobPhaseStarting
+	j.startedAt = time.Now().UTC()
+}
+
 // setPhase moves the job to an active phase and records startedAt the first
 // time it becomes active.
 func (j *crawlJob) setPhase(phase string) {
@@ -731,6 +753,15 @@ func serve(addr string, cfg MCPConfig) error {
 	}
 	defer a.Close(context.Background())
 
+	if cfg.Enabled {
+		limits := cfg.Limits.withDefaults()
+		fmt.Printf("MCP limits: max_running_jobs=%d max_running_jobs_per_token=%d queue=%d rate_limit_per_minute=%d\n",
+			limits.MaxConcurrentJobs,
+			limits.MaxConcurrentJobsPerToken,
+			limits.queueLimit(),
+			limits.RateLimitPerMinute,
+		)
+	}
 	fmt.Printf("go-frog web server listening on %s\n", addr)
 	return http.ListenAndServe(addr, a.Handler())
 }
@@ -860,6 +891,24 @@ func registerWebRoutes(mux *http.ServeMux, jm *jobManager, runner crawlRunner) {
 		w.Header().Set("Content-Type", "text/html")
 		writeJobFragment(w, job.view())
 	})
+}
+
+// runMCPCrawlJob is the MCP launch path. The quota reservation is acquired
+// before the job is created; the deferred release covers done, error, and any
+// future interrupted terminal state. Queued jobs wait for admission, then
+// transition from queued to starting before the crawl begins.
+func runMCPCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner, reservation *quotaReservation) {
+	defer reservation.Release()
+
+	if reservation.queued {
+		if !reservation.Wait() {
+			job.fail(fmt.Errorf("interrupted before start"))
+			return
+		}
+		job.startFromQueue()
+	}
+
+	runCrawlJob(job, settings, runner)
 }
 
 // runCrawlJob is the single launch path shared by the web UI and the MCP
