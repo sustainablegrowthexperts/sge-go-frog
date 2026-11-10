@@ -17,6 +17,15 @@ func (s *mcpServer) registerTools() {
 		Name:        "start_crawl",
 		Description: "Start an asynchronous spider crawl and return a job ID for polling with get_job.",
 	}, s.startCrawl)
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "get_job",
+		Description: "Poll an MCP-created job for status, phase, progress, limits, audit state, and artifact readiness.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+		},
+	}, s.getJob)
 }
 
 // startCrawl validates a spider request, creates an MCP-owned job, launches the
@@ -47,6 +56,37 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 		ArchiveHTML: job.archiveHTML,
 		Links:       jobLinks(s.config, job.id),
 	}, nil
+}
+
+// getJob returns a consistent snapshot of an MCP-owned job. Unknown and
+// browser-owned IDs intentionally produce the same job_not_found error.
+func (s *mcpServer) getJob(_ context.Context, _ *mcp.CallToolRequest, in getJobInput) (*mcp.CallToolResult, getJobOutput, error) {
+	jobID := strings.TrimSpace(in.JobID)
+	if jobID == "" {
+		return nil, getJobOutput{}, fmt.Errorf("invalid_argument: job_id is required")
+	}
+
+	job := s.jobs.get(jobID)
+	if job == nil || !job.ownedBy(ownerMCP) {
+		return nil, getJobOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	}
+
+	out := job.statusSnapshot()
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: jobStatusSummary(out)}},
+	}, out, nil
+}
+
+// jobStatusSummary renders a short agent-facing summary of a job snapshot.
+func jobStatusSummary(out getJobOutput) string {
+	summary := fmt.Sprintf("Job %s is %s (phase %s): %d page(s) crawled.", out.JobID, out.Status, out.Phase, out.PagesCrawled)
+	if out.Audit.Enabled {
+		summary += fmt.Sprintf(" Audit: %s.", out.Audit.State)
+	}
+	if out.Error != nil {
+		summary += " Error: " + *out.Error
+	}
+	return summary
 }
 
 // validateStartCrawl checks the slice's spider contract and converts the DTO

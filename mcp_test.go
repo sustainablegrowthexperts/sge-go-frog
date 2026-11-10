@@ -54,6 +54,113 @@ func toolResultText(res *mcp.CallToolResult) string {
 	return b.String()
 }
 
+// callTool invokes an MCP tool and treats transport failures as test failures.
+func callTool(t *testing.T, ctx context.Context, session *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return res
+}
+
+// callToolObject invokes an MCP tool that must succeed and returns its
+// structured content as a generic JSON object.
+func callToolObject(t *testing.T, ctx context.Context, session *mcp.ClientSession, name string, args map[string]any) map[string]any {
+	t.Helper()
+	res := callTool(t, ctx, session, name, args)
+	if res.IsError {
+		t.Fatalf("%s returned an error: %s", name, toolResultText(res))
+	}
+	return structuredObject(t, res)
+}
+
+// structuredObject converts structured tool content into a map.
+func structuredObject(t *testing.T, res *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	out, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structured content = %T, want an object (%s)", res.StructuredContent, toolResultText(res))
+	}
+	return out
+}
+
+// nestedObject reads a nested object field from structured content.
+func nestedObject(t *testing.T, parent map[string]any, key string) map[string]any {
+	t.Helper()
+	out, ok := parent[key].(map[string]any)
+	if !ok {
+		t.Fatalf("%s = %T, want an object", key, parent[key])
+	}
+	return out
+}
+
+// assertNumber compares a decoded JSON number to an expected value.
+func assertNumber(t *testing.T, name string, got any, want float64) {
+	t.Helper()
+	n, ok := got.(float64)
+	if !ok {
+		t.Fatalf("%s = %v (%T), want a number", name, got, got)
+	}
+	if n != want {
+		t.Fatalf("%s = %v, want %v", name, n, want)
+	}
+}
+
+// assertStringSlice compares a decoded JSON array to an expected string slice.
+func assertStringSlice(t *testing.T, name string, got any, want []string) {
+	t.Helper()
+	items, ok := got.([]any)
+	if !ok {
+		t.Fatalf("%s = %v (%T), want an array", name, got, got)
+	}
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			t.Fatalf("%s contains %v (%T), want strings", name, item, item)
+		}
+		values = append(values, s)
+	}
+	if !slices.Equal(values, want) {
+		t.Fatalf("%s = %v, want %v", name, values, want)
+	}
+}
+
+// assertRFC3339UTC checks that a JSON timestamp is an RFC 3339 UTC string and
+// returns the parsed value.
+func assertRFC3339UTC(t *testing.T, name string, got any) time.Time {
+	t.Helper()
+	s, ok := got.(string)
+	if !ok || s == "" {
+		t.Fatalf("%s = %v, want an RFC 3339 string", name, got)
+	}
+	parsed, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("%s = %q, want RFC 3339: %v", name, s, err)
+	}
+	if parsed.Location() != time.UTC {
+		t.Fatalf("%s = %q, want UTC", name, s)
+	}
+	return parsed
+}
+
+// waitForJobStatus blocks until the job reaches the requested status.
+func waitForJobStatus(t *testing.T, job *crawlJob, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status, _ := job.statusPhase()
+		if status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job status = %q, want %q", status, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestMCPInitializeHandshake covers the slice contract:
 //   - an MCP client can initialize over Streamable HTTP at /mcp and read the
 //     go-frog server metadata;
@@ -367,6 +474,313 @@ func TestStartCrawlSpider(t *testing.T) {
 					t.Fatalf("error text %q does not mention %q", text, tc.wantSub)
 				}
 			})
+		}
+	})
+}
+
+// TestGetJobStatus covers the polling contract:
+//   - a running MCP job reports its status, phase, timestamps, page progress,
+//     current URL, keywords, effective limits, and readiness flags;
+//   - a finished job reports done and a non-null finished_at;
+//   - a failed crawl exposes the stored error without failing the tool;
+//   - audit failures and truncation are reported separately;
+//   - missing, unknown, and UI-owned job IDs follow the tool error contract.
+func TestGetJobStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Run("running job reports live progress and limits", func(t *testing.T) {
+		runner := newFakeCrawlRunner()
+		runner.progressURLs = []string{
+			"https://example.com/one",
+			"https://example.com/two",
+		}
+		runner.pages = []Page{
+			{URL: "https://example.com/one", StatusCode: 200},
+			{URL: "https://example.com/two", StatusCode: 200},
+			{URL: "https://example.com/three", StatusCode: 200},
+		}
+		t.Cleanup(runner.Release)
+
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxPages = 42
+		cfg.Limits.MaxDepth = 3
+		cfg.Limits.MaxDuration = 90 * time.Second
+		app, session := newMCPTestSession(t, ctx, cfg, runner)
+
+		start := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "example.com",
+			"keywords":  []string{"pricing", "contact"},
+		})
+		jobID, _ := start["job_id"].(string)
+		if jobID == "" {
+			t.Fatal("start_crawl did not return a job ID")
+		}
+
+		select {
+		case <-runner.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("crawl runner was not launched")
+		}
+
+		res := callTool(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		if res.IsError {
+			t.Fatalf("get_job returned an error: %s", toolResultText(res))
+		}
+		out := structuredObject(t, res)
+
+		if out["job_id"] != jobID {
+			t.Fatalf("job_id = %v, want %q", out["job_id"], jobID)
+		}
+		if out["mode"] != "spider" {
+			t.Fatalf("mode = %v, want spider", out["mode"])
+		}
+		if out["target"] != "https://example.com" {
+			t.Fatalf("target = %v, want https://example.com", out["target"])
+		}
+		if out["status"] != jobStatusRunning {
+			t.Fatalf("status = %v, want %q", out["status"], jobStatusRunning)
+		}
+		if out["phase"] != jobPhaseCrawling {
+			t.Fatalf("phase = %v, want %q", out["phase"], jobPhaseCrawling)
+		}
+		assertRFC3339UTC(t, "created_at", out["created_at"])
+		assertRFC3339UTC(t, "started_at", out["started_at"])
+		if _, ok := out["finished_at"]; !ok {
+			t.Fatal("finished_at is missing from the response")
+		}
+		if out["finished_at"] != nil {
+			t.Fatalf("finished_at = %v, want null while running", out["finished_at"])
+		}
+		assertNumber(t, "pages_crawled", out["pages_crawled"], 2)
+		if out["current_url"] != "https://example.com/two" {
+			t.Fatalf("current_url = %v, want the last progress URL", out["current_url"])
+		}
+		assertStringSlice(t, "keywords", out["keywords"], []string{"pricing", "contact"})
+		if out["truncated"] != false {
+			t.Fatalf("truncated = %v, want false", out["truncated"])
+		}
+
+		limits := nestedObject(t, out, "limits")
+		assertNumber(t, "limits.max_pages", limits["max_pages"], 42)
+		assertNumber(t, "limits.max_depth", limits["max_depth"], 3)
+		assertNumber(t, "limits.max_duration_seconds", limits["max_duration_seconds"], 90)
+
+		audit := nestedObject(t, out, "audit")
+		if audit["enabled"] != false {
+			t.Fatalf("audit.enabled = %v, want false", audit["enabled"])
+		}
+		if audit["state"] != "disabled" {
+			t.Fatalf("audit.state = %v, want disabled", audit["state"])
+		}
+		if strict, ok := audit["strict"]; !ok || strict != nil {
+			t.Fatalf("audit.strict = %v, want null", audit["strict"])
+		}
+		if inclusive, ok := audit["inclusive"]; !ok || inclusive != nil {
+			t.Fatalf("audit.inclusive = %v, want null", audit["inclusive"])
+		}
+		if out["error"] != nil {
+			t.Fatalf("error = %v, want null", out["error"])
+		}
+
+		artifacts := nestedObject(t, out, "artifacts")
+		for _, key := range []string{"csv_ready", "audit_strict_ready", "audit_inclusive_ready"} {
+			if artifacts[key] != false {
+				t.Fatalf("artifacts.%s = %v, want false", key, artifacts[key])
+			}
+		}
+
+		summary := strings.ToLower(toolResultText(res))
+		for _, want := range []string{"running", "crawling", "2"} {
+			if !strings.Contains(summary, want) {
+				t.Fatalf("summary %q does not mention %q", summary, want)
+			}
+		}
+
+		runner.Release()
+		waitForJobStatus(t, app.jobs.get(jobID), jobStatusDone)
+
+		res = callTool(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		out = structuredObject(t, res)
+		if out["status"] != jobStatusDone {
+			t.Fatalf("status after release = %v, want %q", out["status"], jobStatusDone)
+		}
+		if out["phase"] != jobPhaseDone {
+			t.Fatalf("phase after release = %v, want %q", out["phase"], jobPhaseDone)
+		}
+		assertRFC3339UTC(t, "finished_at", out["finished_at"])
+		assertNumber(t, "pages_crawled after release", out["pages_crawled"], 3)
+		artifacts = nestedObject(t, out, "artifacts")
+		if artifacts["csv_ready"] != true {
+			t.Fatalf("artifacts.csv_ready = %v, want true after a done job with pages", artifacts["csv_ready"])
+		}
+	})
+
+	t.Run("failed job reports the stored error", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, errors.New("boom"))
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		start := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "https://example.com",
+		})
+		jobID, _ := start["job_id"].(string)
+		waitForJobStatus(t, app.jobs.get(jobID), jobStatusError)
+
+		res := callTool(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		if res.IsError {
+			t.Fatalf("get_job returned an error for an error job: %s", toolResultText(res))
+		}
+		out := structuredObject(t, res)
+		if out["status"] != jobStatusError {
+			t.Fatalf("status = %v, want %q", out["status"], jobStatusError)
+		}
+		if out["phase"] != jobPhaseError {
+			t.Fatalf("phase = %v, want %q", out["phase"], jobPhaseError)
+		}
+		if out["error"] != "boom" {
+			t.Fatalf("error = %v, want boom", out["error"])
+		}
+		assertRFC3339UTC(t, "finished_at", out["finished_at"])
+		artifacts := nestedObject(t, out, "artifacts")
+		if artifacts["csv_ready"] != false {
+			t.Fatalf("artifacts.csv_ready = %v, want false for a failed job", artifacts["csv_ready"])
+		}
+	})
+
+	t.Run("audit state and truncation are reported separately", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		job := app.jobs.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{
+			Mode:        1,
+			StartURL:    "https://example.com",
+			KeywordsRaw: "pricing|contact",
+			Audit:       true,
+		})
+		job.limits = jobLimits{MaxPages: 10, MaxDepth: 2, MaxDuration: 2 * time.Minute}
+		job.mu.Lock()
+		job.status = jobStatusDone
+		job.phase = jobPhaseDone
+		job.finishedAt = time.Now().UTC()
+		job.pages = 7
+		job.result = []Page{{URL: "https://example.com/", StatusCode: 200}}
+		job.truncated = true
+		job.limitReason = "max_pages reached"
+		job.auditReady = true
+		job.auditInclusiveError = "inclusive failed"
+		job.mu.Unlock()
+
+		out := callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": job.id})
+		if out["truncated"] != true {
+			t.Fatalf("truncated = %v, want true", out["truncated"])
+		}
+		if out["limit_reason"] != "max_pages reached" {
+			t.Fatalf("limit_reason = %v, want max_pages reached", out["limit_reason"])
+		}
+		if out["status"] != jobStatusDone {
+			t.Fatalf("status = %v, want done even when the audit is partial", out["status"])
+		}
+
+		limits := nestedObject(t, out, "limits")
+		assertNumber(t, "limits.max_pages", limits["max_pages"], 10)
+		assertNumber(t, "limits.max_depth", limits["max_depth"], 2)
+		assertNumber(t, "limits.max_duration_seconds", limits["max_duration_seconds"], 120)
+
+		audit := nestedObject(t, out, "audit")
+		if audit["enabled"] != true {
+			t.Fatalf("audit.enabled = %v, want true", audit["enabled"])
+		}
+		if audit["state"] != "partial" {
+			t.Fatalf("audit.state = %v, want partial", audit["state"])
+		}
+		strict := nestedObject(t, audit, "strict")
+		if strict["ready"] != true {
+			t.Fatalf("audit.strict.ready = %v, want true", strict["ready"])
+		}
+		inclusive := nestedObject(t, audit, "inclusive")
+		if inclusive["ready"] != false {
+			t.Fatalf("audit.inclusive.ready = %v, want false", inclusive["ready"])
+		}
+		if inclusive["error"] != "inclusive failed" {
+			t.Fatalf("audit.inclusive.error = %v, want inclusive failed", inclusive["error"])
+		}
+
+		artifacts := nestedObject(t, out, "artifacts")
+		if artifacts["csv_ready"] != true {
+			t.Fatalf("artifacts.csv_ready = %v, want true", artifacts["csv_ready"])
+		}
+		if artifacts["audit_strict_ready"] != true {
+			t.Fatalf("artifacts.audit_strict_ready = %v, want true", artifacts["audit_strict_ready"])
+		}
+		if artifacts["audit_inclusive_ready"] != false {
+			t.Fatalf("artifacts.audit_inclusive_ready = %v, want false", artifacts["audit_inclusive_ready"])
+		}
+	})
+
+	t.Run("audit is pending while the crawl runs", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		job := app.jobs.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{
+			Mode:     1,
+			StartURL: "https://example.com",
+			Audit:    true,
+		})
+
+		out := callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": job.id})
+		audit := nestedObject(t, out, "audit")
+		if audit["enabled"] != true {
+			t.Fatalf("audit.enabled = %v, want true", audit["enabled"])
+		}
+		if audit["state"] != "pending" {
+			t.Fatalf("audit.state = %v, want pending", audit["state"])
+		}
+		if strict, ok := audit["strict"]; !ok || strict != nil {
+			t.Fatalf("audit.strict = %v, want null before the audit starts", audit["strict"])
+		}
+		if inclusive, ok := audit["inclusive"]; !ok || inclusive != nil {
+			t.Fatalf("audit.inclusive = %v, want null before the audit starts", audit["inclusive"])
+		}
+	})
+
+	t.Run("unknown and UI job IDs are indistinguishable", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		uiJob := app.jobs.createWithOwner(ownerUI, "spider", "https://example.com", WizardSettings{
+			Mode:     1,
+			StartURL: "https://example.com",
+		})
+
+		for _, jobID := range []string{"00000000000000000000000000000000", uiJob.id} {
+			res := callTool(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+			if !res.IsError {
+				t.Fatalf("get_job(%q) succeeded, want job_not_found", jobID)
+			}
+			text := strings.ToLower(toolResultText(res))
+			if !strings.Contains(text, "job_not_found") {
+				t.Fatalf("get_job(%q) error = %q, want job_not_found", jobID, text)
+			}
+			if strings.Contains(text, "ui") {
+				t.Fatalf("get_job(%q) discloses the job owner: %q", jobID, text)
+			}
+		}
+	})
+
+	t.Run("missing job_id is invalid", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		_, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		for _, args := range []map[string]any{{}, {"job_id": "   "}} {
+			res := callTool(t, ctx, session, "get_job", args)
+			if !res.IsError {
+				t.Fatal("get_job accepted a missing job_id")
+			}
+			if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "invalid_argument") {
+				t.Fatalf("error = %q, want invalid_argument", text)
+			}
 		}
 	})
 }

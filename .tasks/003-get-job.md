@@ -1,7 +1,7 @@
 ---
 id: task-003
 title: "[Slice] Agent polls job status, phase, and progress"
-status: pending
+status: completed
 depends_on: ["task-002"]
 target_files:
   - "mcp_tools.go"

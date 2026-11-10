@@ -60,6 +60,7 @@ type crawlJob struct {
 	truncated   bool
 	limitReason string
 
+	auditStarted bool
 	auditReady   bool
 	auditError   string
 	auditSummary auditpkg.AuditSummary
@@ -93,7 +94,6 @@ func (jm *jobManager) createWithOwner(owner, mode, target string, s WizardSettin
 		owner:     owner,
 		status:    jobStatusRunning,
 		phase:     jobPhaseStarting,
-		startedAt: now,
 		settings:  s,
 	}
 	jm.mu.Lock()
@@ -209,11 +209,26 @@ func (j *crawlJob) setPhase(phase string) {
 	}
 }
 
+// beginAudit marks the start of the audit pipeline so polling can distinguish
+// a pending audit from one that is running.
+func (j *crawlJob) beginAudit() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.auditStarted = true
+}
+
 // statusPhase returns a consistent status/phase pair for polling.
 func (j *crawlJob) statusPhase() (status, phase string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.status, j.phase
+}
+
+// ownedBy reports whether the job belongs to the given owner.
+func (j *crawlJob) ownedBy(owner string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.owner == owner
 }
 
 func (j *crawlJob) progress(url string) {
@@ -331,6 +346,119 @@ func (j *crawlJob) view() jobView {
 		AuditInclusiveLinks:   j.auditInclusiveSummary.ContentLinkOccurrences,
 		AuditInclusiveOrphans: j.auditInclusiveSummary.Orphans,
 	}
+}
+
+// statusSnapshot copies every pollable job field under the job mutex and maps
+// it to the get_job DTO. Handlers must not read mutable job fields directly.
+func (j *crawlJob) statusSnapshot() getJobOutput {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	out := getJobOutput{
+		JobID:        j.id,
+		Mode:         j.mode,
+		Target:       j.target,
+		Status:       j.status,
+		Phase:        j.phase,
+		CreatedAt:    rfc3339UTC(j.createdAt),
+		StartedAt:    rfc3339UTC(j.startedAt),
+		FinishedAt:   rfc3339UTC(j.finishedAt),
+		PagesCrawled: j.pages,
+		CurrentURL:   j.currentURL,
+		Keywords:     splitJobKeywords(j.settings.KeywordsRaw),
+		Truncated:    j.truncated,
+		LimitReason:  j.limitReason,
+		Limits: getJobLimits{
+			MaxPages:           j.limits.MaxPages,
+			MaxDepth:           j.limits.MaxDepth,
+			MaxDurationSeconds: int(j.limits.MaxDuration / time.Second),
+		},
+		Audit: getJobAudit{
+			Enabled: j.settings.Audit,
+			State: auditStateFor(
+				j.settings.Audit,
+				j.status,
+				j.auditStarted,
+				j.auditReady,
+				j.auditError,
+				j.auditInclusiveReady,
+				j.auditInclusiveError,
+			),
+		},
+		Artifacts: getJobArtifacts{
+			CSVReady:            j.status == jobStatusDone && len(j.result) > 0,
+			AuditStrictReady:    j.auditReady,
+			AuditInclusiveReady: j.auditInclusiveReady,
+		},
+	}
+	if j.settings.Audit {
+		if j.auditReady || j.auditError != "" {
+			out.Audit.Strict = &getJobAuditProfile{Ready: j.auditReady, Error: j.auditError}
+		}
+		if j.auditInclusiveReady || j.auditInclusiveError != "" {
+			out.Audit.Inclusive = &getJobAuditProfile{Ready: j.auditInclusiveReady, Error: j.auditInclusiveError}
+		}
+	}
+	if j.errMsg != "" {
+		msg := j.errMsg
+		out.Error = &msg
+	}
+	return out
+}
+
+// rfc3339UTC formats a timestamp for the polling DTO, or nil when unset.
+func rfc3339UTC(t time.Time) *string {
+	if t.IsZero() {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339)
+	return &s
+}
+
+// splitJobKeywords returns the job's parsed keyword list, never nil.
+func splitJobKeywords(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{}
+	}
+	parts := strings.Split(raw, "|")
+	keywords := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if keyword := strings.TrimSpace(part); keyword != "" {
+			keywords = append(keywords, keyword)
+		}
+	}
+	return keywords
+}
+
+// auditStateFor maps a consistent job snapshot to one audit state value. Audit
+// failures stay separate from crawl status.
+func auditStateFor(enabled bool, status string, started, strictReady bool, strictErr string, inclusiveReady bool, inclusiveErr string) string {
+	if !enabled {
+		return auditStateDisabled
+	}
+	if strictErr != "" {
+		return auditStateError
+	}
+	if strictReady {
+		switch {
+		case inclusiveErr != "":
+			return auditStatePartial
+		case inclusiveReady:
+			return auditStateReady
+		}
+	}
+	if status == jobStatusRunning {
+		if started {
+			return auditStateRunning
+		}
+		return auditStatePending
+	}
+	if status == jobStatusDone {
+		// A completed crawl with the audit enabled produced no report and no
+		// stored audit error: surface that as an audit failure.
+		return auditStateError
+	}
+	return auditStatePending
 }
 
 func newJobID() string {
@@ -574,6 +702,7 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 	}
 
 	if settings.Audit {
+		job.beginAudit()
 		result, auditErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
 		if auditErr != nil {
 			job.finishWithAuditError(pages, fmt.Errorf("internal linking audit: %w", auditErr))

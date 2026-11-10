@@ -28,6 +28,16 @@ const (
 	jobPhaseError    = "error"
 )
 
+// Audit lifecycle states reported by get_job.
+const (
+	auditStateDisabled = "disabled"
+	auditStatePending  = "pending"
+	auditStateRunning  = "running"
+	auditStateReady    = "ready"
+	auditStateError    = "error"
+	auditStatePartial  = "partial"
+)
+
 // defaultPollAfterMS is the polling hint returned by start_crawl.
 const defaultPollAfterMS = 1000
 
@@ -80,4 +90,61 @@ func jobLinks(cfg MCPConfig, id string) startCrawlLinks {
 		AuditStrictZIP:    crawlPath + "/audit/bundle.zip",
 		AuditInclusiveZIP: crawlPath + "/audit/inclusive/bundle.zip",
 	}
+}
+
+// getJobInput is the typed input for the get_job polling tool. job_id is
+// validated by the handler so a missing value follows the invalid_argument
+// error contract instead of the SDK's schema error.
+type getJobInput struct {
+	JobID string `json:"job_id,omitempty" jsonschema:"job ID returned by start_crawl"`
+}
+
+// getJobLimits describes the effective caps a job is running with.
+type getJobLimits struct {
+	MaxPages           int `json:"max_pages"`
+	MaxDepth           int `json:"max_depth"`
+	MaxDurationSeconds int `json:"max_duration_seconds"`
+}
+
+// getJobAuditProfile is the readiness of one audit profile.
+type getJobAuditProfile struct {
+	Ready bool   `json:"ready"`
+	Error string `json:"error,omitempty"`
+}
+
+// getJobAudit is the read-only audit state attached to a job status.
+type getJobAudit struct {
+	Enabled   bool                `json:"enabled"`
+	State     string              `json:"state"`
+	Strict    *getJobAuditProfile `json:"strict"`
+	Inclusive *getJobAuditProfile `json:"inclusive"`
+}
+
+// getJobArtifacts reports which download artifacts are ready.
+type getJobArtifacts struct {
+	CSVReady            bool `json:"csv_ready"`
+	AuditStrictReady    bool `json:"audit_strict_ready"`
+	AuditInclusiveReady bool `json:"audit_inclusive_ready"`
+}
+
+// getJobOutput is the typed output for get_job. It deliberately excludes
+// page rows, audit reports, search matches, and artifact payloads.
+type getJobOutput struct {
+	JobID        string          `json:"job_id"`
+	Mode         string          `json:"mode"`
+	Target       string          `json:"target"`
+	Status       string          `json:"status"`
+	Phase        string          `json:"phase"`
+	CreatedAt    *string         `json:"created_at"`
+	StartedAt    *string         `json:"started_at"`
+	FinishedAt   *string         `json:"finished_at"`
+	PagesCrawled int             `json:"pages_crawled"`
+	CurrentURL   string          `json:"current_url"`
+	Keywords     []string        `json:"keywords"`
+	Truncated    bool            `json:"truncated"`
+	LimitReason  string          `json:"limit_reason,omitempty"`
+	Limits       getJobLimits    `json:"limits"`
+	Audit        getJobAudit     `json:"audit"`
+	Error        *string         `json:"error"`
+	Artifacts    getJobArtifacts `json:"artifacts"`
 }
