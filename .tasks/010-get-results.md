@@ -1,7 +1,7 @@
 ---
 id: task-010
 title: "[Slice] Agent retrieves filtered and paginated crawl results"
-status: pending
+status: completed
 depends_on: ["task-009"]
 target_files:
   - "mcp_tools.go"

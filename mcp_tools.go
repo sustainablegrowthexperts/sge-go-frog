@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	auditpkg "go-frog/internal/audit"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -38,6 +44,16 @@ func (s *mcpServer) registerTools() {
 			OpenWorldHint:  boolPtr(false),
 		},
 	}, s.listJobs)
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "get_results",
+		Description: "Retrieve filtered, sorted, and paginated page rows for a completed MCP job, with keyword counts, summary counts, optional manifest depth, and an optional strict-audit join.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+			OpenWorldHint:  boolPtr(false),
+		},
+	}, s.getResults)
 }
 
 // startCrawlPlan is the validated request shared by job creation and launch.
@@ -214,6 +230,464 @@ func listJobsSummary(out listJobsOutput) string {
 	summary := fmt.Sprintf("%d job(s) found.", len(out.Jobs))
 	if out.Total > len(out.Jobs) {
 		summary = fmt.Sprintf("%d job(s) shown of %d.", len(out.Jobs), out.Total)
+	}
+	if out.HasMore && out.NextOffset != nil {
+		summary += fmt.Sprintf(" More pages available; next_offset is %d.", *out.NextOffset)
+	} else {
+		summary += " No more pages."
+	}
+	return summary
+}
+
+// getResults returns a deterministic page of page rows for a completed
+// MCP-owned job. It filters first, computes the filtered total, sorts, then
+// paginates. The manifest and strict audit are joined only when available.
+func (s *mcpServer) getResults(_ context.Context, _ *mcp.CallToolRequest, in getResultsInput) (*mcp.CallToolResult, getResultsOutput, error) {
+	if err := s.checkToolRateLimit(); err != nil {
+		return nil, getResultsOutput{}, err
+	}
+
+	jobID := strings.TrimSpace(in.JobID)
+	if jobID == "" {
+		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: job_id is required")
+	}
+
+	job := s.jobs.get(jobID)
+	if job == nil || !job.ownedBy(ownerMCP) {
+		return nil, getResultsOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	}
+
+	statusCodes, err := parseStatusCodeFilter(in.StatusCode)
+	if err != nil {
+		return nil, getResultsOutput{}, err
+	}
+
+	sortField := strings.TrimSpace(in.Sort)
+	if sortField == "" {
+		sortField = "url"
+	}
+	if err := validateJobEnum("sort", sortField, getResultsSorts); err != nil {
+		return nil, getResultsOutput{}, err
+	}
+	order := strings.TrimSpace(in.Order)
+	if order == "" {
+		if sortField == "url" {
+			order = "asc"
+		} else {
+			order = "desc"
+		}
+	}
+	if err := validateJobEnum("order", order, getResultsOrders); err != nil {
+		return nil, getResultsOutput{}, err
+	}
+
+	if in.Offset < 0 {
+		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: offset must be non-negative")
+	}
+
+	limit := in.Limit
+	switch {
+	case limit == 0:
+		limit = defaultGetResultsLimit
+	case limit < 0:
+		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: limit must be non-negative")
+	case limit > maxGetResultsLimit:
+		limit = maxGetResultsLimit
+	}
+
+	keyword := strings.TrimSpace(in.Keyword)
+	if in.MinKeywordHits < 0 {
+		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: min_keyword_hits must be non-negative")
+	}
+	if in.MinKeywordHits > 0 && keyword == "" {
+		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: min_keyword_hits requires keyword")
+	}
+	if sortField == "keyword_hits" && keyword == "" {
+		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: keyword is required when sort is keyword_hits")
+	}
+
+	state := job.resultsSnapshot()
+	if state.status != jobStatusDone {
+		return nil, getResultsOutput{}, fmt.Errorf("job_not_finished: job %q is %s; results are available only when the job is done", jobID, state.status)
+	}
+
+	keywords := splitJobKeywords(state.keywordsRaw)
+	keywordIndex := -1
+	if keyword != "" {
+		for i, candidate := range keywords {
+			if strings.EqualFold(candidate, keyword) {
+				keywordIndex = i
+				keyword = candidate
+				break
+			}
+		}
+		if keywordIndex < 0 {
+			return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: keyword must be one of the job keywords: %s", strings.Join(keywords, ", "))
+		}
+	}
+
+	var auditResult *auditpkg.Result
+	if in.IncludeAudit {
+		if !state.auditReady {
+			return nil, getResultsOutput{}, fmt.Errorf("audit_not_available: strict audit is not ready for job %q", jobID)
+		}
+		auditResult, err = loadStrictAuditResult(state.auditDir)
+		if err != nil {
+			// Never echo the loader error: it contains the on-disk path.
+			return nil, getResultsOutput{}, fmt.Errorf("audit_not_available: strict audit could not be loaded for job %q", jobID)
+		}
+	}
+
+	manifest := loadResultsManifest(state.archiveDir)
+
+	filtered := filterResultsRows(state.pages, resultsRowFilter{
+		statusCodes:    statusCodes,
+		urlContains:    strings.TrimSpace(in.URLContains),
+		titleContains:  strings.TrimSpace(in.TitleContains),
+		keywordIndex:   keywordIndex,
+		minKeywordHits: in.MinKeywordHits,
+	})
+	sortResultsRows(filtered, sortField, order, keywordIndex)
+
+	total := len(filtered)
+	out := getResultsOutput{
+		JobID:   jobID,
+		Total:   total,
+		Offset:  in.Offset,
+		Limit:   limit,
+		Summary: buildResultsSummary(filtered, keywords),
+		Rows:    make([]getResultsRow, 0, limit),
+	}
+
+	start, end := paginateResults(total, in.Offset, limit)
+
+	// Account for the response size in one place. The fixed overhead covers
+	// the envelope and summary; each row is measured as it is added.
+	budget := int(s.config.Limits.withDefaults().MaxResponseBytes)
+	used := getResultsResponseOverhead
+	for _, page := range filtered[start:end] {
+		row := buildResultsRow(page, keywords, manifest, auditResult)
+		rowBytes, err := json.Marshal(row)
+		if err != nil {
+			return nil, getResultsOutput{}, fmt.Errorf("internal_error: encode result row: %v", err)
+		}
+		if used+len(rowBytes)+1 > budget {
+			out.Summary.Truncated = true
+			break
+		}
+		used += len(rowBytes) + 1
+		out.Rows = append(out.Rows, row)
+	}
+
+	out.HasMore = out.Offset+len(out.Rows) < total
+	if out.HasMore {
+		next := out.Offset + len(out.Rows)
+		out.NextOffset = &next
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: getResultsSummaryText(out)}},
+	}, out, nil
+}
+
+// getResultsResponseOverhead reserves envelope and summary bytes when applying
+// the response cap.
+const getResultsResponseOverhead = 512
+
+// resultsJobSnapshot is one consistent copy of the job fields get_results
+// needs. It is taken under the job mutex so a completing crawl cannot mix
+// status, keywords, and rows from different moments.
+type resultsJobSnapshot struct {
+	status      string
+	keywordsRaw string
+	archiveDir  string
+	auditDir    string
+	auditReady  bool
+	pages       []Page
+}
+
+func (j *crawlJob) resultsSnapshot() resultsJobSnapshot {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return resultsJobSnapshot{
+		status:      j.status,
+		keywordsRaw: j.settings.KeywordsRaw,
+		archiveDir:  j.settings.AuditArchiveDir,
+		auditDir:    j.auditDir,
+		auditReady:  j.auditReady,
+		pages:       append([]Page(nil), j.result...),
+	}
+}
+
+// resultsRowFilter is the pure input for filterResultsRows.
+type resultsRowFilter struct {
+	statusCodes    []int
+	urlContains    string
+	titleContains  string
+	keywordIndex   int
+	minKeywordHits int
+}
+
+// filterResultsRows copies and filters the rows. String filters are
+// case-insensitive substrings; keywordIndex < 0 means no keyword filter.
+func filterResultsRows(pages []Page, filter resultsRowFilter) []Page {
+	out := make([]Page, 0, len(pages))
+	urlNeedle := strings.ToLower(filter.urlContains)
+	titleNeedle := strings.ToLower(filter.titleContains)
+	for _, page := range pages {
+		if len(filter.statusCodes) > 0 && !slices.Contains(filter.statusCodes, page.StatusCode) {
+			continue
+		}
+		if urlNeedle != "" && !strings.Contains(strings.ToLower(page.URL), urlNeedle) {
+			continue
+		}
+		if titleNeedle != "" && !strings.Contains(strings.ToLower(page.Title), titleNeedle) {
+			continue
+		}
+		if filter.keywordIndex >= 0 {
+			// Selecting a keyword means "pages that contain it"; the explicit
+			// minimum raises that floor.
+			minimum := filter.minKeywordHits
+			if minimum < 1 {
+				minimum = 1
+			}
+			if keywordHitsAt(page, filter.keywordIndex) < minimum {
+				continue
+			}
+		}
+		out = append(out, page)
+	}
+	return out
+}
+
+// sortResultsRows sorts in place by the requested field and order. URL is the
+// deterministic tie-breaker for every field, always ascending.
+func sortResultsRows(pages []Page, field, order string, keywordIndex int) {
+	sort.SliceStable(pages, func(i, j int) bool {
+		left, right := pages[i], pages[j]
+		cmp := 0
+		switch field {
+		case "status_code":
+			cmp = left.StatusCode - right.StatusCode
+		case "load_time":
+			switch {
+			case left.LoadTime < right.LoadTime:
+				cmp = -1
+			case left.LoadTime > right.LoadTime:
+				cmp = 1
+			}
+		case "keyword_hits":
+			cmp = keywordHitsAt(left, keywordIndex) - keywordHitsAt(right, keywordIndex)
+		default: // url
+			cmp = strings.Compare(left.URL, right.URL)
+		}
+		if cmp == 0 {
+			return left.URL < right.URL
+		}
+		if order == "desc" {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+}
+
+// keywordHitsAt returns a keyword count, treating missing slots as zero.
+func keywordHitsAt(page Page, index int) int {
+	if index < 0 || index >= len(page.KeywordHits) {
+		return 0
+	}
+	return page.KeywordHits[index]
+}
+
+// buildResultsSummary counts the filtered set before pagination and the byte
+// cap, so summary.pages and by_status always describe the full match set.
+func buildResultsSummary(filtered []Page, keywords []string) getResultsSummary {
+	byStatus := make(map[string]int)
+	for _, page := range filtered {
+		byStatus[strconv.Itoa(page.StatusCode)]++
+	}
+	return getResultsSummary{
+		Pages:    len(filtered),
+		ByStatus: byStatus,
+		Keywords: append([]string{}, keywords...),
+	}
+}
+
+// resultsManifest indexes a job archive's manifest for depth/discovery joins.
+type resultsManifest struct {
+	byURL       map[string]auditpkg.ManifestEntry
+	byCanonical map[string]auditpkg.ManifestEntry
+}
+
+// loadResultsManifest reads manifest.json when the job has an archive. A
+// missing or malformed manifest simply omits depth/discovery; it never fails
+// the read.
+func loadResultsManifest(dir string) *resultsManifest {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil
+	}
+	archive, err := auditpkg.LoadArchive(filepath.Clean(dir))
+	if err != nil {
+		return nil
+	}
+	lookup := &resultsManifest{
+		byURL:       make(map[string]auditpkg.ManifestEntry, len(archive.Manifest.Entries)),
+		byCanonical: make(map[string]auditpkg.ManifestEntry, len(archive.Manifest.Entries)),
+	}
+	for _, entry := range archive.Manifest.Entries {
+		lookup.byURL[entry.URL] = entry
+		if canonical, ok := auditpkg.CanonicalURL(entry.URL, nil); ok {
+			if _, exists := lookup.byCanonical[canonical]; !exists {
+				lookup.byCanonical[canonical] = entry
+			}
+		}
+	}
+	return lookup
+}
+
+// lookup finds an entry by exact URL first, then by the audit-normalized form
+// so http/https and www/apex variations still join.
+func (m *resultsManifest) lookup(rawURL string) (auditpkg.ManifestEntry, bool) {
+	if m == nil {
+		return auditpkg.ManifestEntry{}, false
+	}
+	if entry, ok := m.byURL[rawURL]; ok {
+		return entry, true
+	}
+	canonical, ok := auditpkg.CanonicalURL(rawURL, nil)
+	if !ok {
+		return auditpkg.ManifestEntry{}, false
+	}
+	entry, ok := m.byCanonical[canonical]
+	return entry, ok
+}
+
+// paginateResults clamps an offset/limit window to the filtered total. An
+// offset past the end yields an empty but valid window at the end.
+func paginateResults(total, offset, limit int) (start, end int) {
+	start = offset
+	if start > total {
+		start = total
+	}
+	if start < 0 {
+		start = 0
+	}
+	end = start + limit
+	if end > total {
+		end = total
+	}
+	if end < start {
+		end = start
+	}
+	return start, end
+}
+
+// buildResultsRow maps one Page to the public row DTO, adding the keyword map
+// in job order and the optional manifest/audit joins.
+func buildResultsRow(page Page, keywords []string, manifest *resultsManifest, auditResult *auditpkg.Result) getResultsRow {
+	counts := make(map[string]int, len(keywords))
+	for i, keyword := range keywords {
+		counts[keyword] = keywordHitsAt(page, i)
+	}
+	row := getResultsRow{
+		URL:         page.URL,
+		StatusCode:  page.StatusCode,
+		LoadTimeMS:  page.LoadTime.Milliseconds(),
+		ParentURL:   page.ParentURL,
+		InlinksRaw:  page.Inlinks,
+		Title:       page.Title,
+		Description: page.Description,
+		H1s:         append([]string{}, page.H1s...),
+		ImgAltsRaw:  page.ImgAlts,
+		Robots:      page.Robots,
+		Keywords:    counts,
+	}
+	if entry, ok := manifest.lookup(page.URL); ok {
+		depth := entry.Depth
+		row.Depth = &depth
+		row.DiscoveredVia = entry.DiscoveredVia
+	}
+	if auditResult != nil {
+		if auditPage, key, ok := strictAuditPage(auditResult, page.URL); ok {
+			row.Audit = getResultsAuditFromPage(auditPage, key)
+		}
+	}
+	return row
+}
+
+// parseStatusCodeFilter accepts a single JSON number or an array of them and
+// validates every value as an HTTP status code.
+func parseStatusCodeFilter(raw any) ([]int, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	var values []any
+	switch v := raw.(type) {
+	case []any:
+		values = v
+	case []int:
+		values = make([]any, len(v))
+		for i, n := range v {
+			values[i] = n
+		}
+	default:
+		values = []any{v}
+	}
+
+	out := make([]int, 0, len(values))
+	for _, value := range values {
+		code, ok := statusCodeValue(value)
+		if !ok {
+			return nil, fmt.Errorf("invalid_argument: status_code must be an integer or an array of integers")
+		}
+		if code < 100 || code > 599 {
+			return nil, fmt.Errorf("invalid_argument: status_code must be between 100 and 599")
+		}
+		out = append(out, code)
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+// statusCodeValue converts the decoded JSON number shapes into an integer
+// without silently truncating fractional values.
+func statusCodeValue(value any) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		n := int(v)
+		return n, float64(n) == v
+	case float32:
+		n := int(v)
+		return n, float32(n) == v
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
+	}
+}
+
+// getResultsSummaryText renders a short agent-facing summary of the page.
+func getResultsSummaryText(out getResultsOutput) string {
+	if out.Total == 0 {
+		return "No rows matched."
+	}
+	if len(out.Rows) == 0 {
+		return fmt.Sprintf("No rows in this window of %d matching rows.", out.Total)
+	}
+	summary := fmt.Sprintf("Showing rows %d-%d of %d.", out.Offset+1, out.Offset+len(out.Rows), out.Total)
+	if out.Summary.Truncated {
+		summary += " Response truncated at the size cap."
 	}
 	if out.HasMore && out.NextOffset != nil {
 		summary += fmt.Sprintf(" More pages available; next_offset is %d.", *out.NextOffset)

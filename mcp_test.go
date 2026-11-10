@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -2061,4 +2064,672 @@ func TestToolRateLimit(t *testing.T) {
 	// The clock is injectable: refilling for one second admits the next call.
 	clock.Advance(time.Second)
 	callToolObject(t, ctx, session, "list_jobs", nil)
+}
+
+// createDoneResultsJob seeds a completed MCP job with page rows. Tests use this
+// instead of a real crawl so filtering and pagination are deterministic.
+func createDoneResultsJob(t *testing.T, app *app, keywords string, pages []Page) *crawlJob {
+	t.Helper()
+	job := app.jobs.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{
+		Mode:        1,
+		StartURL:    "https://example.com",
+		KeywordsRaw: keywords,
+	})
+	job.mu.Lock()
+	job.status = jobStatusDone
+	job.phase = jobPhaseDone
+	job.finishedAt = time.Now().UTC()
+	job.result = append([]Page(nil), pages...)
+	job.pages = len(pages)
+	job.mu.Unlock()
+	return job
+}
+
+// resultRows reads the get_results "rows" array from structured content.
+func resultRows(t *testing.T, out map[string]any) []map[string]any {
+	t.Helper()
+	raw, ok := out["rows"].([]any)
+	if !ok {
+		t.Fatalf("rows = %v (%T), want an array", out["rows"], out["rows"])
+	}
+	rows := make([]map[string]any, 0, len(raw))
+	for i, item := range raw {
+		row, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("rows[%d] = %v (%T), want an object", i, item, item)
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// resultRowURLs extracts the URL column from a get_results page.
+func resultRowURLs(t *testing.T, out map[string]any) []string {
+	t.Helper()
+	rows := resultRows(t, out)
+	urls := make([]string, 0, len(rows))
+	for _, row := range rows {
+		url, _ := row["url"].(string)
+		urls = append(urls, url)
+	}
+	return urls
+}
+
+// TestGetResults covers the read contract:
+//   - only completed jobs are readable;
+//   - status/URL/title/keyword filters, sorting, and pagination are applied to
+//     the filtered set with totals computed before pagination;
+//   - keyword counts follow the job's parsed keyword order;
+//   - manifest depth/discovery is joined when an archive exists;
+//   - strict-audit metrics are joined by normalized URL;
+//   - the response byte cap sets truncated without corrupting has_more.
+func TestGetResults(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+	pages := []Page{
+		{
+			URL:         "https://example.com/blog/post",
+			StatusCode:  200,
+			LoadTime:    250 * time.Millisecond,
+			ParentURL:   "https://example.com/",
+			Inlinks:     `https://example.com/>"Home"`,
+			Title:       "Pricing Post",
+			Description: "A post about pricing",
+			H1s:         []string{"Pricing Post"},
+			ImgAlts:     `https://example.com/a.png>"A"`,
+			Robots:      "index, follow",
+			KeywordHits: []int{3, 1},
+		},
+		{
+			URL:         "https://example.com/about",
+			StatusCode:  200,
+			LoadTime:    100 * time.Millisecond,
+			ParentURL:   "https://example.com/",
+			Title:       "About",
+			Description: "About us",
+			H1s:         []string{"About us"},
+			Robots:      "index, follow",
+			KeywordHits: []int{0, 2},
+		},
+		{
+			URL:         "https://example.com/broken",
+			StatusCode:  404,
+			LoadTime:    50 * time.Millisecond,
+			Title:       "Missing Page",
+			Description: "Not found",
+			KeywordHits: []int{0, 0},
+		},
+		{
+			URL:         "https://example.com/pricing",
+			StatusCode:  301,
+			LoadTime:    75 * time.Millisecond,
+			Title:       "Pricing",
+			Description: "Plans",
+			KeywordHits: []int{5, 0},
+		},
+	}
+	job := createDoneResultsJob(t, app, "pricing|contact", pages)
+
+	t.Run("returns default url-sorted page", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": job.id})
+
+		if out["job_id"] != job.id {
+			t.Fatalf("job_id = %v, want %q", out["job_id"], job.id)
+		}
+		assertNumber(t, "total", out["total"], 4)
+		assertNumber(t, "offset", out["offset"], 0)
+		assertNumber(t, "limit", out["limit"], 100)
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false", out["has_more"])
+		}
+		if value, ok := out["next_offset"]; ok && value != nil {
+			t.Fatalf("next_offset = %v, want omitted when has_more is false", value)
+		}
+
+		wantURLs := []string{
+			"https://example.com/about",
+			"https://example.com/blog/post",
+			"https://example.com/broken",
+			"https://example.com/pricing",
+		}
+		if got := resultRowURLs(t, out); !slices.Equal(got, wantURLs) {
+			t.Fatalf("row URLs = %v, want %v", got, wantURLs)
+		}
+
+		summary := nestedObject(t, out, "summary")
+		assertNumber(t, "summary.pages", summary["pages"], 4)
+		if summary["truncated"] != false {
+			t.Fatalf("summary.truncated = %v, want false", summary["truncated"])
+		}
+		assertStringSlice(t, "summary.keywords", summary["keywords"], []string{"pricing", "contact"})
+		byStatus := nestedObject(t, summary, "by_status")
+		assertNumber(t, "by_status.200", byStatus["200"], 2)
+		assertNumber(t, "by_status.301", byStatus["301"], 1)
+		assertNumber(t, "by_status.404", byStatus["404"], 1)
+
+		rows := resultRows(t, out)
+		about := rows[0]
+		if about["url"] != "https://example.com/about" {
+			t.Fatalf("first url = %v", about["url"])
+		}
+		assertNumber(t, "status_code", about["status_code"], 200)
+		assertNumber(t, "load_time_ms", about["load_time_ms"], 100)
+		if about["parent_url"] != "https://example.com/" {
+			t.Fatalf("parent_url = %v", about["parent_url"])
+		}
+		if about["title"] != "About" {
+			t.Fatalf("title = %v", about["title"])
+		}
+		if about["description"] != "About us" {
+			t.Fatalf("description = %v", about["description"])
+		}
+		assertStringSlice(t, "h1s", about["h1s"], []string{"About us"})
+		if about["robots"] != "index, follow" {
+			t.Fatalf("robots = %v", about["robots"])
+		}
+		kw := nestedObject(t, about, "keywords")
+		assertNumber(t, "keywords.pricing", kw["pricing"], 0)
+		assertNumber(t, "keywords.contact", kw["contact"], 2)
+
+		post := rows[1]
+		if post["inlinks_raw"] != `https://example.com/>"Home"` {
+			t.Fatalf("inlinks_raw = %v", post["inlinks_raw"])
+		}
+		if post["img_alts_raw"] != `https://example.com/a.png>"A"` {
+			t.Fatalf("img_alts_raw = %v", post["img_alts_raw"])
+		}
+
+		if text := toolResultText(callTool(t, ctx, session, "get_results", map[string]any{"job_id": job.id})); !strings.Contains(text, "4") {
+			t.Fatalf("summary text %q does not mention the total", text)
+		}
+	})
+
+	t.Run("filters by status url title and keyword", func(t *testing.T) {
+		cases := []struct {
+			name string
+			args map[string]any
+			want []string
+		}{
+			{
+				name: "single status code",
+				args: map[string]any{"job_id": job.id, "status_code": 404},
+				want: []string{"https://example.com/broken"},
+			},
+			{
+				name: "multiple status codes",
+				args: map[string]any{"job_id": job.id, "status_code": []int{301, 404}},
+				want: []string{"https://example.com/broken", "https://example.com/pricing"},
+			},
+			{
+				name: "url contains is case-insensitive",
+				args: map[string]any{"job_id": job.id, "url_contains": "BLOG"},
+				want: []string{"https://example.com/blog/post"},
+			},
+			{
+				name: "title contains is case-insensitive",
+				args: map[string]any{"job_id": job.id, "title_contains": "pricing"},
+				want: []string{"https://example.com/blog/post", "https://example.com/pricing"},
+			},
+			{
+				name: "keyword without minimum",
+				args: map[string]any{"job_id": job.id, "keyword": "contact"},
+				want: []string{"https://example.com/about", "https://example.com/blog/post"},
+			},
+			{
+				name: "keyword with minimum hits",
+				args: map[string]any{"job_id": job.id, "keyword": "contact", "min_keyword_hits": 2},
+				want: []string{"https://example.com/about"},
+			},
+			{
+				name: "combined filters",
+				args: map[string]any{"job_id": job.id, "status_code": 200, "title_contains": "pricing"},
+				want: []string{"https://example.com/blog/post"},
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				out := callToolObject(t, ctx, session, "get_results", tc.args)
+				if got := resultRowURLs(t, out); !slices.Equal(got, tc.want) {
+					t.Fatalf("row URLs = %v, want %v", got, tc.want)
+				}
+				assertNumber(t, "total", out["total"], float64(len(tc.want)))
+				summary := nestedObject(t, out, "summary")
+				assertNumber(t, "summary.pages", summary["pages"], float64(len(tc.want)))
+			})
+		}
+	})
+
+	t.Run("sorts with deterministic url tie-breaks", func(t *testing.T) {
+		cases := []struct {
+			name string
+			args map[string]any
+			want []string
+		}{
+			{
+				name: "load time defaults to descending",
+				args: map[string]any{"job_id": job.id, "sort": "load_time"},
+				want: []string{
+					"https://example.com/blog/post",
+					"https://example.com/about",
+					"https://example.com/pricing",
+					"https://example.com/broken",
+				},
+			},
+			{
+				name: "load time ascending",
+				args: map[string]any{"job_id": job.id, "sort": "load_time", "order": "asc"},
+				want: []string{
+					"https://example.com/broken",
+					"https://example.com/pricing",
+					"https://example.com/about",
+					"https://example.com/blog/post",
+				},
+			},
+			{
+				name: "status code descending",
+				args: map[string]any{"job_id": job.id, "sort": "status_code"},
+				want: []string{
+					"https://example.com/broken",
+					"https://example.com/pricing",
+					"https://example.com/about",
+					"https://example.com/blog/post",
+				},
+			},
+			{
+				name: "keyword hits descending",
+				args: map[string]any{"job_id": job.id, "sort": "keyword_hits", "keyword": "pricing"},
+				want: []string{
+					"https://example.com/pricing",
+					"https://example.com/blog/post",
+				},
+			},
+			{
+				name: "keyword hits ascending",
+				args: map[string]any{"job_id": job.id, "sort": "keyword_hits", "order": "asc", "keyword": "pricing"},
+				want: []string{
+					"https://example.com/blog/post",
+					"https://example.com/pricing",
+				},
+			},
+			{
+				name: "url descending",
+				args: map[string]any{"job_id": job.id, "sort": "url", "order": "desc"},
+				want: []string{
+					"https://example.com/pricing",
+					"https://example.com/broken",
+					"https://example.com/blog/post",
+					"https://example.com/about",
+				},
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				out := callToolObject(t, ctx, session, "get_results", tc.args)
+				if got := resultRowURLs(t, out); !slices.Equal(got, tc.want) {
+					t.Fatalf("row URLs = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("paginates filtered rows", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": job.id, "limit": 2, "offset": 1})
+		want := []string{"https://example.com/blog/post", "https://example.com/broken"}
+		if got := resultRowURLs(t, out); !slices.Equal(got, want) {
+			t.Fatalf("row URLs = %v, want %v", got, want)
+		}
+		assertNumber(t, "total", out["total"], 4)
+		assertNumber(t, "offset", out["offset"], 1)
+		assertNumber(t, "limit", out["limit"], 2)
+		if out["has_more"] != true {
+			t.Fatalf("has_more = %v, want true", out["has_more"])
+		}
+		assertNumber(t, "next_offset", out["next_offset"], 3)
+
+		out = callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": job.id, "offset": 10})
+		if got := resultRowURLs(t, out); len(got) != 0 {
+			t.Fatalf("row URLs = %v, want an empty page", got)
+		}
+		assertNumber(t, "total", out["total"], 4)
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false", out["has_more"])
+		}
+
+		out = callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": job.id, "limit": 1000})
+		assertNumber(t, "limit", out["limit"], 500)
+		if got := len(resultRows(t, out)); got != 4 {
+			t.Fatalf("rows = %d, want all 4", got)
+		}
+
+		out = callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": job.id, "limit": 1, "offset": 3})
+		if got := resultRowURLs(t, out); !slices.Equal(got, []string{"https://example.com/pricing"}) {
+			t.Fatalf("last row URLs = %v", got)
+		}
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false on the last page", out["has_more"])
+		}
+	})
+
+	t.Run("rejects jobs that are not complete", func(t *testing.T) {
+		for _, status := range []string{jobStatusRunning, jobStatusQueued, jobStatusError} {
+			running := app.jobs.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{Mode: 1, StartURL: "https://example.com"})
+			running.mu.Lock()
+			running.status = status
+			running.phase = jobPhaseCrawling
+			running.result = []Page{{URL: "https://example.com/partial"}}
+			running.mu.Unlock()
+
+			res := callTool(t, ctx, session, "get_results", map[string]any{"job_id": running.id})
+			if !res.IsError {
+				t.Fatalf("get_results accepted a %s job", status)
+			}
+			if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "job_not_finished") {
+				t.Fatalf("error text = %q, want job_not_finished", text)
+			}
+		}
+	})
+
+	t.Run("joins manifest depth and discovery", func(t *testing.T) {
+		dir := t.TempDir()
+		manifest := auditpkg.Manifest{
+			ArchiveMeta: auditpkg.ArchiveMeta{
+				Version:   auditpkg.ArchiveVersion,
+				StartURL:  "https://example.com/",
+				Host:      "example.com",
+				Mode:      "spider",
+				StartedAt: time.Now().UTC(),
+			},
+			Entries: []auditpkg.ManifestEntry{
+				{URL: "https://example.com/about", StatusCode: 200, Depth: 1, DiscoveredVia: "start"},
+				{URL: "https://example.com/blog/post", StatusCode: 200, Depth: 2, DiscoveredVia: "link"},
+			},
+		}
+		data, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatalf("marshal manifest: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0o644); err != nil {
+			t.Fatalf("write manifest: %v", err)
+		}
+		job.mu.Lock()
+		job.settings.AuditArchiveDir = dir
+		job.mu.Unlock()
+
+		out := callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": job.id})
+		rows := resultRows(t, out)
+		if len(rows) != 4 {
+			t.Fatalf("rows = %d, want 4", len(rows))
+		}
+		assertNumber(t, "depth", rows[0]["depth"], 1)
+		if rows[0]["discovered_via"] != "start" {
+			t.Fatalf("discovered_via = %v, want start", rows[0]["discovered_via"])
+		}
+		assertNumber(t, "depth", rows[1]["depth"], 2)
+		if rows[1]["discovered_via"] != "link" {
+			t.Fatalf("discovered_via = %v, want link", rows[1]["discovered_via"])
+		}
+		for _, row := range rows[2:] {
+			if _, ok := row["depth"]; ok {
+				t.Fatalf("row %v has depth without a manifest entry", row["url"])
+			}
+			if _, ok := row["discovered_via"]; ok {
+				t.Fatalf("row %v has discovered_via without a manifest entry", row["url"])
+			}
+		}
+
+		job.mu.Lock()
+		job.settings.AuditArchiveDir = ""
+		job.mu.Unlock()
+	})
+
+	t.Run("joins strict audit by normalized url", func(t *testing.T) {
+		rawURL := "http://www.example.com/about/?utm_source=newsletter#top"
+		canonical, ok := auditpkg.CanonicalURL(rawURL, nil)
+		if !ok {
+			t.Fatalf("canonicalize %q", rawURL)
+		}
+		dir := t.TempDir()
+		report := auditpkg.Result{
+			Version:     auditpkg.ArchiveVersion,
+			StartURL:    "https://example.com/",
+			GeneratedAt: time.Now().UTC(),
+			Pages: map[string]*auditpkg.Page{
+				canonical: {
+					URL:                       canonical,
+					ContentInbound:            7,
+					ContentOutbound:           2,
+					ContentInboundUnique:      5,
+					ContentOutboundUnique:     2,
+					ContentInboundOccurrences: 7,
+					NavInbound:                3,
+					PageRank:                  0.42,
+					ContentOrphan:             false,
+					ContentReachableFromStart: true,
+					NavReachable:              true,
+					InSitemap:                 true,
+				},
+			},
+		}
+		data, err := json.Marshal(report)
+		if err != nil {
+			t.Fatalf("marshal audit: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "audit.json"), data, 0o644); err != nil {
+			t.Fatalf("write audit: %v", err)
+		}
+
+		auditJob := createDoneResultsJob(t, app, "", []Page{{
+			URL:        rawURL,
+			StatusCode: 200,
+			Title:      "About",
+		}})
+		auditJob.mu.Lock()
+		auditJob.settings.Audit = true
+		auditJob.auditReady = true
+		auditJob.auditDir = dir
+		auditJob.mu.Unlock()
+
+		out := callToolObject(t, ctx, session, "get_results", map[string]any{"job_id": auditJob.id, "include_audit": true})
+		rows := resultRows(t, out)
+		if len(rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(rows))
+		}
+		audit := nestedObject(t, rows[0], "audit")
+		if audit["page_key"] != canonical {
+			t.Fatalf("page_key = %v, want %q", audit["page_key"], canonical)
+		}
+		assertNumber(t, "content_inbound", audit["content_inbound"], 7)
+		assertNumber(t, "content_outbound", audit["content_outbound"], 2)
+		assertNumber(t, "pagerank", audit["pagerank"], 0.42)
+		if audit["content_reachable_from_start"] != true {
+			t.Fatalf("content_reachable_from_start = %v, want true", audit["content_reachable_from_start"])
+		}
+		if audit["nav_reachable"] != true {
+			t.Fatalf("nav_reachable = %v, want true", audit["nav_reachable"])
+		}
+		if audit["in_sitemap"] != true {
+			t.Fatalf("in_sitemap = %v, want true", audit["in_sitemap"])
+		}
+
+		notReady := createDoneResultsJob(t, app, "", []Page{{URL: "https://example.com/about", StatusCode: 200}})
+		notReady.mu.Lock()
+		notReady.settings.Audit = true
+		notReady.auditReady = false
+		notReady.mu.Unlock()
+		res := callTool(t, ctx, session, "get_results", map[string]any{"job_id": notReady.id, "include_audit": true})
+		if !res.IsError {
+			t.Fatal("get_results joined audit data for a job without a ready audit")
+		}
+		if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "audit_not_available") {
+			t.Fatalf("error text = %q, want audit_not_available", text)
+		}
+	})
+
+	t.Run("truncates oversized responses without corrupting has_more", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxResponseBytes = 1500
+		capApp, capSession := newMCPTestSession(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+		var many []Page
+		for i := 0; i < 20; i++ {
+			many = append(many, Page{
+				URL:         fmt.Sprintf("https://example.com/page-%02d", i),
+				StatusCode:  200,
+				Title:       strings.Repeat("t", 200),
+				Description: strings.Repeat("d", 400),
+			})
+		}
+		capJob := createDoneResultsJob(t, capApp, "", many)
+
+		out := callToolObject(t, ctx, capSession, "get_results", map[string]any{"job_id": capJob.id, "limit": 20})
+		rows := resultRows(t, out)
+		if len(rows) == 0 || len(rows) >= 20 {
+			t.Fatalf("rows = %d, want a non-empty page smaller than 20", len(rows))
+		}
+		assertNumber(t, "total", out["total"], 20)
+		summary := nestedObject(t, out, "summary")
+		if summary["truncated"] != true {
+			t.Fatalf("summary.truncated = %v, want true", summary["truncated"])
+		}
+		assertNumber(t, "summary.pages", summary["pages"], 20)
+		if out["has_more"] != true {
+			t.Fatalf("has_more = %v, want true after truncation", out["has_more"])
+		}
+		assertNumber(t, "next_offset", out["next_offset"], float64(len(rows)))
+
+		next := callToolObject(t, ctx, capSession, "get_results", map[string]any{
+			"job_id": capJob.id,
+			"limit":  20,
+			"offset": len(rows),
+		})
+		if got := len(resultRows(t, next)); got == 0 {
+			t.Fatal("the page after next_offset returned no rows")
+		}
+	})
+
+	t.Run("rejects invalid arguments", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			args    map[string]any
+			wantSub string
+		}{
+			{"missing job id", map[string]any{}, "job_id"},
+			{"unknown job", map[string]any{"job_id": "missing"}, "job_not_found"},
+			{"unknown keyword", map[string]any{"job_id": job.id, "keyword": "absent"}, "keyword"},
+			{"minimum without keyword", map[string]any{"job_id": job.id, "min_keyword_hits": 2}, "min_keyword_hits"},
+			{"negative minimum", map[string]any{"job_id": job.id, "keyword": "pricing", "min_keyword_hits": -1}, "min_keyword_hits"},
+			{"invalid sort", map[string]any{"job_id": job.id, "sort": "title"}, "sort"},
+			{"invalid order", map[string]any{"job_id": job.id, "order": "sideways"}, "order"},
+			{"keyword sort without keyword", map[string]any{"job_id": job.id, "sort": "keyword_hits"}, "keyword"},
+			{"negative offset", map[string]any{"job_id": job.id, "offset": -1}, "offset"},
+			{"negative limit", map[string]any{"job_id": job.id, "limit": -1}, "limit"},
+			{"invalid status code", map[string]any{"job_id": job.id, "status_code": "nope"}, "status_code"},
+			{"invalid status code value", map[string]any{"job_id": job.id, "status_code": -5}, "status_code"},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "get_results", tc.args)
+				if !res.IsError {
+					t.Fatalf("get_results accepted invalid input: %v", res.StructuredContent)
+				}
+				if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, tc.wantSub) {
+					t.Fatalf("error text %q does not mention %q", text, tc.wantSub)
+				}
+			})
+		}
+	})
+}
+
+// TestGetResultsHelpers exercises the pure filter, sort, and pagination helpers
+// directly so their edge cases stay covered independently of the MCP transport.
+func TestGetResultsHelpers(t *testing.T) {
+	basePages := func() []Page {
+		return []Page{
+			{URL: "https://example.com/blog/post", StatusCode: 200, LoadTime: 250 * time.Millisecond, Title: "Pricing Post", KeywordHits: []int{3, 1}},
+			{URL: "https://example.com/about", StatusCode: 200, LoadTime: 100 * time.Millisecond, Title: "About", KeywordHits: []int{0, 2}},
+			{URL: "https://example.com/broken", StatusCode: 404, LoadTime: 50 * time.Millisecond, Title: "Missing Page", KeywordHits: []int{0, 0}},
+			{URL: "https://example.com/pricing", StatusCode: 301, LoadTime: 75 * time.Millisecond, Title: "Pricing", KeywordHits: []int{5, 0}},
+		}
+	}
+	urls := func(pages []Page) []string {
+		out := make([]string, 0, len(pages))
+		for _, page := range pages {
+			out = append(out, page.URL)
+		}
+		return out
+	}
+
+	t.Run("filter", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			filter resultsRowFilter
+			want   []string
+		}{
+			{"status codes", resultsRowFilter{statusCodes: []int{301, 404}, keywordIndex: -1}, []string{"https://example.com/broken", "https://example.com/pricing"}},
+			{"url substring", resultsRowFilter{urlContains: "BLOG", keywordIndex: -1}, []string{"https://example.com/blog/post"}},
+			{"title substring", resultsRowFilter{titleContains: "pricing", keywordIndex: -1}, []string{"https://example.com/blog/post", "https://example.com/pricing"}},
+			{"keyword implies at least one hit", resultsRowFilter{keywordIndex: 1}, []string{"https://example.com/blog/post", "https://example.com/about"}},
+			{"keyword minimum", resultsRowFilter{keywordIndex: 1, minKeywordHits: 2}, []string{"https://example.com/about"}},
+			{"keyword minimum above all", resultsRowFilter{keywordIndex: 0, minKeywordHits: 9}, nil},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got := urls(filterResultsRows(basePages(), tc.filter))
+				if !slices.Equal(got, tc.want) {
+					t.Fatalf("filtered URLs = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("sort", func(t *testing.T) {
+		cases := []struct {
+			name         string
+			field        string
+			order        string
+			keywordIndex int
+			want         []string
+		}{
+			{"url ascending", "url", "asc", -1, []string{"https://example.com/about", "https://example.com/blog/post", "https://example.com/broken", "https://example.com/pricing"}},
+			{"load time descending", "load_time", "desc", -1, []string{"https://example.com/blog/post", "https://example.com/about", "https://example.com/pricing", "https://example.com/broken"}},
+			{"status code descending ties by url", "status_code", "desc", -1, []string{"https://example.com/broken", "https://example.com/pricing", "https://example.com/about", "https://example.com/blog/post"}},
+			{"keyword hits descending ties by url", "keyword_hits", "desc", 0, []string{"https://example.com/pricing", "https://example.com/blog/post", "https://example.com/about", "https://example.com/broken"}},
+			{"url descending", "url", "desc", -1, []string{"https://example.com/pricing", "https://example.com/broken", "https://example.com/blog/post", "https://example.com/about"}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				pages := basePages()
+				sortResultsRows(pages, tc.field, tc.order, tc.keywordIndex)
+				if got := urls(pages); !slices.Equal(got, tc.want) {
+					t.Fatalf("sorted URLs = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("pagination", func(t *testing.T) {
+		cases := []struct {
+			total, offset, limit int
+			wantStart, wantEnd   int
+		}{
+			{4, 0, 2, 0, 2},
+			{4, 1, 2, 1, 3},
+			{4, 3, 100, 3, 4},
+			{4, 10, 2, 4, 4},
+			{0, 0, 100, 0, 0},
+		}
+		for _, tc := range cases {
+			start, end := paginateResults(tc.total, tc.offset, tc.limit)
+			if start != tc.wantStart || end != tc.wantEnd {
+				t.Fatalf("paginateResults(%d, %d, %d) = (%d, %d), want (%d, %d)",
+					tc.total, tc.offset, tc.limit, start, end, tc.wantStart, tc.wantEnd)
+			}
+		}
+	})
 }

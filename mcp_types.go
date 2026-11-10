@@ -247,6 +247,96 @@ func jobSummaryFromStatus(out getJobOutput) jobSummary {
 	}
 }
 
+// get_results pagination defaults and the accepted sort/order values.
+const (
+	defaultGetResultsLimit = 100
+	maxGetResultsLimit     = 500
+)
+
+var (
+	getResultsSorts  = []string{"url", "status_code", "load_time", "keyword_hits"}
+	getResultsOrders = []string{"asc", "desc"}
+)
+
+// getResultsInput is the typed input for the get_results tool. StatusCode is
+// intentionally untyped so a client may send a single integer or an array;
+// the handler validates the shape and the status bounds.
+type getResultsInput struct {
+	JobID          string `json:"job_id,omitempty" jsonschema:"job ID returned by start_crawl"`
+	StatusCode     any    `json:"status_code,omitempty" jsonschema:"exact HTTP status code filter; a single integer or an array of integers"`
+	URLContains    string `json:"url_contains,omitempty" jsonschema:"case-insensitive URL substring filter"`
+	TitleContains  string `json:"title_contains,omitempty" jsonschema:"case-insensitive title substring filter"`
+	Keyword        string `json:"keyword,omitempty" jsonschema:"keyword to filter and count; must be one of the job keywords"`
+	MinKeywordHits int    `json:"min_keyword_hits,omitempty" jsonschema:"minimum keyword occurrences; used only with keyword"`
+	Sort           string `json:"sort,omitempty" jsonschema:"sort field: url, status_code, load_time, or keyword_hits; defaults to url"`
+	Order          string `json:"order,omitempty" jsonschema:"sort order: asc or desc; defaults to asc for url and desc for numeric fields"`
+	Offset         int    `json:"offset,omitempty" jsonschema:"number of matching rows to skip; defaults to 0"`
+	Limit          int    `json:"limit,omitempty" jsonschema:"maximum rows to return; defaults to 100 and is capped at 500"`
+	IncludeAudit   bool   `json:"include_audit,omitempty" jsonschema:"join strict-audit metrics by normalized URL when the audit is ready"`
+}
+
+// getResultsSummary is the aggregate view of the filtered row set. Pages is
+// the filtered total; Truncated is set only when the response byte cap stopped
+// rows from being serialized.
+type getResultsSummary struct {
+	Pages     int            `json:"pages"`
+	ByStatus  map[string]int `json:"by_status"`
+	Keywords  []string       `json:"keywords"`
+	Truncated bool           `json:"truncated"`
+}
+
+// getResultsAudit is the per-row strict-audit subset. PageKey is the audit's
+// graph identity, not the crawl row URL.
+type getResultsAudit struct {
+	PageKey                    string  `json:"page_key"`
+	ContentInbound             int     `json:"content_inbound"`
+	ContentOutbound            int     `json:"content_outbound"`
+	ContentInboundUnique       int     `json:"content_inbound_unique"`
+	ContentOutboundUnique      int     `json:"content_outbound_unique"`
+	ContentInboundOccurrences  int     `json:"content_inbound_occurrences"`
+	ContentOutboundOccurrences int     `json:"content_outbound_occurrences"`
+	NavInbound                 int     `json:"nav_inbound"`
+	PageRank                   float64 `json:"pagerank"`
+	IsOrphan                   bool    `json:"is_orphan"`
+	OrphanType                 string  `json:"orphan_type,omitempty"`
+	ContentOrphan              bool    `json:"content_orphan"`
+	ContentReachableFromStart  bool    `json:"content_reachable_from_start"`
+	NavReachable               bool    `json:"nav_reachable"`
+	InSitemap                  bool    `json:"in_sitemap"`
+	SitemapOnly                bool    `json:"sitemap_only"`
+}
+
+// getResultsRow is one page row with the optional manifest and audit joins.
+type getResultsRow struct {
+	URL           string           `json:"url"`
+	StatusCode    int              `json:"status_code"`
+	LoadTimeMS    int64            `json:"load_time_ms"`
+	ParentURL     string           `json:"parent_url"`
+	InlinksRaw    string           `json:"inlinks_raw"`
+	Title         string           `json:"title"`
+	Description   string           `json:"description"`
+	H1s           []string         `json:"h1s"`
+	ImgAltsRaw    string           `json:"img_alts_raw"`
+	Robots        string           `json:"robots"`
+	Keywords      map[string]int   `json:"keywords"`
+	Depth         *int             `json:"depth,omitempty"`
+	DiscoveredVia string           `json:"discovered_via,omitempty"`
+	Audit         *getResultsAudit `json:"audit,omitempty"`
+}
+
+// getResultsOutput is the typed output for get_results. Total is the filtered
+// count before pagination; NextOffset is present only when another page exists.
+type getResultsOutput struct {
+	JobID      string            `json:"job_id"`
+	Total      int               `json:"total"`
+	Offset     int               `json:"offset"`
+	Limit      int               `json:"limit"`
+	HasMore    bool              `json:"has_more"`
+	NextOffset *int              `json:"next_offset,omitempty"`
+	Summary    getResultsSummary `json:"summary"`
+	Rows       []getResultsRow   `json:"rows"`
+}
+
 // getJobOutput is the typed output for get_job. It deliberately excludes
 // page rows, audit reports, search matches, and artifact payloads.
 type getJobOutput struct {
