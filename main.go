@@ -15,26 +15,10 @@ import (
 const defaultConcurrency = 10
 
 const (
-	defaultMCPPath              = "/mcp"
-	defaultMCPJobTTL            = 24 * time.Hour
-	defaultMCPResultsDir        = "results"
-	defaultMCPMaxPages          = 5000
-	defaultMCPMaxDepth          = 10
-	defaultMCPMaxListURLs       = 1000
-	defaultMCPMaxDuration       = 30 * time.Minute
-	defaultMCPMaxConcurrentJobs = 4
-	defaultMCPMaxConcurrency    = 20
+	defaultMCPPath       = "/mcp"
+	defaultMCPJobTTL     = 24 * time.Hour
+	defaultMCPResultsDir = "results"
 )
-
-// MCPLimits holds the server-enforced caps for MCP-created jobs.
-type MCPLimits struct {
-	MaxPages          int
-	MaxDepth          int
-	MaxListURLs       int
-	MaxDuration       time.Duration
-	MaxConcurrentJobs int
-	MaxConcurrency    int
-}
 
 // MCPConfig is the configuration surface for the embedded MCP server. It is
 // populated from defaults, environment variables, and command-line flags, in
@@ -51,18 +35,11 @@ type MCPConfig struct {
 
 func defaultMCPConfig() MCPConfig {
 	return MCPConfig{
-		Enabled:    false,
-		Path:       defaultMCPPath,
-		JobTTL:     defaultMCPJobTTL,
-		ResultsDir: defaultMCPResultsDir,
-		Limits: MCPLimits{
-			MaxPages:          defaultMCPMaxPages,
-			MaxDepth:          defaultMCPMaxDepth,
-			MaxListURLs:       defaultMCPMaxListURLs,
-			MaxDuration:       defaultMCPMaxDuration,
-			MaxConcurrentJobs: defaultMCPMaxConcurrentJobs,
-			MaxConcurrency:    defaultMCPMaxConcurrency,
-		},
+		Enabled:         false,
+		Path:            defaultMCPPath,
+		JobTTL:          defaultMCPJobTTL,
+		ResultsDir:      defaultMCPResultsDir,
+		Limits:          defaultMCPLimits(),
 		DefaultArchive:  false,
 		ArtifactBaseURL: "",
 	}
@@ -135,6 +112,55 @@ func mcpConfigFromEnv(getenv func(string) string) (MCPConfig, error) {
 		}
 		cfg.Limits.MaxConcurrency = n
 	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_KEYWORDS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_KEYWORDS: %w", err)
+		}
+		cfg.Limits.MaxKeywords = n
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_KEYWORD_LENGTH")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_KEYWORD_LENGTH: %w", err)
+		}
+		cfg.Limits.MaxKeywordLength = n
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_URL_LENGTH")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_URL_LENGTH: %w", err)
+		}
+		cfg.Limits.MaxURLLength = n
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_RESPONSE_BYTES")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_RESPONSE_BYTES: %w", err)
+		}
+		cfg.Limits.MaxResponseBytes = n
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_REQUEST_BYTES")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_REQUEST_BYTES: %w", err)
+		}
+		cfg.Limits.MaxRequestBytes = n
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_MAX_SEARCH_LIMIT")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_MAX_SEARCH_LIMIT: %w", err)
+		}
+		cfg.Limits.MaxSearchLimit = n
+	}
+	if v := strings.TrimSpace(getenv("GOFROG_MCP_RATE_LIMIT")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("GOFROG_MCP_RATE_LIMIT: %w", err)
+		}
+		cfg.Limits.RateLimitPerMinute = n
+	}
 	if v := strings.TrimSpace(getenv("GOFROG_MCP_DEFAULT_ARCHIVE")); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -160,6 +186,13 @@ func (c *MCPConfig) registerFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.Limits.MaxDuration, "mcp-max-duration", c.Limits.MaxDuration, "maximum duration for an MCP job")
 	fs.IntVar(&c.Limits.MaxConcurrentJobs, "mcp-max-jobs", c.Limits.MaxConcurrentJobs, "maximum concurrent MCP jobs")
 	fs.IntVar(&c.Limits.MaxConcurrency, "mcp-max-concurrency", c.Limits.MaxConcurrency, "maximum request concurrency for an MCP crawl")
+	fs.IntVar(&c.Limits.MaxKeywords, "mcp-max-keywords", c.Limits.MaxKeywords, "maximum keywords per MCP crawl")
+	fs.IntVar(&c.Limits.MaxKeywordLength, "mcp-max-keyword-length", c.Limits.MaxKeywordLength, "maximum characters per MCP keyword")
+	fs.IntVar(&c.Limits.MaxURLLength, "mcp-max-url-length", c.Limits.MaxURLLength, "maximum URL length for MCP jobs")
+	fs.Int64Var(&c.Limits.MaxResponseBytes, "mcp-max-response-bytes", c.Limits.MaxResponseBytes, "maximum MCP response size in bytes")
+	fs.Int64Var(&c.Limits.MaxRequestBytes, "mcp-max-request-bytes", c.Limits.MaxRequestBytes, "maximum MCP request size in bytes")
+	fs.IntVar(&c.Limits.MaxSearchLimit, "mcp-max-search-limit", c.Limits.MaxSearchLimit, "maximum search results per MCP request")
+	fs.IntVar(&c.Limits.RateLimitPerMinute, "mcp-rate-limit", c.Limits.RateLimitPerMinute, "maximum MCP tool calls per minute")
 	fs.BoolVar(&c.DefaultArchive, "mcp-default-archive", c.DefaultArchive, "archive HTML by default for MCP jobs")
 	fs.StringVar(&c.ArtifactBaseURL, "mcp-artifact-base-url", c.ArtifactBaseURL, "public base URL for MCP artifacts")
 }

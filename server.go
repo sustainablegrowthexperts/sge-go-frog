@@ -778,9 +778,18 @@ func parseAuditFilters(r *http.Request, mode string, auditEnabled bool) *auditpk
 	if r.FormValue("audit_filters_explicit") != "1" {
 		return nil
 	}
+	return explicitAuditFilters(
+		auditpkg.SplitSubstrings(r.FormValue("audit_nav_substrings")),
+		auditpkg.SplitSubstrings(r.FormValue("audit_exclude_substrings")),
+	)
+}
+
+// explicitAuditFilters builds the replacement profile shared by the UI filter
+// editor and the MCP audit_filters input. Callers pass already-split lists.
+func explicitAuditFilters(nav, exclude []string) *auditpkg.FilterOptions {
 	return &auditpkg.FilterOptions{
-		NavSubstrings:     auditpkg.SplitSubstrings(r.FormValue("audit_nav_substrings")),
-		ExcludeSubstrings: auditpkg.SplitSubstrings(r.FormValue("audit_exclude_substrings")),
+		NavSubstrings:     append([]string(nil), nav...),
+		ExcludeSubstrings: append([]string(nil), exclude...),
 		Explicit:          true,
 	}
 }

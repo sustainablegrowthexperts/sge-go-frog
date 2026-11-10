@@ -65,12 +65,33 @@ type jobLimits struct {
 	MaxDuration time.Duration
 }
 
+// startCrawlAuditFilters replaces the auditor's default class filters when
+// explicit is true. A non-explicit object is ignored so callers never merge a
+// half-specified filter profile by accident.
+type startCrawlAuditFilters struct {
+	NavSubstrings     []string `json:"nav_substrings,omitempty" jsonschema:"replacement navigation class substrings; used only when explicit is true"`
+	ExcludeSubstrings []string `json:"exclude_substrings,omitempty" jsonschema:"replacement excluded class substrings; used only when explicit is true"`
+	Explicit          bool     `json:"explicit,omitempty" jsonschema:"when true the supplied lists replace defaults and config; when false they are ignored"`
+}
+
+// startCrawlLimits holds optional per-job caps. The server rejects values above
+// its configured maxima instead of silently clamping them.
+type startCrawlLimits struct {
+	MaxPages           *int `json:"max_pages,omitempty" jsonschema:"per-job page cap; cannot exceed the server maximum"`
+	MaxDepth           *int `json:"max_depth,omitempty" jsonschema:"per-job depth cap; cannot exceed the server maximum"`
+	MaxDurationSeconds *int `json:"max_duration_seconds,omitempty" jsonschema:"per-job duration cap in seconds; cannot exceed the server maximum"`
+}
+
 // startCrawlInput is the typed input for the start_crawl tool.
 type startCrawlInput struct {
-	Mode        string   `json:"mode" jsonschema:"crawl mode; only spider is supported in this slice"`
-	StartURL    string   `json:"start_url,omitempty" jsonschema:"starting URL for a spider crawl"`
-	Keywords    []string `json:"keywords,omitempty" jsonschema:"optional keywords whose occurrences are counted on each page"`
-	Concurrency int      `json:"concurrency,omitempty" jsonschema:"maximum concurrent requests; defaults to 10"`
+	Mode         string                  `json:"mode" jsonschema:"crawl mode: spider or list"`
+	StartURL     string                  `json:"start_url,omitempty" jsonschema:"starting URL for a spider crawl; spider mode only"`
+	URLs         []string                `json:"urls,omitempty" jsonschema:"URLs to visit once in list mode; deduplicated server-side"`
+	Keywords     []string                `json:"keywords,omitempty" jsonschema:"optional keywords whose occurrences are counted on each page"`
+	Concurrency  int                     `json:"concurrency,omitempty" jsonschema:"maximum concurrent requests; defaults to 10"`
+	Audit        bool                    `json:"audit,omitempty" jsonschema:"enable the strict and inclusive internal-linking audit; spider mode only"`
+	AuditFilters *startCrawlAuditFilters `json:"audit_filters,omitempty" jsonschema:"optional replacement audit filter profile; parsed only when explicit is true"`
+	Limits       *startCrawlLimits       `json:"limits,omitempty" jsonschema:"optional per-job page, depth, and duration caps"`
 }
 
 // startCrawlLinks holds the placeholder artifact links returned when a job
@@ -86,11 +107,13 @@ type startCrawlLinks struct {
 // the job as it exists immediately after launch.
 type startCrawlOutput struct {
 	JobID       string          `json:"job_id"`
+	Mode        string          `json:"mode"`
 	Status      string          `json:"status"`
 	Phase       string          `json:"phase"`
 	PollAfterMS int             `json:"poll_after_ms"`
 	Audit       bool            `json:"audit"`
 	ArchiveHTML bool            `json:"archive_html"`
+	Limits      getJobLimits    `json:"limits"`
 	Links       startCrawlLinks `json:"links"`
 }
 

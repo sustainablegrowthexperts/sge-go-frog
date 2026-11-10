@@ -1,7 +1,7 @@
 ---
 id: task-005
 title: "[Slice] Agent starts list and audited spider jobs with options"
-status: pending
+status: completed
 depends_on: ["task-004"]
 target_files:
   - "mcp_tools.go"

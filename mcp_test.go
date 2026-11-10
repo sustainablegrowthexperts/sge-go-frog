@@ -452,7 +452,8 @@ func TestStartCrawlSpider(t *testing.T) {
 			args    map[string]any
 			wantSub string
 		}{
-			{"non-spider mode", map[string]any{"mode": "list", "start_url": "example.com"}, "mode"},
+			{"unknown mode", map[string]any{"mode": "crawl", "start_url": "example.com"}, "mode"},
+			{"list mode without urls", map[string]any{"mode": "list", "start_url": "example.com"}, "start_url"},
 			{"missing start_url", map[string]any{"mode": "spider"}, "start_url"},
 			{"keyword with pipe", map[string]any{"mode": "spider", "start_url": "example.com", "keywords": []string{"a|b"}}, "keyword"},
 			{"empty keyword", map[string]any{"mode": "spider", "start_url": "example.com", "keywords": []string{"ok", "  "}}, "keyword"},
@@ -1012,6 +1013,353 @@ func TestGetJobStatus(t *testing.T) {
 			if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "invalid_argument") {
 				t.Fatalf("error = %q, want invalid_argument", text)
 			}
+		}
+	})
+}
+
+// TestStartCrawlOptions covers the task-005 contract:
+//   - list mode starts a job with deduplicated HTTP(S) URLs and a target summary;
+//   - spider jobs can enable the audit and replace the filter profile only when
+//     audit_filters.explicit is true;
+//   - audit is spider-only;
+//   - per-job limits are validated against server maxima, stored on the job, and
+//     returned in the start response;
+//   - keyword, URL, and list-size ceilings return invalid_argument naming the
+//     offending field.
+func TestStartCrawlOptions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	t.Run("list mode deduplicates urls", func(t *testing.T) {
+		runner := newImmediateFakeRunner([]Page{{URL: "https://example.com/a", StatusCode: 200}}, nil)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode": "list",
+			"urls": []string{
+				"https://example.com/a",
+				"https://example.com/a",
+				"example.com/b",
+				"https://example.com/c#fragment",
+			},
+		})
+
+		jobID, _ := out["job_id"].(string)
+		if jobID == "" {
+			t.Fatal("start_crawl did not return a job ID")
+		}
+		if out["mode"] != "list" {
+			t.Fatalf("mode = %v, want list", out["mode"])
+		}
+		if out["audit"] != false {
+			t.Fatalf("audit = %v, want false", out["audit"])
+		}
+		if out["archive_html"] != false {
+			t.Fatalf("archive_html = %v, want false", out["archive_html"])
+		}
+		limits := nestedObject(t, out, "limits")
+		assertNumber(t, "limits.max_pages", limits["max_pages"], defaultMCPMaxPages)
+		assertNumber(t, "limits.max_depth", limits["max_depth"], defaultMCPMaxDepth)
+		assertNumber(t, "limits.max_duration_seconds", limits["max_duration_seconds"], float64(defaultMCPMaxDuration/time.Second))
+
+		select {
+		case <-runner.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("list runner was not launched")
+		}
+
+		runner.mu.Lock()
+		calls := runner.listCalls
+		gotURLs := append([]string(nil), runner.listURLs...)
+		runner.mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("list calls = %d, want 1", calls)
+		}
+		wantURLs := []string{
+			"https://example.com/a",
+			"https://example.com/b",
+			"https://example.com/c",
+		}
+		if !slices.Equal(gotURLs, wantURLs) {
+			t.Fatalf("list URLs = %v, want %v", gotURLs, wantURLs)
+		}
+
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		job.mu.Lock()
+		gotMode, gotTarget := job.mode, job.target
+		gotSettingsURLs := append([]string(nil), job.settings.listURLs...)
+		gotConcurrency := job.settings.Concurrency
+		job.mu.Unlock()
+		if gotMode != "list" {
+			t.Fatalf("job mode = %q, want list", gotMode)
+		}
+		if gotTarget != "3 URLs" {
+			t.Fatalf("job target = %q, want 3 URLs", gotTarget)
+		}
+		if !slices.Equal(gotSettingsURLs, wantURLs) {
+			t.Fatalf("settings.listURLs = %v, want %v", gotSettingsURLs, wantURLs)
+		}
+		if gotConcurrency != defaultConcurrency {
+			t.Fatalf("concurrency = %d, want %d", gotConcurrency, defaultConcurrency)
+		}
+	})
+
+	t.Run("spider audit stores explicit filters", func(t *testing.T) {
+		runner := newFakeCrawlRunner()
+		t.Cleanup(runner.Release)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "example.com",
+			"keywords":  []string{"pricing"},
+			"audit":     true,
+			"audit_filters": map[string]any{
+				"explicit":           true,
+				"nav_substrings":     []string{"site-nav", "menu-x"},
+				"exclude_substrings": []string{"widget-y"},
+			},
+		})
+		if out["mode"] != "spider" {
+			t.Fatalf("mode = %v, want spider", out["mode"])
+		}
+		if out["audit"] != true {
+			t.Fatalf("audit = %v, want true", out["audit"])
+		}
+		limits := nestedObject(t, out, "limits")
+		assertNumber(t, "limits.max_pages", limits["max_pages"], defaultMCPMaxPages)
+		assertNumber(t, "limits.max_depth", limits["max_depth"], defaultMCPMaxDepth)
+		assertNumber(t, "limits.max_duration_seconds", limits["max_duration_seconds"], float64(defaultMCPMaxDuration/time.Second))
+
+		jobID, _ := out["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		job.mu.Lock()
+		audit := job.settings.Audit
+		archiveDir := job.settings.AuditArchiveDir
+		filters := job.settings.AuditFilters
+		job.mu.Unlock()
+
+		if !audit {
+			t.Fatal("settings.Audit = false, want true")
+		}
+		if archiveDir == "" {
+			t.Fatal("settings.AuditArchiveDir is empty")
+		}
+		if filters == nil {
+			t.Fatal("settings.AuditFilters is nil, want an explicit profile")
+		}
+		if !filters.Explicit {
+			t.Fatal("settings.AuditFilters.Explicit = false, want true")
+		}
+		if want := []string{"site-nav", "menu-x"}; !slices.Equal(filters.NavSubstrings, want) {
+			t.Fatalf("nav substrings = %v, want %v", filters.NavSubstrings, want)
+		}
+		if want := []string{"widget-y"}; !slices.Equal(filters.ExcludeSubstrings, want) {
+			t.Fatalf("exclude substrings = %v, want %v", filters.ExcludeSubstrings, want)
+		}
+
+		runner.Release()
+		waitForJobStatus(t, job, jobStatusDone)
+	})
+
+	t.Run("non-explicit audit filters are ignored", func(t *testing.T) {
+		runner := newFakeCrawlRunner()
+		t.Cleanup(runner.Release)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "example.com",
+			"audit":     true,
+			"audit_filters": map[string]any{
+				"explicit":       false,
+				"nav_substrings": []string{"ignored"},
+			},
+		})
+
+		jobID, _ := out["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		job.mu.Lock()
+		filters := job.settings.AuditFilters
+		job.mu.Unlock()
+		if filters != nil {
+			t.Fatalf("settings.AuditFilters = %+v, want nil for non-explicit input", filters)
+		}
+
+		runner.Release()
+		waitForJobStatus(t, job, jobStatusDone)
+	})
+
+	t.Run("list mode rejects audit", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		_, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		res := callTool(t, ctx, session, "start_crawl", map[string]any{
+			"mode":  "list",
+			"urls":  []string{"https://example.com"},
+			"audit": true,
+		})
+		if !res.IsError {
+			t.Fatal("start_crawl accepted audit with list mode")
+		}
+		text := strings.ToLower(toolResultText(res))
+		for _, want := range []string{"invalid_argument", "audit"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("error = %q, want %q", text, want)
+			}
+		}
+	})
+
+	t.Run("per-job limits are stored and returned", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxPages = 100
+		cfg.Limits.MaxDepth = 5
+		cfg.Limits.MaxDuration = 60 * time.Second
+
+		runner := newFakeCrawlRunner()
+		t.Cleanup(runner.Release)
+		app, session := newMCPTestSession(t, ctx, cfg, runner)
+
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "example.com",
+			"limits": map[string]any{
+				"max_pages":            25,
+				"max_depth":            0,
+				"max_duration_seconds": 30,
+			},
+		})
+
+		limits := nestedObject(t, out, "limits")
+		assertNumber(t, "limits.max_pages", limits["max_pages"], 25)
+		assertNumber(t, "limits.max_depth", limits["max_depth"], 0)
+		assertNumber(t, "limits.max_duration_seconds", limits["max_duration_seconds"], 30)
+
+		jobID, _ := out["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		if job.limits.MaxPages != 25 {
+			t.Fatalf("job max pages = %d, want 25", job.limits.MaxPages)
+		}
+		if job.limits.MaxDepth != 0 {
+			t.Fatalf("job max depth = %d, want 0", job.limits.MaxDepth)
+		}
+		if job.limits.MaxDuration != 30*time.Second {
+			t.Fatalf("job max duration = %v, want 30s", job.limits.MaxDuration)
+		}
+
+		runner.Release()
+		waitForJobStatus(t, job, jobStatusDone)
+	})
+
+	t.Run("limits above server maxima are rejected", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxPages = 10
+		cfg.Limits.MaxDepth = 2
+		cfg.Limits.MaxDuration = 20 * time.Second
+
+		runner := newImmediateFakeRunner(nil, nil)
+		_, session := newMCPTestSession(t, ctx, cfg, runner)
+
+		cases := []struct {
+			name    string
+			args    map[string]any
+			wantSub string
+		}{
+			{"pages above max", map[string]any{"max_pages": 11}, "max_pages"},
+			{"pages below min", map[string]any{"max_pages": 0}, "max_pages"},
+			{"depth above max", map[string]any{"max_depth": 3}, "max_depth"},
+			{"duration above max", map[string]any{"max_duration_seconds": 21}, "max_duration_seconds"},
+			{"duration below min", map[string]any{"max_duration_seconds": 0}, "max_duration_seconds"},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				args := map[string]any{
+					"mode":      "spider",
+					"start_url": "example.com",
+					"limits":    tc.args,
+				}
+				res := callTool(t, ctx, session, "start_crawl", args)
+				if !res.IsError {
+					t.Fatalf("start_crawl accepted limits %v", tc.args)
+				}
+				text := strings.ToLower(toolResultText(res))
+				for _, want := range []string{"invalid_argument", tc.wantSub} {
+					if !strings.Contains(text, want) {
+						t.Fatalf("error = %q, want %q", text, want)
+					}
+				}
+			})
+		}
+
+		res := callTool(t, ctx, session, "start_crawl", map[string]any{
+			"mode":        "spider",
+			"start_url":   "example.com",
+			"concurrency": defaultMCPMaxConcurrency + 1,
+		})
+		if !res.IsError {
+			t.Fatal("start_crawl accepted concurrency above the server maximum")
+		}
+		text := strings.ToLower(toolResultText(res))
+		for _, want := range []string{"invalid_argument", "concurrency"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("error = %q, want %q", text, want)
+			}
+		}
+	})
+
+	t.Run("url and keyword ceilings are enforced", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxListURLs = 2
+
+		runner := newImmediateFakeRunner(nil, nil)
+		_, session := newMCPTestSession(t, ctx, cfg, runner)
+
+		longURL := "https://example.com/" + strings.Repeat("a", 2049)
+		cases := []struct {
+			name    string
+			args    map[string]any
+			wantSub string
+		}{
+			{"empty list", map[string]any{"mode": "list", "urls": []string{}}, "urls"},
+			{"too many list urls", map[string]any{"mode": "list", "urls": []string{"https://example.com/a", "https://example.com/b", "https://example.com/c"}}, "urls"},
+			{"invalid list url", map[string]any{"mode": "list", "urls": []string{"ftp://example.com/a"}}, "urls"},
+			{"oversized list url", map[string]any{"mode": "list", "urls": []string{longURL}}, "urls"},
+			{"oversized start url", map[string]any{"mode": "spider", "start_url": longURL}, "start_url"},
+			{"too many keywords", map[string]any{"mode": "spider", "start_url": "example.com", "keywords": []string{
+				"k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11",
+				"k12", "k13", "k14", "k15", "k16", "k17", "k18", "k19", "k20", "k21",
+			}}, "keywords"},
+			{"empty keyword", map[string]any{"mode": "spider", "start_url": "example.com", "keywords": []string{"ok", "  "}}, "keywords"},
+			{"keyword with pipe", map[string]any{"mode": "spider", "start_url": "example.com", "keywords": []string{"a|b"}}, "keywords"},
+			{"oversized keyword", map[string]any{"mode": "spider", "start_url": "example.com", "keywords": []string{strings.Repeat("k", 101)}}, "keywords"},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "start_crawl", tc.args)
+				if !res.IsError {
+					t.Fatalf("start_crawl accepted invalid input: %v", tc.args)
+				}
+				text := strings.ToLower(toolResultText(res))
+				for _, want := range []string{"invalid_argument", tc.wantSub} {
+					if !strings.Contains(text, want) {
+						t.Fatalf("error = %q, want %q", text, want)
+					}
+				}
+			})
 		}
 	})
 }
