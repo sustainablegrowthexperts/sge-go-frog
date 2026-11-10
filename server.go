@@ -153,6 +153,29 @@ func (jm *jobManager) list(filter jobFilter) []*crawlJob {
 	return out
 }
 
+// listPage returns one page of matching jobs and the total number of matches
+// before pagination. Pagination is applied after filtering and sorting so
+// total, has_more, and next_offset stay stable across calls.
+func (jm *jobManager) listPage(filter jobFilter, limit, offset int) ([]*crawlJob, int) {
+	jobs := jm.list(filter)
+	total := len(jobs)
+
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return []*crawlJob{}, total
+	}
+	if limit <= 0 {
+		limit = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return jobs[offset:end], total
+}
+
 // runningCount returns the number of running jobs for the owner, or for every
 // owner when owner is empty.
 func (jm *jobManager) runningCount(owner string) int {
@@ -404,6 +427,12 @@ func (j *crawlJob) statusSnapshot() getJobOutput {
 		out.Error = &msg
 	}
 	return out
+}
+
+// summarySnapshot maps the job's full status snapshot to the compact list_jobs
+// view so both tools share one field mapping.
+func (j *crawlJob) summarySnapshot() jobSummary {
+	return jobSummaryFromStatus(j.statusSnapshot())
 }
 
 // rfc3339UTC formats a timestamp for the polling DTO, or nil when unset.

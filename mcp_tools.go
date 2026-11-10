@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,6 +27,16 @@ func (s *mcpServer) registerTools() {
 			IdempotentHint: true,
 		},
 	}, s.getJob)
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "list_jobs",
+		Description: "List MCP-created jobs newest first, optionally filtered by status and mode and paginated with limit/offset.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+			OpenWorldHint:  boolPtr(false),
+		},
+	}, s.listJobs)
 }
 
 // startCrawl validates a spider request, creates an MCP-owned job, launches the
@@ -75,6 +86,83 @@ func (s *mcpServer) getJob(_ context.Context, _ *mcp.CallToolRequest, in getJobI
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: jobStatusSummary(out)}},
 	}, out, nil
+}
+
+// listJobs returns a page of MCP-owned jobs, newest first, with optional
+// status and mode filters. Unknown and browser-owned jobs are never included.
+func (s *mcpServer) listJobs(_ context.Context, _ *mcp.CallToolRequest, in listJobsInput) (*mcp.CallToolResult, listJobsOutput, error) {
+	status := strings.TrimSpace(in.Status)
+	mode := strings.TrimSpace(in.Mode)
+	if err := validateJobEnum("status", status, listJobStatuses); err != nil {
+		return nil, listJobsOutput{}, err
+	}
+	if err := validateJobEnum("mode", mode, listJobModes); err != nil {
+		return nil, listJobsOutput{}, err
+	}
+
+	limit := in.Limit
+	switch {
+	case limit == 0:
+		limit = defaultListJobsLimit
+	case limit < 0:
+		return nil, listJobsOutput{}, fmt.Errorf("invalid_argument: limit must be non-negative")
+	case limit > maxListJobsLimit:
+		limit = maxListJobsLimit
+	}
+	if in.Offset < 0 {
+		return nil, listJobsOutput{}, fmt.Errorf("invalid_argument: offset must be non-negative")
+	}
+
+	jobs, total := s.jobs.listPage(jobFilter{
+		Owner:  ownerMCP,
+		Status: status,
+		Mode:   mode,
+	}, limit, in.Offset)
+
+	out := listJobsOutput{
+		Jobs:  make([]jobSummary, 0, len(jobs)),
+		Total: total,
+	}
+	for _, job := range jobs {
+		out.Jobs = append(out.Jobs, job.summarySnapshot())
+	}
+	out.HasMore = in.Offset+len(out.Jobs) < total
+	if out.HasMore {
+		next := in.Offset + len(out.Jobs)
+		out.NextOffset = &next
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: listJobsSummary(out)}},
+	}, out, nil
+}
+
+// listJobsSummary renders a short agent-facing summary of a list_jobs page.
+func listJobsSummary(out listJobsOutput) string {
+	summary := fmt.Sprintf("%d job(s) found.", len(out.Jobs))
+	if out.Total > len(out.Jobs) {
+		summary = fmt.Sprintf("%d job(s) shown of %d.", len(out.Jobs), out.Total)
+	}
+	if out.HasMore && out.NextOffset != nil {
+		summary += fmt.Sprintf(" More pages available; next_offset is %d.", *out.NextOffset)
+	} else {
+		summary += " No more pages."
+	}
+	return summary
+}
+
+// validateJobEnum accepts an empty filter value and otherwise requires one of
+// the allowed values.
+func validateJobEnum(field, value string, allowed []string) error {
+	if value == "" || slices.Contains(allowed, value) {
+		return nil
+	}
+	return fmt.Errorf("invalid_argument: %s must be one of %s", field, strings.Join(allowed, ", "))
+}
+
+// boolPtr returns a pointer to b for SDK annotation fields.
+func boolPtr(b bool) *bool {
+	return &b
 }
 
 // jobStatusSummary renders a short agent-facing summary of a job snapshot.

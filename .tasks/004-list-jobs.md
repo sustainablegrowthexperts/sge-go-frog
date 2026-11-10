@@ -1,7 +1,7 @@
 ---
 id: task-004
 title: "[Slice] Agent lists and filters MCP-created jobs"
-status: pending
+status: completed
 depends_on: ["task-003"]
 target_files:
   - "mcp_tools.go"

@@ -478,6 +478,237 @@ func TestStartCrawlSpider(t *testing.T) {
 	})
 }
 
+// jobSummaries reads the list_jobs "jobs" array from structured content.
+func jobSummaries(t *testing.T, out map[string]any) []map[string]any {
+	t.Helper()
+	raw, ok := out["jobs"].([]any)
+	if !ok {
+		t.Fatalf("jobs = %v (%T), want an array", out["jobs"], out["jobs"])
+	}
+	jobs := make([]map[string]any, 0, len(raw))
+	for i, item := range raw {
+		job, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("jobs[%d] = %v (%T), want an object", i, item, item)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs
+}
+
+// jobSummaryIDs extracts the job_id values from a list_jobs response.
+func jobSummaryIDs(t *testing.T, out map[string]any) []string {
+	t.Helper()
+	jobs := jobSummaries(t, out)
+	ids := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		id, _ := job["job_id"].(string)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// TestListJobsMCPOnly covers the list contract:
+//   - only MCP-created jobs are returned, newest first, even when UI jobs exist;
+//   - status and mode filters, offset/limit pagination, total, has_more, and
+//     next_offset follow the slice contract;
+//   - creation-time ties break by job ID;
+//   - invalid status/mode and negative offsets return invalid_argument.
+func TestListJobsMCPOnly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	runner := newImmediateFakeRunner(nil, nil)
+	app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+	base := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	create := func(owner, mode, target string, created time.Time, status, phase string) *crawlJob {
+		job := app.jobs.createWithOwner(owner, mode, target, WizardSettings{
+			Mode:     1,
+			StartURL: target,
+		})
+		job.mu.Lock()
+		job.createdAt = created
+		job.status = status
+		job.phase = phase
+		job.pages = 2
+		job.currentURL = target + "/current"
+		job.mu.Unlock()
+		return job
+	}
+
+	oldest := create(ownerMCP, "spider", "https://oldest.example", base, jobStatusDone, jobPhaseDone)
+	middle := create(ownerMCP, "list", "3 URLs", base.Add(time.Hour), jobStatusRunning, jobPhaseCrawling)
+	newest := create(ownerMCP, "spider", "https://newest.example", base.Add(2*time.Hour), jobStatusError, jobPhaseError)
+	newest.mu.Lock()
+	newest.errMsg = "boom"
+	newest.mu.Unlock()
+	_ = create(ownerUI, "spider", "https://ui.example", base.Add(3*time.Hour), jobStatusDone, jobPhaseDone)
+
+	t.Run("returns only MCP jobs newest first", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "list_jobs", nil)
+
+		want := []string{newest.id, middle.id, oldest.id}
+		if got := jobSummaryIDs(t, out); !slices.Equal(got, want) {
+			t.Fatalf("job IDs = %v, want %v", got, want)
+		}
+		assertNumber(t, "total", out["total"], 3)
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false", out["has_more"])
+		}
+		if value, ok := out["next_offset"]; ok && value != nil {
+			t.Fatalf("next_offset = %v, want omitted when has_more is false", value)
+		}
+
+		jobs := jobSummaries(t, out)
+		first := jobs[0]
+		if first["job_id"] != newest.id {
+			t.Fatalf("first job = %v, want %q", first["job_id"], newest.id)
+		}
+		if first["mode"] != "spider" {
+			t.Fatalf("mode = %v, want spider", first["mode"])
+		}
+		if first["target"] != "https://newest.example" {
+			t.Fatalf("target = %v, want https://newest.example", first["target"])
+		}
+		if first["status"] != jobStatusError {
+			t.Fatalf("status = %v, want %q", first["status"], jobStatusError)
+		}
+		if first["phase"] != jobPhaseError {
+			t.Fatalf("phase = %v, want %q", first["phase"], jobPhaseError)
+		}
+		if first["error"] != "boom" {
+			t.Fatalf("error = %v, want boom", first["error"])
+		}
+		assertNumber(t, "pages_crawled", first["pages_crawled"], 2)
+		if first["current_url"] != "https://newest.example/current" {
+			t.Fatalf("current_url = %v, want the job's current URL", first["current_url"])
+		}
+		created := assertRFC3339UTC(t, "created_at", first["created_at"])
+		if !created.Equal(base.Add(2 * time.Hour)) {
+			t.Fatalf("created_at = %v, want %v", created, base.Add(2*time.Hour))
+		}
+
+		summary := strings.ToLower(toolResultText(callTool(t, ctx, session, "list_jobs", nil)))
+		for _, wantPart := range []string{"3", "job"} {
+			if !strings.Contains(summary, wantPart) {
+				t.Fatalf("summary %q does not mention %q", summary, wantPart)
+			}
+		}
+	})
+
+	t.Run("filters by status and mode", func(t *testing.T) {
+		cases := []struct {
+			name string
+			args map[string]any
+			want []string
+		}{
+			{"status running", map[string]any{"status": "running"}, []string{middle.id}},
+			{"mode list", map[string]any{"mode": "list"}, []string{middle.id}},
+			{"status error and mode spider", map[string]any{"status": "error", "mode": "spider"}, []string{newest.id}},
+			{"valid without matches", map[string]any{"status": "queued"}, nil},
+			{"valid cancelled without matches", map[string]any{"status": "cancelled"}, nil},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				out := callToolObject(t, ctx, session, "list_jobs", tc.args)
+				want := tc.want
+				if want == nil {
+					want = []string{}
+				}
+				if got := jobSummaryIDs(t, out); !slices.Equal(got, want) {
+					t.Fatalf("job IDs = %v, want %v", got, want)
+				}
+				assertNumber(t, "total", out["total"], float64(len(want)))
+			})
+		}
+	})
+
+	t.Run("paginates with offset and limit", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "list_jobs", map[string]any{"limit": 2})
+		if got, want := jobSummaryIDs(t, out), []string{newest.id, middle.id}; !slices.Equal(got, want) {
+			t.Fatalf("first page IDs = %v, want %v", got, want)
+		}
+		assertNumber(t, "total", out["total"], 3)
+		if out["has_more"] != true {
+			t.Fatalf("has_more = %v, want true", out["has_more"])
+		}
+		assertNumber(t, "next_offset", out["next_offset"], 2)
+
+		out = callToolObject(t, ctx, session, "list_jobs", map[string]any{"limit": 2, "offset": 2})
+		if got, want := jobSummaryIDs(t, out), []string{oldest.id}; !slices.Equal(got, want) {
+			t.Fatalf("second page IDs = %v, want %v", got, want)
+		}
+		assertNumber(t, "total", out["total"], 3)
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false", out["has_more"])
+		}
+		if value, ok := out["next_offset"]; ok && value != nil {
+			t.Fatalf("next_offset = %v, want omitted on the last page", value)
+		}
+
+		out = callToolObject(t, ctx, session, "list_jobs", map[string]any{"offset": 99})
+		if got := jobSummaryIDs(t, out); len(got) != 0 {
+			t.Fatalf("job IDs = %v, want an empty page", got)
+		}
+		assertNumber(t, "total", out["total"], 3)
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false", out["has_more"])
+		}
+
+		out = callToolObject(t, ctx, session, "list_jobs", map[string]any{"limit": 500})
+		if got := jobSummaryIDs(t, out); len(got) != 3 {
+			t.Fatalf("limit above the maximum returned %v, want all 3 jobs", got)
+		}
+	})
+
+	t.Run("rejects invalid arguments", func(t *testing.T) {
+		cases := []struct {
+			name string
+			args map[string]any
+		}{
+			{"invalid status", map[string]any{"status": "paused"}},
+			{"invalid mode", map[string]any{"mode": "crawl"}},
+			{"negative offset", map[string]any{"offset": -1}},
+			{"negative limit", map[string]any{"limit": -1}},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "list_jobs", tc.args)
+				if !res.IsError {
+					t.Fatalf("list_jobs accepted invalid input: %v", res.StructuredContent)
+				}
+				if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, "invalid_argument") {
+					t.Fatalf("error = %q, want invalid_argument", text)
+				}
+			})
+		}
+	})
+
+	t.Run("breaks created_at ties by job ID", func(t *testing.T) {
+		tieApp, tieSession := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+		sameTime := base.Add(24 * time.Hour)
+
+		first := tieApp.jobs.createWithOwner(ownerMCP, "list", "2 URLs", WizardSettings{Mode: 2})
+		second := tieApp.jobs.createWithOwner(ownerMCP, "list", "2 URLs", WizardSettings{Mode: 2})
+		for _, job := range []*crawlJob{first, second} {
+			job.mu.Lock()
+			job.createdAt = sameTime
+			job.mu.Unlock()
+		}
+
+		want := []string{first.id, second.id}
+		slices.Sort(want)
+
+		out := callToolObject(t, ctx, tieSession, "list_jobs", map[string]any{"mode": "list"})
+		if got := jobSummaryIDs(t, out); !slices.Equal(got, want) {
+			t.Fatalf("job IDs = %v, want %v", got, want)
+		}
+	})
+}
+
 // TestGetJobStatus covers the polling contract:
 //   - a running MCP job reports its status, phase, timestamps, page progress,
 //     current URL, keywords, effective limits, and readiness flags;

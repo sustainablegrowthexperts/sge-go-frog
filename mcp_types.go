@@ -12,11 +12,26 @@ const (
 	ownerMCP = "mcp"
 )
 
-// Job lifecycle status values.
+// Job lifecycle status values. queued and cancelled are part of the public
+// filter contract even though this slice only creates running jobs.
 const (
-	jobStatusRunning = "running"
-	jobStatusDone    = "done"
-	jobStatusError   = "error"
+	jobStatusQueued    = "queued"
+	jobStatusRunning   = "running"
+	jobStatusDone      = "done"
+	jobStatusError     = "error"
+	jobStatusCancelled = "cancelled"
+)
+
+// listJobStatuses and listJobModes are the accepted list_jobs filter values.
+var (
+	listJobStatuses = []string{jobStatusQueued, jobStatusRunning, jobStatusDone, jobStatusError, jobStatusCancelled}
+	listJobModes    = []string{"spider", "list"}
+)
+
+// list_jobs pagination defaults.
+const (
+	defaultListJobsLimit = 20
+	maxListJobsLimit     = 100
 )
 
 // Job phase values. A job moves from starting to crawling and ends in done or
@@ -125,6 +140,61 @@ type getJobArtifacts struct {
 	CSVReady            bool `json:"csv_ready"`
 	AuditStrictReady    bool `json:"audit_strict_ready"`
 	AuditInclusiveReady bool `json:"audit_inclusive_ready"`
+}
+
+// listJobsInput is the typed input for the list_jobs tool. Empty status or
+// mode means no filter.
+type listJobsInput struct {
+	Status string `json:"status,omitempty" jsonschema:"optional status filter: queued, running, done, error, or cancelled"`
+	Mode   string `json:"mode,omitempty" jsonschema:"optional mode filter: spider or list"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"maximum jobs to return; defaults to 20 and is capped at 100"`
+	Offset int    `json:"offset,omitempty" jsonschema:"number of matching jobs to skip; defaults to 0"`
+}
+
+// jobSummary is the compact list_jobs view of a job: the pollable identity,
+// status, progress, and error fields without keywords, limits, audit, or
+// artifact detail.
+type jobSummary struct {
+	JobID        string  `json:"job_id"`
+	Mode         string  `json:"mode"`
+	Target       string  `json:"target"`
+	Status       string  `json:"status"`
+	Phase        string  `json:"phase"`
+	CreatedAt    *string `json:"created_at"`
+	StartedAt    *string `json:"started_at"`
+	FinishedAt   *string `json:"finished_at"`
+	PagesCrawled int     `json:"pages_crawled"`
+	CurrentURL   string  `json:"current_url"`
+	Truncated    bool    `json:"truncated"`
+	Error        *string `json:"error"`
+}
+
+// listJobsOutput is the typed output for list_jobs. Total is the number of
+// matching jobs before pagination; next_offset is present only when another
+// page exists.
+type listJobsOutput struct {
+	Jobs       []jobSummary `json:"jobs"`
+	Total      int          `json:"total"`
+	HasMore    bool         `json:"has_more"`
+	NextOffset *int         `json:"next_offset,omitempty"`
+}
+
+// jobSummaryFromStatus maps a full get_job snapshot to the compact list view.
+func jobSummaryFromStatus(out getJobOutput) jobSummary {
+	return jobSummary{
+		JobID:        out.JobID,
+		Mode:         out.Mode,
+		Target:       out.Target,
+		Status:       out.Status,
+		Phase:        out.Phase,
+		CreatedAt:    out.CreatedAt,
+		StartedAt:    out.StartedAt,
+		FinishedAt:   out.FinishedAt,
+		PagesCrawled: out.PagesCrawled,
+		CurrentURL:   out.CurrentURL,
+		Truncated:    out.Truncated,
+		Error:        out.Error,
+	}
 }
 
 // getJobOutput is the typed output for get_job. It deliberately excludes
