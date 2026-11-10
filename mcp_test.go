@@ -3017,3 +3017,544 @@ func TestGetResultsHelpers(t *testing.T) {
 		}
 	})
 }
+
+// writeAuditResultFixture serializes a synthetic audit report into dir.
+func writeAuditResultFixture(t *testing.T, dir string, result auditpkg.Result) string {
+	t.Helper()
+	path := filepath.Join(dir, "audit.json")
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal audit fixture: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write audit fixture: %v", err)
+	}
+	return path
+}
+
+// auditObjectList reads an array of objects from a get_audit response.
+func auditObjectList(t *testing.T, out map[string]any, key string) []map[string]any {
+	t.Helper()
+	raw, ok := out[key].([]any)
+	if !ok {
+		t.Fatalf("%s = %v (%T), want an array", key, out[key], out[key])
+	}
+	items := make([]map[string]any, 0, len(raw))
+	for i, item := range raw {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("%s[%d] = %v (%T), want an object", key, i, item, item)
+		}
+		items = append(items, obj)
+	}
+	return items
+}
+
+// auditString reads a string field and fails when it is missing or not a string.
+func auditString(t *testing.T, obj map[string]any, key string) string {
+	t.Helper()
+	value, ok := obj[key].(string)
+	if !ok {
+		t.Fatalf("%s = %v (%T), want a string", key, obj[key], obj[key])
+	}
+	return value
+}
+
+// getAuditPageKeys extracts page_key values from a pages response.
+func getAuditPageKeys(t *testing.T, out map[string]any) []string {
+	t.Helper()
+	pages := auditObjectList(t, out, "pages")
+	keys := make([]string, 0, len(pages))
+	for _, page := range pages {
+		keys = append(keys, auditString(t, page, "page_key"))
+	}
+	return keys
+}
+
+// TestGetAuditSections covers the get_audit read contract:
+//   - strict and inclusive profiles load from the job-owned audit directories;
+//   - every section is exposed without paths or full-report dumps;
+//   - pages are sorted deterministically before pagination and expose the
+//     graph key plus URL identity fields;
+//   - section-specific filters, sort, and pagination are validated;
+//   - disabled, not-ready, not-done, and failed profiles return
+//     audit_not_available;
+//   - the decoded report cache invalidates when audit.json changes.
+func TestGetAuditSections(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+	strictDir := t.TempDir()
+	inclusiveDir := t.TempDir()
+
+	newPage := func(key string, inbound int, rank float64, orphan bool, status int) *auditpkg.Page {
+		return &auditpkg.Page{
+			URL:                       key,
+			Depth:                     1,
+			StatusCode:                status,
+			Title:                     strings.TrimPrefix(key, "https://example.com/"),
+			ContentInbound:            inbound,
+			ContentInboundUnique:      inbound,
+			ContentInboundOccurrences: inbound,
+			PageRank:                  rank,
+			IsOrphan:                  orphan,
+			OrphanType:                map[bool]string{true: "content-orphaned", false: ""}[orphan],
+			ContentOrphan:             orphan,
+			ContentReachableFromStart: !orphan,
+			NavReachable:              !orphan,
+			InSitemap:                 true,
+		}
+	}
+
+	strict := auditpkg.Result{
+		Version:     auditpkg.AuditVersion,
+		StartURL:    "https://example.com/",
+		GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+		Pages: map[string]*auditpkg.Page{
+			"https://example.com/":  newPage("https://example.com/", 2, 0.5, false, 200),
+			"https://example.com/a": newPage("https://example.com/a", 3, 0.2, false, 200),
+			"https://example.com/b": newPage("https://example.com/b", 5, 0.9, false, 200),
+			"https://example.com/c": newPage("https://example.com/c", 0, 0.1, true, 404),
+		},
+		Links: []auditpkg.Link{
+			{Source: "https://example.com/", Target: "https://example.com/a", Anchor: "A", Decision: "content", Reason: "content page link"},
+			{Source: "https://example.com/", Target: "https://example.com/b", Anchor: "B", Decision: "content", Reason: "content page link"},
+			{Source: "https://example.com/a", Target: "https://example.com/b", Anchor: "B again", Decision: "content", Reason: "content page link"},
+		},
+		Blocks: []auditpkg.Block{
+			{BlockID: "block-content", Tag: "article", Position: "main", LinkCount: 3, PageCount: 2, Decision: "content", Reason: "body content"},
+			{BlockID: "block-nav", Tag: "nav", Position: "header", LinkCount: 8, PageCount: 1, Decision: "excluded", Reason: "navigation container", NavMarker: true},
+		},
+		Anchors: auditpkg.Anchors{
+			TopAnchors: []auditpkg.AnchorCount{{Anchor: "A", Count: 2, DistinctTargets: 1}},
+			TopTargets: []auditpkg.TargetCount{{Target: "https://example.com/a", Count: 2, DistinctAnchors: 1}},
+		},
+		PageRankRanking: []auditpkg.RankEntry{
+			{URL: "https://example.com/b", PageRank: 0.9, ContentInbound: 5, ContentInboundUnique: 5},
+			{URL: "https://example.com/", PageRank: 0.5, ContentInbound: 2, ContentInboundUnique: 2},
+			{URL: "https://example.com/a", PageRank: 0.2, ContentInbound: 3, ContentInboundUnique: 3},
+			{URL: "https://example.com/c", PageRank: 0.1, ContentInbound: 0, ContentInboundUnique: 0},
+		},
+		PageRankMeta: auditpkg.PageRankMeta{NodeCount: 4, EdgeCount: 3, Damping: 0.85, Metric: "content_inbound"},
+		Redirects:    []auditpkg.Redirect{{URL: "https://example.com/old", StatusCode: 301, Location: "/new"}},
+		Failed:       []auditpkg.Failed{{URL: "https://example.com/broken", Error: "parse failed"}},
+		Sitemap: &auditpkg.SitemapMeta{
+			FetchedAt: time.Date(2026, 11, 10, 11, 0, 0, 0, time.UTC),
+			Sitemaps:  []string{"https://example.com/sitemap.xml"},
+			URLs:      []string{"https://example.com/", "https://example.com/a", "https://example.com/b", "https://example.com/c"},
+			URLCount:  4,
+		},
+		Structure: auditpkg.Structure{TotalContentLinks: 3, TotalInternalLinks: 12, TotalBlocks: 2, BlocksContent: 1, BlocksNav: 1},
+		Summary: auditpkg.AuditSummary{
+			Pages:                  4,
+			ContentLinks:           3,
+			ContentPageLinks:       3,
+			ContentLinkOccurrences: 3,
+			UniqueContentLinks:     3,
+			Orphans:                1,
+			ContentOrphans:         1,
+			ContentUnreachable:     1,
+			SitemapOnly:            0,
+			NavLinks:               8,
+			GeneratedAt:            time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+			OutDir:                 "/secret/strict/audit/path",
+		},
+	}
+	// Give the root page URL identity fields.
+	strict.Pages["https://example.com/"].RawURL = "https://www.example.com/"
+	strict.Pages["https://example.com/"].FinalURL = "https://example.com/"
+
+	inclusive := strict
+	inclusive.Links = append(append([]auditpkg.Link{}, strict.Links...),
+		auditpkg.Link{Source: "https://example.com/b", Target: "https://example.com/c", Anchor: "C", Decision: "content", Reason: "inclusive content page link"},
+		auditpkg.Link{Source: "https://example.com/c", Target: "https://example.com/", Anchor: "Home", Decision: "content", Reason: "inclusive content page link"},
+	)
+	inclusive.Summary.ContentLinks = 5
+	inclusive.Summary.ContentPageLinks = 5
+	inclusive.Summary.ContentLinkOccurrences = 5
+	inclusive.Summary.NavLinks = 9
+
+	writeAuditResultFixture(t, strictDir, strict)
+	writeAuditResultFixture(t, inclusiveDir, inclusive)
+
+	job := createDoneResultsJob(t, app, "", nil)
+	job.mu.Lock()
+	job.settings.Audit = true
+	job.auditReady = true
+	job.auditDir = strictDir
+	job.auditInclusiveReady = true
+	job.auditInclusiveDir = inclusiveDir
+	job.mu.Unlock()
+
+	t.Run("summary selects profile and hides out_dir", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_audit", map[string]any{"job_id": job.id})
+		if out["profile"] != "strict" || out["section"] != "summary" {
+			t.Fatalf("defaults = profile:%v section:%v, want strict/summary", out["profile"], out["section"])
+		}
+		summary := nestedObject(t, out, "summary")
+		assertNumber(t, "summary.pages", summary["pages"], 4)
+		assertNumber(t, "summary.links", summary["links"], 3)
+		assertNumber(t, "summary.blocks", summary["blocks"], 2)
+		assertNumber(t, "summary.redirects", summary["redirects"], 1)
+		assertNumber(t, "summary.failed", summary["failed"], 1)
+		assertNumber(t, "summary.pagerank_nodes", summary["pagerank_nodes"], 4)
+		if _, leaked := summary["out_dir"]; leaked {
+			t.Fatalf("summary leaked out_dir: %v", summary)
+		}
+		if text := strings.ToLower(toolResultText(callTool(t, ctx, session, "get_audit", map[string]any{"job_id": job.id}))); !strings.Contains(text, "summary") {
+			t.Fatalf("text summary = %q, want a short summary", text)
+		}
+
+		inclusiveOut := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"profile": "inclusive",
+		})
+		inclusiveSummary := nestedObject(t, inclusiveOut, "summary")
+		assertNumber(t, "inclusive summary.links", inclusiveSummary["links"], 5)
+	})
+
+	t.Run("pages are deterministic and expose URL identity", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"sort":    "url",
+			"limit":   2,
+		})
+		keys := getAuditPageKeys(t, out)
+		if !slices.Equal(keys, []string{"https://example.com/", "https://example.com/a"}) {
+			t.Fatalf("page keys = %v, want URL order", keys)
+		}
+		assertNumber(t, "total", out["total"], 4)
+		if out["has_more"] != true {
+			t.Fatalf("has_more = %v, want true", out["has_more"])
+		}
+		assertNumber(t, "next_offset", out["next_offset"], 2)
+
+		first := auditObjectList(t, out, "pages")[0]
+		if auditString(t, first, "url") != "https://example.com/" {
+			t.Fatalf("url = %v", first["url"])
+		}
+		if auditString(t, first, "raw_url") != "https://www.example.com/" {
+			t.Fatalf("raw_url = %v", first["raw_url"])
+		}
+		if auditString(t, first, "final_url") != "https://example.com/" {
+			t.Fatalf("final_url = %v", first["final_url"])
+		}
+
+		inbound := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"sort":    "content_inbound",
+		})
+		if got := getAuditPageKeys(t, inbound); !slices.Equal(got, []string{
+			"https://example.com/b", "https://example.com/a", "https://example.com/", "https://example.com/c",
+		}) {
+			t.Fatalf("inbound page keys = %v", got)
+		}
+
+		ranked := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"sort":    "pagerank",
+			"limit":   1,
+		})
+		if got := getAuditPageKeys(t, ranked); !slices.Equal(got, []string{"https://example.com/b"}) {
+			t.Fatalf("pagerank page keys = %v", got)
+		}
+
+		orphaned := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"sort":    "orphan",
+		})
+		if got := getAuditPageKeys(t, orphaned); !slices.Equal(got, []string{
+			"https://example.com/c", "https://example.com/", "https://example.com/a", "https://example.com/b",
+		}) {
+			t.Fatalf("orphan page keys = %v", got)
+		}
+
+		orphanOnly := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"filter":  map[string]any{"orphan_only": true},
+		})
+		if got := getAuditPageKeys(t, orphanOnly); !slices.Equal(got, []string{"https://example.com/c"}) {
+			t.Fatalf("orphan_only page keys = %v", got)
+		}
+		assertNumber(t, "orphan_only total", orphanOnly["total"], 1)
+
+		byStatus := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"filter":  map[string]any{"status_code": 404},
+		})
+		if got := getAuditPageKeys(t, byStatus); !slices.Equal(got, []string{"https://example.com/c"}) {
+			t.Fatalf("status_code page keys = %v", got)
+		}
+
+		byRank := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"filter":  map[string]any{"min_pagerank": 0.5},
+		})
+		if got := getAuditPageKeys(t, byRank); !slices.Equal(got, []string{"https://example.com/", "https://example.com/b"}) {
+			t.Fatalf("min_pagerank page keys = %v", got)
+		}
+	})
+
+	t.Run("links are content rows with filters and pagination", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "links",
+			"sort":    "target",
+			"limit":   1,
+		})
+		links := auditObjectList(t, out, "links")
+		if len(links) != 1 {
+			t.Fatalf("links = %d, want 1", len(links))
+		}
+		assertNumber(t, "links total", out["total"], 3)
+		if got := auditString(t, links[0], "target"); got != "https://example.com/a" {
+			t.Fatalf("first target = %q, want /a", got)
+		}
+		if out["has_more"] != true {
+			t.Fatalf("links has_more = %v, want true", out["has_more"])
+		}
+
+		filtered := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "links",
+			"filter":  map[string]any{"decision": "excluded"},
+		})
+		if got := auditObjectList(t, filtered, "links"); len(got) != 0 {
+			t.Fatalf("excluded links = %v, want none because Result.Links is content-only", got)
+		}
+		assertNumber(t, "excluded links total", filtered["total"], 0)
+	})
+
+	t.Run("blocks anchors pagerank redirects failed sitemap and structure", func(t *testing.T) {
+		blocks := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "blocks",
+		})
+		if got := auditObjectList(t, blocks, "blocks"); len(got) != 2 {
+			t.Fatalf("blocks = %d, want 2", len(got))
+		}
+		excluded := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "blocks",
+			"filter":  map[string]any{"decision": "excluded"},
+		})
+		excludedBlocks := auditObjectList(t, excluded, "blocks")
+		if len(excludedBlocks) != 1 || excludedBlocks[0]["block_id"] != "block-nav" {
+			t.Fatalf("excluded blocks = %v", excludedBlocks)
+		}
+
+		anchors := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "anchors",
+		})
+		anchorsObj := nestedObject(t, anchors, "anchors")
+		topAnchors, ok := anchorsObj["top_anchors"].([]any)
+		if !ok || len(topAnchors) != 1 {
+			t.Fatalf("anchors.top_anchors = %v", anchorsObj["top_anchors"])
+		}
+
+		pagerank := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pagerank",
+		})
+		rankObj := nestedObject(t, pagerank, "pagerank")
+		ranking := auditObjectList(t, rankObj, "ranking")
+		if len(ranking) != 4 {
+			t.Fatalf("pagerank ranking = %d, want 4", len(ranking))
+		}
+		if got := auditString(t, ranking[0], "url"); got != "https://example.com/b" {
+			t.Fatalf("first ranking URL = %q, want /b", got)
+		}
+		meta := nestedObject(t, rankObj, "meta")
+		assertNumber(t, "pagerank.meta.node_count", meta["node_count"], 4)
+
+		rankFiltered := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pagerank",
+			"filter":  map[string]any{"min_inbound": 5},
+		})
+		filteredRanking := auditObjectList(t, nestedObject(t, rankFiltered, "pagerank"), "ranking")
+		if len(filteredRanking) != 1 || auditString(t, filteredRanking[0], "url") != "https://example.com/b" {
+			t.Fatalf("filtered pagerank = %v", filteredRanking)
+		}
+
+		redirects := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "redirects",
+		})
+		if got := auditObjectList(t, redirects, "redirects"); len(got) != 1 || auditString(t, got[0], "url") != "https://example.com/old" {
+			t.Fatalf("redirects = %v", got)
+		}
+
+		failed := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "failed",
+		})
+		if got := auditObjectList(t, failed, "failed"); len(got) != 1 || auditString(t, got[0], "url") != "https://example.com/broken" {
+			t.Fatalf("failed = %v", got)
+		}
+
+		sitemap := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "sitemap",
+		})
+		sitemapObj := nestedObject(t, sitemap, "sitemap")
+		assertNumber(t, "sitemap.url_count", sitemapObj["url_count"], 4)
+
+		structure := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "structure",
+		})
+		structureObj := nestedObject(t, structure, "structure")
+		assertNumber(t, "structure.total_blocks", structureObj["total_blocks"], 2)
+	})
+
+	t.Run("all returns summary and counts without arrays", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "all",
+		})
+		summary := nestedObject(t, out, "summary")
+		assertNumber(t, "all summary.pages", summary["pages"], 4)
+		sections := auditObjectList(t, out, "sections")
+		if len(sections) != 10 {
+			t.Fatalf("all sections = %d, want 10", len(sections))
+		}
+		for _, key := range []string{"pages", "links", "blocks", "redirects", "failed"} {
+			if _, present := out[key]; present {
+				t.Fatalf("all returned %q, want counts only", key)
+			}
+		}
+		byName := make(map[string]map[string]any, len(sections))
+		for _, section := range sections {
+			byName[auditString(t, section, "name")] = section
+		}
+		pagesSection, ok := byName["pages"]
+		if !ok || pagesSection["available"] != true {
+			t.Fatalf("pages section status = %v", byName["pages"])
+		}
+		assertNumber(t, "pages section count", pagesSection["count"], 4)
+	})
+
+	t.Run("audit_not_available for disabled not-done and failed profiles", func(t *testing.T) {
+		disabled := createDoneResultsJob(t, app, "", nil)
+		res := callTool(t, ctx, session, "get_audit", map[string]any{"job_id": disabled.id})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+			t.Fatalf("disabled audit error = %q", toolResultText(res))
+		}
+
+		running := createDoneResultsJob(t, app, "", nil)
+		running.mu.Lock()
+		running.status = jobStatusRunning
+		running.phase = jobPhaseCrawling
+		running.settings.Audit = true
+		running.auditReady = true
+		running.auditDir = strictDir
+		running.mu.Unlock()
+		res = callTool(t, ctx, session, "get_audit", map[string]any{"job_id": running.id})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+			t.Fatalf("running job audit error = %q", toolResultText(res))
+		}
+
+		partial := createDoneResultsJob(t, app, "", nil)
+		partial.mu.Lock()
+		partial.settings.Audit = true
+		partial.auditReady = true
+		partial.auditDir = strictDir
+		partial.auditInclusiveReady = false
+		partial.auditInclusiveError = "inclusive audit exploded"
+		partial.mu.Unlock()
+
+		// The strict profile still works while inclusive is unavailable.
+		callToolObject(t, ctx, session, "get_audit", map[string]any{"job_id": partial.id})
+
+		res = callTool(t, ctx, session, "get_audit", map[string]any{"job_id": partial.id, "profile": "inclusive"})
+		if !res.IsError {
+			t.Fatal("inclusive get_audit succeeded for a failed profile")
+		}
+		text := strings.ToLower(toolResultText(res))
+		for _, want := range []string{"audit_not_available", "inclusive audit exploded"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("inclusive failure error = %q, want %q", text, want)
+			}
+		}
+
+		notReady := createDoneResultsJob(t, app, "", nil)
+		notReady.mu.Lock()
+		notReady.settings.Audit = true
+		notReady.auditReady = false
+		notReady.auditError = "strict audit exploded"
+		notReady.mu.Unlock()
+		res = callTool(t, ctx, session, "get_audit", map[string]any{"job_id": notReady.id})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "strict audit exploded") {
+			t.Fatalf("not-ready strict error = %q", toolResultText(res))
+		}
+
+		missing := createDoneResultsJob(t, app, "", nil)
+		missing.mu.Lock()
+		missing.settings.Audit = true
+		missing.auditReady = true
+		missing.auditDir = filepath.Join(t.TempDir(), "absent")
+		missing.mu.Unlock()
+		res = callTool(t, ctx, session, "get_audit", map[string]any{"job_id": missing.id})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+			t.Fatalf("missing audit error = %q", toolResultText(res))
+		}
+	})
+
+	t.Run("rejects invalid arguments", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			args    map[string]any
+			wantSub string
+		}{
+			{"missing job id", map[string]any{}, "job_id"},
+			{"unknown job", map[string]any{"job_id": "missing"}, "job_not_found"},
+			{"invalid profile", map[string]any{"job_id": job.id, "profile": "loose"}, "profile"},
+			{"invalid section", map[string]any{"job_id": job.id, "section": "everything"}, "section"},
+			{"sort on summary", map[string]any{"job_id": job.id, "section": "summary", "sort": "url"}, "sort"},
+			{"invalid pages sort", map[string]any{"job_id": job.id, "section": "pages", "sort": "title"}, "sort"},
+			{"negative offset", map[string]any{"job_id": job.id, "offset": -1}, "offset"},
+			{"negative limit", map[string]any{"job_id": job.id, "limit": -1}, "limit"},
+			{"unknown pages filter", map[string]any{"job_id": job.id, "section": "pages", "filter": map[string]any{"nope": true}}, "filter"},
+			{"unknown links filter", map[string]any{"job_id": job.id, "section": "links", "filter": map[string]any{"orphan_only": true}}, "filter"},
+			{"invalid filter value", map[string]any{"job_id": job.id, "section": "pages", "filter": map[string]any{"orphan_only": "yes"}}, "orphan_only"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "get_audit", tc.args)
+				if !res.IsError {
+					t.Fatalf("get_audit accepted invalid input: %v", res.StructuredContent)
+				}
+				if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, tc.wantSub) {
+					t.Fatalf("error = %q, want %q", text, tc.wantSub)
+				}
+			})
+		}
+	})
+
+	t.Run("cache invalidates when audit.json changes", func(t *testing.T) {
+		first := callToolObject(t, ctx, session, "get_audit", map[string]any{"job_id": job.id})
+		assertNumber(t, "initial summary.pages", nestedObject(t, first, "summary")["pages"], 4)
+
+		changed := strict
+		changed.Summary.Pages = 9
+		path := writeAuditResultFixture(t, strictDir, changed)
+		future := time.Now().Add(3 * time.Second)
+		if err := os.Chtimes(path, future, future); err != nil {
+			t.Fatalf("touch audit fixture: %v", err)
+		}
+
+		second := callToolObject(t, ctx, session, "get_audit", map[string]any{"job_id": job.id})
+		assertNumber(t, "refreshed summary.pages", nestedObject(t, second, "summary")["pages"], 9)
+	})
+}

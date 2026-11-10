@@ -1,7 +1,7 @@
 ---
 id: task-015
 title: "[Slice] Agent reads strict and inclusive audit sections"
-status: pending
+status: completed
 depends_on: ["task-014"]
 target_files:
   - "mcp_audit.go"

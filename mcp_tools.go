@@ -54,6 +54,16 @@ func (s *mcpServer) registerTools() {
 			OpenWorldHint:  boolPtr(false),
 		},
 	}, s.getResults)
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "get_audit",
+		Description: "Read a strict or inclusive audit section for a completed MCP job. Sections include summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, and all. links contains content page links only; external, redirect, and excluded rows are available in the audit ZIP artifact.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+			OpenWorldHint:  boolPtr(false),
+		},
+	}, s.getAudit)
 }
 
 // startCrawlPlan is the validated request shared by job creation and launch.
@@ -407,6 +417,181 @@ func (s *mcpServer) getResults(_ context.Context, _ *mcp.CallToolRequest, in get
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: getResultsSummaryText(out)}},
 	}, out, nil
+}
+
+// getAudit returns one section of the job-owned strict or inclusive audit
+// report. The handler never accepts a filesystem path: the loader builds it
+// from the job's audit directory.
+func (s *mcpServer) getAudit(_ context.Context, _ *mcp.CallToolRequest, in getAuditInput) (*mcp.CallToolResult, getAuditOutput, error) {
+	if err := s.checkToolRateLimit(); err != nil {
+		return nil, getAuditOutput{}, err
+	}
+
+	jobID := strings.TrimSpace(in.JobID)
+	if jobID == "" {
+		return nil, getAuditOutput{}, fmt.Errorf("invalid_argument: job_id is required")
+	}
+
+	job := s.jobs.get(jobID)
+	if job == nil || !job.ownedBy(ownerMCP) {
+		return nil, getAuditOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	}
+
+	profile := strings.TrimSpace(in.Profile)
+	if profile == "" {
+		profile = "strict"
+	}
+	if err := validateJobEnum("profile", profile, getAuditProfiles); err != nil {
+		return nil, getAuditOutput{}, err
+	}
+
+	section := strings.TrimSpace(in.Section)
+	if section == "" {
+		section = "summary"
+	}
+	if err := validateJobEnum("section", section, getAuditSections); err != nil {
+		return nil, getAuditOutput{}, err
+	}
+
+	if in.Offset < 0 {
+		return nil, getAuditOutput{}, fmt.Errorf("invalid_argument: offset must be non-negative")
+	}
+	limit := in.Limit
+	switch {
+	case limit == 0:
+		limit = defaultGetAuditLimit
+	case limit < 0:
+		return nil, getAuditOutput{}, fmt.Errorf("invalid_argument: limit must be non-negative")
+	case limit > maxGetAuditLimit:
+		limit = maxGetAuditLimit
+	}
+
+	sortField, err := validateAuditSectionArgs(section, in.Sort, in.Filter)
+	if err != nil {
+		return nil, getAuditOutput{}, err
+	}
+	if err := validateAuditFilterValues(section, in.Filter); err != nil {
+		return nil, getAuditOutput{}, err
+	}
+
+	state := job.auditSnapshot()
+	if state.status != jobStatusDone {
+		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: audit is available only when job %q is done (status %s)", jobID, state.status)
+	}
+	if !state.auditEnabled {
+		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: job %q did not enable audit", jobID)
+	}
+
+	var ready bool
+	var dir string
+	var storedError string
+	switch profile {
+	case "strict":
+		ready = state.strictReady
+		dir = state.strictDir
+		storedError = state.strictError
+	case "inclusive":
+		ready = state.inclusiveReady
+		dir = state.inclusiveDir
+		storedError = state.inclusiveError
+	}
+	if !ready {
+		if storedError != "" {
+			// The stored error explains the failure, but it may contain the
+			// job-owned directory, so strip that before returning it.
+			return nil, getAuditOutput{}, fmt.Errorf(
+				"audit_not_available: %s audit failed for job %q: %s",
+				profile, jobID, sanitizeAuditError(storedError, state.strictDir, state.inclusiveDir),
+			)
+		}
+		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: %s audit is not ready for job %q", profile, jobID)
+	}
+	if strings.TrimSpace(dir) == "" {
+		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: %s audit has no report directory for job %q", profile, jobID)
+	}
+
+	result, err := loadAuditResult(dir)
+	if err != nil {
+		// Never echo the loader error: it contains the on-disk path.
+		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: %s audit could not be loaded for job %q", profile, jobID)
+	}
+
+	out := getAuditOutput{
+		JobID:   jobID,
+		Profile: profile,
+		Section: section,
+		Offset:  in.Offset,
+		Limit:   limit,
+	}
+	if err := populateAuditSection(&out, result, sortField, in.Filter); err != nil {
+		return nil, getAuditOutput{}, err
+	}
+	out.Truncated = in.Limit > maxGetAuditLimit && out.Total > maxGetAuditLimit
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: getAuditSummaryText(out)}},
+	}, out, nil
+}
+
+// auditJobSnapshot is one consistent copy of the audit lifecycle fields.
+type auditJobSnapshot struct {
+	status         string
+	auditEnabled   bool
+	strictReady    bool
+	strictDir      string
+	strictError    string
+	inclusiveReady bool
+	inclusiveDir   string
+	inclusiveError string
+}
+
+func (j *crawlJob) auditSnapshot() auditJobSnapshot {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return auditJobSnapshot{
+		status:         j.status,
+		auditEnabled:   j.settings.Audit,
+		strictReady:    j.auditReady,
+		strictDir:      j.auditDir,
+		strictError:    j.auditError,
+		inclusiveReady: j.auditInclusiveReady,
+		inclusiveDir:   j.auditInclusiveDir,
+		inclusiveError: j.auditInclusiveError,
+	}
+}
+
+// getAuditSummaryText renders a short agent-facing summary of the section.
+func getAuditSummaryText(out getAuditOutput) string {
+	if out.Section == "summary" && out.Summary != nil {
+		return fmt.Sprintf(
+			"%s audit summary for job %s: %d page(s), %d content link(s), %d orphan(s).",
+			out.Profile, out.JobID, out.Summary.Pages, out.Summary.Links, out.Summary.Orphans,
+		)
+	}
+	if out.Section == "all" && out.Summary != nil {
+		return fmt.Sprintf(
+			"%s audit for job %s: %d page(s), %d content link(s), %d block(s), %d section status row(s).",
+			out.Profile, out.JobID, out.Summary.Pages, out.Summary.Links, out.Summary.Blocks, out.Total,
+		)
+	}
+	if out.Total == 0 {
+		return fmt.Sprintf("%s audit %s for job %s is empty.", out.Profile, out.Section, out.JobID)
+	}
+	shown := out.Total - out.Offset
+	if shown > out.Limit {
+		shown = out.Limit
+	}
+	if shown < 0 {
+		shown = 0
+	}
+	summary := fmt.Sprintf("%s audit %s for job %s: showing %d of %d.", out.Profile, out.Section, out.JobID, shown, out.Total)
+	if out.HasMore && out.NextOffset != nil {
+		summary += fmt.Sprintf(" More rows available; next_offset is %d.", *out.NextOffset)
+	}
+	if out.Truncated {
+		summary += " Response truncated at the server limit cap."
+	}
+	return summary
 }
 
 // getResultsResponseOverhead reserves envelope and summary bytes when applying

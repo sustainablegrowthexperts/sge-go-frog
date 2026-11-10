@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	auditpkg "go-frog/internal/audit"
 )
 
 // Job owners. The web UI and the MCP tools share one job manager, but MCP
@@ -363,6 +365,137 @@ type getResultsOutput struct {
 	NextOffset *int              `json:"next_offset,omitempty"`
 	Summary    getResultsSummary `json:"summary"`
 	Rows       []getResultsRow   `json:"rows"`
+}
+
+// get_audit pagination defaults and the accepted profile/section values.
+const (
+	defaultGetAuditLimit = 100
+	maxGetAuditLimit     = 500
+)
+
+var (
+	getAuditProfiles = []string{"strict", "inclusive"}
+	getAuditSections = []string{
+		"summary", "pages", "links", "blocks", "anchors",
+		"pagerank", "redirects", "failed", "sitemap", "structure", "all",
+	}
+)
+
+// getAuditInput is the typed input for the get_audit tool. Filter is a
+// section-specific object validated by the handler; unknown keys are rejected
+// so a typo cannot silently return an unfiltered report.
+type getAuditInput struct {
+	JobID   string         `json:"job_id,omitempty" jsonschema:"job ID returned by start_crawl"`
+	Profile string         `json:"profile,omitempty" jsonschema:"audit profile: strict (default) or inclusive"`
+	Section string         `json:"section,omitempty" jsonschema:"report section: summary (default), pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, or all"`
+	Offset  int            `json:"offset,omitempty" jsonschema:"number of matching rows to skip; defaults to 0"`
+	Limit   int            `json:"limit,omitempty" jsonschema:"maximum rows to return; defaults to 100 and is capped at 500"`
+	Sort    string         `json:"sort,omitempty" jsonschema:"section-specific deterministic sort field"`
+	Filter  map[string]any `json:"filter,omitempty" jsonschema:"section-specific filters; unknown keys are rejected"`
+}
+
+// getAuditPage is one audit page row. PageKey is the audit graph identity and
+// may differ from the crawl row URL; the URL identity fields are reported
+// alongside it so callers can join without assuming string equality.
+type getAuditPage struct {
+	PageKey                    string   `json:"page_key"`
+	URL                        string   `json:"url"`
+	RawURL                     string   `json:"raw_url,omitempty"`
+	FinalURL                   string   `json:"final_url,omitempty"`
+	Depth                      int      `json:"depth"`
+	StatusCode                 int      `json:"status_code"`
+	Title                      string   `json:"title"`
+	ContentOutbound            int      `json:"content_outbound"`
+	ContentInbound             int      `json:"content_inbound"`
+	ContentOutboundOccurrences int      `json:"content_outbound_occurrences"`
+	ContentInboundOccurrences  int      `json:"content_inbound_occurrences"`
+	ContentOutboundUnique      int      `json:"content_outbound_unique"`
+	ContentInboundUnique       int      `json:"content_inbound_unique"`
+	NavInbound                 int      `json:"nav_inbound"`
+	PageRank                   float64  `json:"pagerank"`
+	IsOrphan                   bool     `json:"is_orphan"`
+	OrphanType                 string   `json:"orphan_type,omitempty"`
+	IsStart                    bool     `json:"is_start"`
+	InSitemap                  bool     `json:"in_sitemap"`
+	SitemapOnly                bool     `json:"sitemap_only"`
+	ContentOrphan              bool     `json:"content_orphan"`
+	ContentReachableFromStart  bool     `json:"content_reachable_from_start"`
+	NavReachable               bool     `json:"nav_reachable"`
+	Aliases                    []string `json:"aliases,omitempty"`
+}
+
+// getAuditSummary is AuditSummary plus high-level graph counts. It never
+// includes the report's on-disk output directory.
+type getAuditSummary struct {
+	Pages                  int    `json:"pages"`
+	ContentLinks           int    `json:"content_links"`
+	ContentPageLinks       int    `json:"content_page_links"`
+	ContentLinkOccurrences int    `json:"content_link_occurrences"`
+	UniqueContentLinks     int    `json:"unique_content_links"`
+	Orphans                int    `json:"orphans"`
+	ContentOrphans         int    `json:"content_orphans"`
+	ContentUnreachable     int    `json:"content_unreachable"`
+	SitemapOnly            int    `json:"sitemap_only"`
+	NavLinks               int    `json:"nav_links"`
+	ExternalLinks          int    `json:"external_links"`
+	SelfLinks              int    `json:"self_links"`
+	GeneratedAt            string `json:"generated_at,omitempty"`
+	Links                  int    `json:"links"`
+	Blocks                 int    `json:"blocks"`
+	Redirects              int    `json:"redirects"`
+	Failed                 int    `json:"failed"`
+	TopAnchors             int    `json:"top_anchors"`
+	PageRankNodes          int    `json:"pagerank_nodes"`
+	PageRankEdges          int    `json:"pagerank_edges"`
+	SitemapURLs            int    `json:"sitemap_urls"`
+}
+
+// getAuditSitemap is the bounded sitemap summary stored in audit.json.
+type getAuditSitemap struct {
+	FetchedAt string   `json:"fetched_at,omitempty"`
+	Sitemaps  []string `json:"sitemaps,omitempty"`
+	URLs      []string `json:"urls,omitempty"`
+	URLCount  int      `json:"url_count,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
+}
+
+// getAuditPageRank is the ranking plus the methodology metadata.
+type getAuditPageRank struct {
+	Ranking []auditpkg.RankEntry  `json:"ranking"`
+	Meta    auditpkg.PageRankMeta `json:"meta"`
+}
+
+// getAuditSectionStatus is one row of the all section: availability plus a
+// count, never the full section payload.
+type getAuditSectionStatus struct {
+	Name      string `json:"name"`
+	Available bool   `json:"available"`
+	Count     int    `json:"count"`
+}
+
+// getAuditOutput is the typed output for get_audit. Only the requested section
+// is populated, so "all" cannot accidentally dump every array.
+type getAuditOutput struct {
+	JobID      string                   `json:"job_id"`
+	Profile    string                   `json:"profile"`
+	Section    string                   `json:"section"`
+	Total      int                      `json:"total"`
+	Offset     int                      `json:"offset"`
+	Limit      int                      `json:"limit"`
+	HasMore    bool                     `json:"has_more"`
+	NextOffset *int                     `json:"next_offset,omitempty"`
+	Truncated  bool                     `json:"truncated"`
+	Summary    *getAuditSummary         `json:"summary,omitempty"`
+	Pages      *[]getAuditPage          `json:"pages,omitempty"`
+	Links      *[]auditpkg.Link         `json:"links,omitempty"`
+	Blocks     *[]auditpkg.Block        `json:"blocks,omitempty"`
+	Anchors    *auditpkg.Anchors        `json:"anchors,omitempty"`
+	PageRank   *getAuditPageRank        `json:"pagerank,omitempty"`
+	Redirects  *[]auditpkg.Redirect     `json:"redirects,omitempty"`
+	Failed     *[]auditpkg.Failed       `json:"failed,omitempty"`
+	Sitemap    *getAuditSitemap         `json:"sitemap,omitempty"`
+	Structure  *auditpkg.Structure      `json:"structure,omitempty"`
+	Sections   *[]getAuditSectionStatus `json:"sections,omitempty"`
 }
 
 // getJobOutput is the typed output for get_job. It deliberately excludes
