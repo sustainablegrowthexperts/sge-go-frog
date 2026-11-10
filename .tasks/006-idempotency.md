@@ -1,7 +1,7 @@
 ---
 id: task-006
 title: "[Slice] Repeated start_crawl requests are idempotent"
-status: pending
+status: completed
 depends_on: ["task-005"]
 target_files:
   - "server.go"

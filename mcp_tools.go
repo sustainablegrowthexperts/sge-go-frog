@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -41,43 +42,68 @@ func (s *mcpServer) registerTools() {
 
 // startCrawlPlan is the validated request shared by job creation and launch.
 type startCrawlPlan struct {
-	mode     string
-	target   string
-	settings WizardSettings
-	limits   jobLimits
+	mode            string
+	target          string
+	settings        WizardSettings
+	limits          jobLimits
+	clientRequestID string
+	fingerprint     string
 }
 
 // startCrawl validates a spider or list request, creates an MCP-owned job,
 // launches the crawl asynchronously, and returns immediately with the job
-// handle and effective limits.
+// handle and effective limits. A supplied client_request_id makes retries
+// idempotent: identical input returns the original job, while different input
+// returns a conflict.
 func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in startCrawlInput) (*mcp.CallToolResult, startCrawlOutput, error) {
 	plan, err := s.validateStartCrawl(in)
 	if err != nil {
 		return nil, startCrawlOutput{}, err
 	}
 
-	job := s.jobs.createWithOwner(ownerMCP, plan.mode, plan.target, plan.settings)
-	job.limits = plan.limits
-	job.archiveHTML = false
+	job, replay, err := s.jobs.createWithRequest(
+		ownerMCP,
+		plan.mode,
+		plan.target,
+		plan.settings,
+		plan.limits,
+		false,
+		plan.clientRequestID,
+		plan.fingerprint,
+	)
+	if err != nil {
+		return nil, startCrawlOutput{}, err
+	}
 
-	go runCrawlJob(job, plan.settings, s.runner)
+	if !replay {
+		go runCrawlJob(job, plan.settings, s.runner)
+	}
 
-	_, phase := job.statusPhase()
-	return nil, startCrawlOutput{
+	return nil, s.startCrawlOutput(job), nil
+}
+
+// startCrawlOutput builds the start response from a job snapshot. Replays use
+// the same helper so the job ID, links, limits, and current lifecycle state are
+// reported consistently without exposing the client request ID.
+func (s *mcpServer) startCrawlOutput(job *crawlJob) startCrawlOutput {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+
+	return startCrawlOutput{
 		JobID:       job.id,
-		Mode:        plan.mode,
-		Status:      jobStatusRunning,
-		Phase:       phase,
+		Mode:        job.mode,
+		Status:      job.status,
+		Phase:       job.phase,
 		PollAfterMS: defaultPollAfterMS,
-		Audit:       plan.settings.Audit,
+		Audit:       job.settings.Audit,
 		ArchiveHTML: job.archiveHTML,
 		Limits: getJobLimits{
-			MaxPages:           plan.limits.MaxPages,
-			MaxDepth:           plan.limits.MaxDepth,
-			MaxDurationSeconds: int(plan.limits.MaxDuration / time.Second),
+			MaxPages:           job.limits.MaxPages,
+			MaxDepth:           job.limits.MaxDepth,
+			MaxDurationSeconds: int(job.limits.MaxDuration / time.Second),
 		},
 		Links: jobLinks(s.config, job.id),
-	}, nil
+	}
 }
 
 // getJob returns a consistent snapshot of an MCP-owned job. Unknown and
@@ -253,10 +279,37 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 		return startCrawlPlan{}, err
 	}
 
-	return startCrawlPlan{
-		mode:     mode,
-		target:   target,
-		settings: settings,
-		limits:   jobLim,
-	}, nil
+	clientRequestID, err := validateClientRequestID(in.ClientRequestID)
+	if err != nil {
+		return startCrawlPlan{}, err
+	}
+
+	plan := startCrawlPlan{
+		mode:            mode,
+		target:          target,
+		settings:        settings,
+		limits:          jobLim,
+		clientRequestID: clientRequestID,
+	}
+	if clientRequestID != "" {
+		plan.fingerprint = canonicalStartCrawlFingerprint(plan)
+	}
+	return plan, nil
+}
+
+// validateClientRequestID trims and validates the optional idempotency key. An
+// omitted or empty key means "no idempotency"; a supplied value must be
+// non-empty after trimming and within the length cap.
+func validateClientRequestID(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return "", fmt.Errorf("invalid_argument: client_request_id must not be empty")
+	}
+	if utf8.RuneCountInString(id) > maxClientRequestIDLength {
+		return "", fmt.Errorf("invalid_argument: client_request_id must be at most %d characters", maxClientRequestIDLength)
+	}
+	return id, nil
 }

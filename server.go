@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +34,18 @@ var indexTmpl = template.Must(template.ParseFS(webFS, "web/index.html"))
 type jobManager struct {
 	mu   sync.RWMutex
 	jobs map[string]*crawlJob
+
+	// idempotency maps owner + "\x00" + client_request_id to the job that
+	// first used the key and the canonical fingerprint of that request. It is
+	// guarded by mu and purged whenever the mapped job is deleted or reaped.
+	idempotency map[string]idempotencyEntry
+}
+
+// idempotencyEntry records the job owning a request key and the effective
+// request fingerprint stored when that job was created.
+type idempotencyEntry struct {
+	jobID       string
+	fingerprint string
 }
 
 type crawlJob struct {
@@ -40,8 +55,7 @@ type crawlJob struct {
 	createdAt time.Time
 	owner     string // "ui" | "mcp"
 
-	// limits and archiveHTML are immutable after creation; clientRequestID is
-	// reserved for the idempotency slice.
+	// limits, archiveHTML, and clientRequestID are immutable after creation.
 	limits          jobLimits
 	archiveHTML     bool
 	clientRequestID string
@@ -73,12 +87,48 @@ type crawlJob struct {
 }
 
 func newJobManager() *jobManager {
-	jm := &jobManager{jobs: make(map[string]*crawlJob)}
+	jm := &jobManager{
+		jobs:        make(map[string]*crawlJob),
+		idempotency: make(map[string]idempotencyEntry),
+	}
 	go jm.reapLoop()
 	return jm
 }
 
+// createWithOwner creates an owner-scoped job without an idempotency key.
 func (jm *jobManager) createWithOwner(owner, mode, target string, s WizardSettings) *crawlJob {
+	job, _, _ := jm.createWithRequest(owner, mode, target, s, jobLimits{}, false, "", "")
+	return job
+}
+
+// createWithRequest creates a job and, when clientRequestID is set, atomically
+// records its idempotency mapping. It returns the existing job and replay=true
+// for a matching repeat, or an idempotencyConflictError when the same key was
+// used with different effective input. The check and insert share one write
+// lock so concurrent retries cannot create duplicate jobs.
+func (jm *jobManager) createWithRequest(owner, mode, target string, s WizardSettings, limits jobLimits, archiveHTML bool, clientRequestID, fingerprint string) (*crawlJob, bool, error) {
+	key := ""
+	if clientRequestID != "" {
+		key = idempotencyKey(owner, clientRequestID)
+	}
+
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+
+	if key != "" {
+		if entry, ok := jm.idempotency[key]; ok {
+			if existing := jm.jobs[entry.jobID]; existing != nil {
+				if entry.fingerprint != fingerprint {
+					return nil, false, &idempotencyConflictError{ExistingJobID: entry.jobID}
+				}
+				return existing, true, nil
+			}
+			// The index entry outlived its job. Drop it and treat the request
+			// as new; delete/reap should have removed it already.
+			delete(jm.idempotency, key)
+		}
+	}
+
 	var id string
 	if owner == ownerMCP {
 		id = newMCPJobID()
@@ -87,19 +137,97 @@ func (jm *jobManager) createWithOwner(owner, mode, target string, s WizardSettin
 	}
 	now := time.Now().UTC()
 	j := &crawlJob{
-		id:        id,
-		mode:      mode,
-		target:    target,
-		createdAt: now,
-		owner:     owner,
-		status:    jobStatusRunning,
-		phase:     jobPhaseStarting,
-		settings:  s,
+		id:              id,
+		mode:            mode,
+		target:          target,
+		createdAt:       now,
+		owner:           owner,
+		limits:          limits,
+		archiveHTML:     archiveHTML,
+		clientRequestID: clientRequestID,
+		status:          jobStatusRunning,
+		phase:           jobPhaseStarting,
+		settings:        s,
 	}
-	jm.mu.Lock()
 	jm.jobs[j.id] = j
-	jm.mu.Unlock()
-	return j
+	if key != "" {
+		if jm.idempotency == nil {
+			jm.idempotency = make(map[string]idempotencyEntry)
+		}
+		jm.idempotency[key] = idempotencyEntry{jobID: j.id, fingerprint: fingerprint}
+	}
+	return j, false, nil
+}
+
+// idempotencyKey scopes request IDs to one owner so different callers can use
+// the same key without colliding.
+func idempotencyKey(owner, clientRequestID string) string {
+	return owner + "\x00" + clientRequestID
+}
+
+// crawlFingerprintPayload is the canonical, deterministic shape hashed for an
+// idempotent request. Field order is fixed by the struct and list URLs are
+// sorted/deduplicated so equivalent list requests share a fingerprint.
+type crawlFingerprintPayload struct {
+	Mode             string                        `json:"mode"`
+	StartURL         string                        `json:"start_url,omitempty"`
+	URLs             []string                      `json:"urls,omitempty"`
+	Keywords         []string                      `json:"keywords,omitempty"`
+	Concurrency      int                           `json:"concurrency"`
+	Audit            bool                          `json:"audit"`
+	AuditFilters     *crawlFingerprintAuditFilters `json:"audit_filters,omitempty"`
+	MaxPages         int                           `json:"max_pages"`
+	MaxDepth         int                           `json:"max_depth"`
+	MaxDurationNanos int64                         `json:"max_duration_nanos"`
+}
+
+// crawlFingerprintAuditFilters is the canonical filter profile included in the
+// request fingerprint only when the caller supplied one.
+type crawlFingerprintAuditFilters struct {
+	NavSubstrings     []string `json:"nav_substrings,omitempty"`
+	ExcludeSubstrings []string `json:"exclude_substrings,omitempty"`
+	Explicit          bool     `json:"explicit"`
+}
+
+// canonicalStartCrawlFingerprint returns a stable hash of the effective
+// start_crawl request: mode, target URLs, keywords, concurrency, audit
+// settings, audit filters, and per-job limits.
+func canonicalStartCrawlFingerprint(plan startCrawlPlan) string {
+	payload := crawlFingerprintPayload{
+		Mode:             plan.mode,
+		Keywords:         splitJobKeywords(plan.settings.KeywordsRaw),
+		Concurrency:      plan.settings.Concurrency,
+		Audit:            plan.settings.Audit,
+		MaxPages:         plan.limits.MaxPages,
+		MaxDepth:         plan.limits.MaxDepth,
+		MaxDurationNanos: int64(plan.limits.MaxDuration),
+	}
+
+	switch plan.mode {
+	case "spider":
+		payload.StartURL = plan.settings.StartURL
+	case "list":
+		urls := append([]string(nil), plan.settings.listURLs...)
+		slices.Sort(urls)
+		payload.URLs = slices.Compact(urls)
+	}
+
+	if filters := plan.settings.AuditFilters; filters != nil {
+		payload.AuditFilters = &crawlFingerprintAuditFilters{
+			NavSubstrings:     append([]string(nil), filters.NavSubstrings...),
+			ExcludeSubstrings: append([]string(nil), filters.ExcludeSubstrings...),
+			Explicit:          filters.Explicit,
+		}
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		// Every field is a plain JSON type, so this is unreachable; returning
+		// an empty fingerprint keeps a create from being treated as a replay.
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 func (jm *jobManager) get(id string) *crawlJob {
@@ -197,27 +325,52 @@ func (jm *jobManager) runningCount(owner string) int {
 	return count
 }
 
-// delete removes a job from the manager. It reports whether the job existed.
+// delete removes a job from the manager and purges its idempotency mapping. It
+// reports whether the job existed.
 func (jm *jobManager) delete(id string) bool {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
-	if _, ok := jm.jobs[id]; !ok {
+	return jm.deleteLocked(id)
+}
+
+// deleteLocked removes a job and its mapping. The caller must hold jm.mu.
+func (jm *jobManager) deleteLocked(id string) bool {
+	job, ok := jm.jobs[id]
+	if !ok {
 		return false
 	}
 	delete(jm.jobs, id)
+	jm.purgeIdempotencyLocked(job)
 	return true
+}
+
+// purgeIdempotencyLocked removes the index entry owned by job. The caller must
+// hold jm.mu.
+func (jm *jobManager) purgeIdempotencyLocked(job *crawlJob) {
+	if job == nil || job.clientRequestID == "" {
+		return
+	}
+	key := idempotencyKey(job.owner, job.clientRequestID)
+	if entry, ok := jm.idempotency[key]; ok && entry.jobID == job.id {
+		delete(jm.idempotency, key)
+	}
 }
 
 func (jm *jobManager) reapLoop() {
 	for range time.Tick(5 * time.Minute) {
-		jm.mu.Lock()
-		cutoff := time.Now().Add(-30 * time.Minute)
-		for id, j := range jm.jobs {
-			if j.createdAt.Before(cutoff) {
-				delete(jm.jobs, id)
-			}
+		jm.reapBefore(time.Now().Add(-30 * time.Minute))
+	}
+}
+
+// reapBefore removes every job created before cutoff and purges the matching
+// idempotency entries in the same critical section.
+func (jm *jobManager) reapBefore(cutoff time.Time) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	for id, j := range jm.jobs {
+		if j.createdAt.Before(cutoff) {
+			jm.deleteLocked(id)
 		}
-		jm.mu.Unlock()
 	}
 }
 

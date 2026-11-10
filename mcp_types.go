@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -56,6 +57,30 @@ const (
 // defaultPollAfterMS is the polling hint returned by start_crawl.
 const defaultPollAfterMS = 1000
 
+// maxClientRequestIDLength caps the optional idempotency key. The value keeps
+// retry keys well below the request-body cap while leaving room for UUIDs and
+// prefixed identifiers.
+const maxClientRequestIDLength = 128
+
+// idempotencyConflictError is returned when a client_request_id is reused with
+// different effective input. Conflict errors are never retryable, and the
+// details identify the job that already owns the key for the same owner.
+type idempotencyConflictError struct {
+	ExistingJobID string
+}
+
+func (e *idempotencyConflictError) Error() string {
+	return fmt.Sprintf("conflict: client_request_id was already used with different input by job %s; retryable=false", e.ExistingJobID)
+}
+
+// Retryable reports whether a client may repeat the same call unchanged.
+func (e *idempotencyConflictError) Retryable() bool { return false }
+
+// Details returns machine-readable conflict details without exposing request IDs.
+func (e *idempotencyConflictError) Details() map[string]any {
+	return map[string]any{"job_id": e.ExistingJobID}
+}
+
 // jobLimits holds the effective per-job caps stored on a crawl job. Server
 // maxima are enforced before a job is created; this is what the job actually
 // ran with.
@@ -84,14 +109,15 @@ type startCrawlLimits struct {
 
 // startCrawlInput is the typed input for the start_crawl tool.
 type startCrawlInput struct {
-	Mode         string                  `json:"mode" jsonschema:"crawl mode: spider or list"`
-	StartURL     string                  `json:"start_url,omitempty" jsonschema:"starting URL for a spider crawl; spider mode only"`
-	URLs         []string                `json:"urls,omitempty" jsonschema:"URLs to visit once in list mode; deduplicated server-side"`
-	Keywords     []string                `json:"keywords,omitempty" jsonschema:"optional keywords whose occurrences are counted on each page"`
-	Concurrency  int                     `json:"concurrency,omitempty" jsonschema:"maximum concurrent requests; defaults to 10"`
-	Audit        bool                    `json:"audit,omitempty" jsonschema:"enable the strict and inclusive internal-linking audit; spider mode only"`
-	AuditFilters *startCrawlAuditFilters `json:"audit_filters,omitempty" jsonschema:"optional replacement audit filter profile; parsed only when explicit is true"`
-	Limits       *startCrawlLimits       `json:"limits,omitempty" jsonschema:"optional per-job page, depth, and duration caps"`
+	Mode            string                  `json:"mode" jsonschema:"crawl mode: spider or list"`
+	StartURL        string                  `json:"start_url,omitempty" jsonschema:"starting URL for a spider crawl; spider mode only"`
+	URLs            []string                `json:"urls,omitempty" jsonschema:"URLs to visit once in list mode; deduplicated server-side"`
+	Keywords        []string                `json:"keywords,omitempty" jsonschema:"optional keywords whose occurrences are counted on each page"`
+	Concurrency     int                     `json:"concurrency,omitempty" jsonschema:"maximum concurrent requests; defaults to 10"`
+	Audit           bool                    `json:"audit,omitempty" jsonschema:"enable the strict and inclusive internal-linking audit; spider mode only"`
+	AuditFilters    *startCrawlAuditFilters `json:"audit_filters,omitempty" jsonschema:"optional replacement audit filter profile; parsed only when explicit is true"`
+	Limits          *startCrawlLimits       `json:"limits,omitempty" jsonschema:"optional per-job page, depth, and duration caps"`
+	ClientRequestID string                  `json:"client_request_id,omitempty" jsonschema:"optional idempotency key; retries with identical input return the existing job"`
 }
 
 // startCrawlLinks holds the placeholder artifact links returned when a job

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	auditpkg "go-frog/internal/audit"
+
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -1362,4 +1364,373 @@ func TestStartCrawlOptions(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestStartCrawlIdempotency covers the task-006 contract:
+//   - a repeated start_crawl with the same client_request_id and identical
+//     effective input returns the original job and does not launch another crawl;
+//   - the same key with different input returns a stable conflict naming the
+//     existing job;
+//   - requests without a key always create a new job;
+//   - deleting a job purges its idempotency mapping;
+//   - empty, whitespace-only, and oversized request IDs are rejected.
+func TestStartCrawlIdempotency(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	requestArgs := func(url string) map[string]any {
+		return map[string]any{
+			"mode":              "spider",
+			"start_url":         url,
+			"keywords":          []string{"pricing"},
+			"client_request_id": "retry-key-1",
+		}
+	}
+
+	t.Run("identical replay returns the same job without a second crawl", func(t *testing.T) {
+		runner := newFakeCrawlRunner()
+		t.Cleanup(runner.Release)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		first := callToolObject(t, ctx, session, "start_crawl", requestArgs("example.com"))
+		jobID, _ := first["job_id"].(string)
+		if jobID == "" {
+			t.Fatal("first start_crawl did not return a job ID")
+		}
+		if _, exposed := first["client_request_id"]; exposed {
+			t.Fatalf("start_crawl exposed client_request_id: %v", first)
+		}
+
+		select {
+		case <-runner.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("crawl runner was not launched")
+		}
+
+		second := callToolObject(t, ctx, session, "start_crawl", requestArgs("https://example.com"))
+
+		if second["job_id"] != jobID {
+			t.Fatalf("replay job_id = %v, want the original %q", second["job_id"], jobID)
+		}
+		if second["status"] != jobStatusRunning {
+			t.Fatalf("replay status = %v, want %q", second["status"], jobStatusRunning)
+		}
+		secondLinks := nestedObject(t, second, "links")
+		firstLinks := nestedObject(t, first, "links")
+		if secondLinks["csv"] != firstLinks["csv"] {
+			t.Fatalf("replay links.csv = %v, want %v", secondLinks["csv"], firstLinks["csv"])
+		}
+		if jobs := app.jobs.list(jobFilter{}); len(jobs) != 1 {
+			t.Fatalf("manager holds %d MCP jobs after replay, want 1", len(jobs))
+		}
+
+		runner.mu.Lock()
+		spiderCalls := runner.spiderCalls
+		runner.mu.Unlock()
+		if spiderCalls != 1 {
+			t.Fatalf("spider calls = %d, want 1", spiderCalls)
+		}
+
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		job.mu.Lock()
+		storedRequestID := job.clientRequestID
+		job.mu.Unlock()
+		if storedRequestID != "retry-key-1" {
+			t.Fatalf("job client_request_id = %q, want retry-key-1", storedRequestID)
+		}
+
+		runner.Release()
+		waitForJobStatus(t, job, jobStatusDone)
+	})
+
+	t.Run("same key with different input returns conflict", func(t *testing.T) {
+		runner := newFakeCrawlRunner()
+		t.Cleanup(runner.Release)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		first := callToolObject(t, ctx, session, "start_crawl", requestArgs("example.com"))
+		jobID, _ := first["job_id"].(string)
+		if jobID == "" {
+			t.Fatal("first start_crawl did not return a job ID")
+		}
+
+		select {
+		case <-runner.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("crawl runner was not launched")
+		}
+
+		res := callTool(t, ctx, session, "start_crawl", requestArgs("other.example.com"))
+		if !res.IsError {
+			t.Fatalf("start_crawl accepted different input for the same key: %v", res.StructuredContent)
+		}
+		text := strings.ToLower(toolResultText(res))
+		for _, want := range []string{"conflict", jobID, "retryable=false"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("conflict error = %q, want %q", text, want)
+			}
+		}
+		if jobs := app.jobs.list(jobFilter{}); len(jobs) != 1 {
+			t.Fatalf("manager holds %d MCP jobs after conflict, want 1", len(jobs))
+		}
+		runner.mu.Lock()
+		spiderCalls := runner.spiderCalls
+		runner.mu.Unlock()
+		if spiderCalls != 1 {
+			t.Fatalf("spider calls = %d after conflict, want 1", spiderCalls)
+		}
+
+		runner.Release()
+		waitForJobStatus(t, app.jobs.get(jobID), jobStatusDone)
+	})
+
+	t.Run("missing key always creates a new job", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		args := map[string]any{"mode": "spider", "start_url": "example.com"}
+		first := callToolObject(t, ctx, session, "start_crawl", args)
+		second := callToolObject(t, ctx, session, "start_crawl", args)
+		firstID, _ := first["job_id"].(string)
+		secondID, _ := second["job_id"].(string)
+		if firstID == "" || secondID == "" {
+			t.Fatalf("job IDs = %q and %q, want two IDs", firstID, secondID)
+		}
+		if firstID == secondID {
+			t.Fatalf("requests without a key returned the same job %q", firstID)
+		}
+		if jobs := app.jobs.list(jobFilter{}); len(jobs) != 2 {
+			t.Fatalf("manager holds %d MCP jobs, want 2", len(jobs))
+		}
+	})
+
+	t.Run("deleting a job purges its mapping", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		first := callToolObject(t, ctx, session, "start_crawl", requestArgs("example.com"))
+		firstID, _ := first["job_id"].(string)
+		if firstID == "" {
+			t.Fatal("first start_crawl did not return a job ID")
+		}
+		if !app.jobs.delete(firstID) {
+			t.Fatalf("delete(%q) = false, want true", firstID)
+		}
+		if app.jobs.get(firstID) != nil {
+			t.Fatalf("job %q is still in the manager after delete", firstID)
+		}
+		if entries := idempotencyEntryCount(app.jobs); entries != 0 {
+			t.Fatalf("idempotency entries after delete = %d, want 0", entries)
+		}
+
+		second := callToolObject(t, ctx, session, "start_crawl", requestArgs("https://example.com"))
+		secondID, _ := second["job_id"].(string)
+		if secondID == "" {
+			t.Fatal("second start_crawl did not return a job ID")
+		}
+		if secondID == firstID {
+			t.Fatalf("start_crawl reused the deleted job ID %q", firstID)
+		}
+	})
+
+	t.Run("reaping a job purges its mapping", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		start := callToolObject(t, ctx, session, "start_crawl", requestArgs("example.com"))
+		jobID, _ := start["job_id"].(string)
+		if jobID == "" {
+			t.Fatal("start_crawl did not return a job ID")
+		}
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		job.mu.Lock()
+		job.createdAt = time.Now().Add(-time.Hour).UTC()
+		job.mu.Unlock()
+
+		app.jobs.reapBefore(time.Now().Add(-30 * time.Minute))
+
+		if app.jobs.get(jobID) != nil {
+			t.Fatalf("job %q survived the reaper", jobID)
+		}
+		if entries := idempotencyEntryCount(app.jobs); entries != 0 {
+			t.Fatalf("idempotency entries after reap = %d, want 0", entries)
+		}
+	})
+
+	t.Run("rejects invalid client_request_id", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, nil)
+		_, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		cases := []struct {
+			name  string
+			value string
+		}{
+			{"whitespace only", "   "},
+			{"too long", strings.Repeat("a", maxClientRequestIDLength+1)},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "start_crawl", map[string]any{
+					"mode":              "spider",
+					"start_url":         "example.com",
+					"client_request_id": tc.value,
+				})
+				if !res.IsError {
+					t.Fatalf("start_crawl accepted client_request_id %q", tc.value)
+				}
+				text := strings.ToLower(toolResultText(res))
+				for _, want := range []string{"invalid_argument", "client_request_id"} {
+					if !strings.Contains(text, want) {
+						t.Fatalf("error = %q, want %q", text, want)
+					}
+				}
+			})
+		}
+	})
+}
+
+// idempotencyEntryCount reads the number of live mappings under the manager
+// lock so tests can assert purge behavior directly.
+func idempotencyEntryCount(jm *jobManager) int {
+	jm.mu.RLock()
+	defer jm.mu.RUnlock()
+	return len(jm.idempotency)
+}
+
+// TestCanonicalStartCrawlFingerprint covers the fingerprint contract:
+//   - the fingerprint is stable for an identical effective request;
+//   - list URL order and duplicates do not change it;
+//   - every effective input field (mode/target, keywords, concurrency, audit,
+//     filters, and limits) changes it.
+func TestCanonicalStartCrawlFingerprint(t *testing.T) {
+	limits := jobLimits{MaxPages: 100, MaxDepth: 5, MaxDuration: time.Minute}
+
+	spiderPlan := func(mutate func(*WizardSettings)) startCrawlPlan {
+		settings := WizardSettings{
+			Mode:        1,
+			StartURL:    "https://example.com",
+			KeywordsRaw: "pricing|contact",
+			Concurrency: 10,
+			Audit:       true,
+			AuditFilters: &auditpkg.FilterOptions{
+				NavSubstrings:     []string{"site-nav"},
+				ExcludeSubstrings: []string{"widget"},
+				Explicit:          true,
+			},
+		}
+		if mutate != nil {
+			mutate(&settings)
+		}
+		return startCrawlPlan{mode: "spider", settings: settings, limits: limits}
+	}
+	listPlan := func(urls []string) startCrawlPlan {
+		return startCrawlPlan{
+			mode: "list",
+			settings: WizardSettings{
+				Mode:        2,
+				listURLs:    urls,
+				Concurrency: 10,
+			},
+			limits: limits,
+		}
+	}
+
+	baseSpider := spiderPlan(nil)
+	baseList := listPlan([]string{"https://example.com/a", "https://example.com/b"})
+
+	cases := []struct {
+		name  string
+		base  startCrawlPlan
+		plan  startCrawlPlan
+		equal bool
+	}{
+		{
+			name:  "identical spider request",
+			base:  baseSpider,
+			plan:  spiderPlan(nil),
+			equal: true,
+		},
+		{
+			name:  "different start URL",
+			base:  baseSpider,
+			plan:  spiderPlan(func(s *WizardSettings) { s.StartURL = "https://other.example.com" }),
+			equal: false,
+		},
+		{
+			name:  "different keywords",
+			base:  baseSpider,
+			plan:  spiderPlan(func(s *WizardSettings) { s.KeywordsRaw = "pricing" }),
+			equal: false,
+		},
+		{
+			name:  "different concurrency",
+			base:  baseSpider,
+			plan:  spiderPlan(func(s *WizardSettings) { s.Concurrency = 11 }),
+			equal: false,
+		},
+		{
+			name:  "audit disabled",
+			base:  baseSpider,
+			plan:  spiderPlan(func(s *WizardSettings) { s.Audit = false; s.AuditFilters = nil }),
+			equal: false,
+		},
+		{
+			name: "different audit filters",
+			base: baseSpider,
+			plan: spiderPlan(func(s *WizardSettings) {
+				s.AuditFilters = &auditpkg.FilterOptions{NavSubstrings: []string{"other-nav"}, Explicit: true}
+			}),
+			equal: false,
+		},
+		{
+			name: "different limits",
+			base: baseSpider,
+			plan: func() startCrawlPlan {
+				plan := spiderPlan(nil)
+				plan.limits.MaxPages = 99
+				return plan
+			}(),
+			equal: false,
+		},
+		{
+			name:  "list URL order is canonical",
+			base:  baseList,
+			plan:  listPlan([]string{"https://example.com/b", "https://example.com/a"}),
+			equal: true,
+		},
+		{
+			name:  "list URL duplicates are canonical",
+			base:  baseList,
+			plan:  listPlan([]string{"https://example.com/b", "https://example.com/a", "https://example.com/b"}),
+			equal: true,
+		},
+		{
+			name:  "different list URL set",
+			base:  baseList,
+			plan:  listPlan([]string{"https://example.com/a", "https://example.com/c"}),
+			equal: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := canonicalStartCrawlFingerprint(tc.plan)
+			want := canonicalStartCrawlFingerprint(tc.base)
+			if got == "" || want == "" {
+				t.Fatal("fingerprint is empty")
+			}
+			if tc.equal && got != want {
+				t.Fatalf("fingerprint = %q, want the base %q", got, want)
+			}
+			if !tc.equal && got == want {
+				t.Fatalf("fingerprint = %q, want a different value from the base", got)
+			}
+		})
+	}
 }
