@@ -258,13 +258,15 @@ type startCrawlInput struct {
 	ClientRequestID string                  `json:"client_request_id,omitempty" jsonschema:"optional idempotency key; retries with identical input return the existing job"`
 }
 
-// startCrawlLinks holds the placeholder artifact links returned when a job
-// starts. Links are relative unless a public artifact base URL is configured.
+// startCrawlLinks holds the absolute, job-scoped artifact URLs returned when a
+// job starts. Every link uses the MCP artifact path, not the UI download path,
+// so the same contract applies to start_crawl and get_artifact.
 type startCrawlLinks struct {
-	Self              string `json:"self"`
-	CSV               string `json:"csv"`
-	AuditStrictZIP    string `json:"audit_strict_zip"`
-	AuditInclusiveZIP string `json:"audit_inclusive_zip"`
+	CSV                string `json:"csv"`
+	AuditStrictZIP     string `json:"audit_strict_zip"`
+	AuditInclusiveZIP  string `json:"audit_inclusive_zip"`
+	AuditJSONStrict    string `json:"audit_json_strict"`
+	AuditJSONInclusive string `json:"audit_json_inclusive"`
 }
 
 // startCrawlOutput is the typed output for the start_crawl tool. It describes
@@ -281,16 +283,51 @@ type startCrawlOutput struct {
 	Links       startCrawlLinks `json:"links"`
 }
 
-// jobLinks builds the artifact link placeholders for a job. It never exposes
-// filesystem paths.
-func jobLinks(cfg MCPConfig, id string) startCrawlLinks {
-	base := strings.TrimRight(strings.TrimSpace(cfg.ArtifactBaseURL), "/")
-	crawlPath := base + "/api/crawl/" + id
+// normalizeMCPPath returns the canonical MCP mount prefix used by artifact
+// URLs: the default path when empty, a leading slash, and no trailing slash.
+// The same helper serves /mcp, /mcp/, and "" so all produce /mcp.
+func normalizeMCPPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = defaultMCPPath
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return strings.TrimRight(path, "/")
+}
+
+// normalizeArtifactBase trims the configured or request-derived origin. An empty
+// base stays empty so callers return no URL rather than a bare relative path.
+func normalizeArtifactBase(base string) string {
+	return strings.TrimRight(strings.TrimSpace(base), "/")
+}
+
+// artifactPath returns the absolute path portion of one job-scoped artifact
+// URL: <mcp-path>/artifacts/<jobID>/<kind>.
+func artifactPath(mcpPath, jobID, kind string) string {
+	return normalizeMCPPath(mcpPath) + "/artifacts/" + jobID + "/" + kind
+}
+
+// absoluteArtifactURL joins an origin with the job-scoped artifact path. It is
+// the single URL builder shared by start_crawl and get_artifact.
+func absoluteArtifactURL(base, mcpPath, jobID, kind string) string {
+	base = normalizeArtifactBase(base)
+	if base == "" {
+		return ""
+	}
+	return base + artifactPath(mcpPath, jobID, kind)
+}
+
+// jobLinks builds the absolute artifact URLs advertised at job start. Links are
+// always job-scoped and never expose filesystem paths.
+func jobLinks(base, mcpPath, id string) startCrawlLinks {
 	return startCrawlLinks{
-		Self:              "gofrog://jobs/" + id + "/status",
-		CSV:               crawlPath + "/download",
-		AuditStrictZIP:    crawlPath + "/audit/bundle.zip",
-		AuditInclusiveZIP: crawlPath + "/audit/inclusive/bundle.zip",
+		CSV:                absoluteArtifactURL(base, mcpPath, id, "csv"),
+		AuditStrictZIP:     absoluteArtifactURL(base, mcpPath, id, "audit_strict_zip"),
+		AuditInclusiveZIP:  absoluteArtifactURL(base, mcpPath, id, "audit_inclusive_zip"),
+		AuditJSONStrict:    absoluteArtifactURL(base, mcpPath, id, "audit_json_strict"),
+		AuditJSONInclusive: absoluteArtifactURL(base, mcpPath, id, "audit_json_inclusive"),
 	}
 }
 

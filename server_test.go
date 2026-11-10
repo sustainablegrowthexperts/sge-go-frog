@@ -21,6 +21,8 @@ import (
 	"time"
 
 	auditpkg "go-frog/internal/audit"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // testLogBuffer is a concurrency-safe sink for JSON slog output written by
@@ -1048,5 +1050,140 @@ func TestStructuredLogging(t *testing.T) {
 		if record["service"] != mcpServerName || record["version"] != mcpServerVersion {
 			t.Fatalf("json service identity = %v/%v, want %q/%q", record["service"], record["version"], mcpServerName, mcpServerVersion)
 		}
+	})
+}
+
+// testHeaderTransport adds fixed headers to every outgoing request. It lets the
+// MCP test client exercise the request-derived artifact base without a proxy.
+type testHeaderTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (t testHeaderTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	for key, value := range t.headers {
+		r.Header.Set(key, value)
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(r)
+}
+
+// TestArtifactBaseFromRequest covers the request-scoped artifact base resolver:
+//   - X-Forwarded-Proto and X-Forwarded-Host select the first value in each list;
+//   - TLS selects https when no forwarded proto is present;
+//   - a plain request falls back to its own host;
+//   - a configured base URL wins over every forwarded header.
+func TestArtifactBaseFromRequest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	kinds := []string{
+		"csv",
+		"audit_strict_zip",
+		"audit_inclusive_zip",
+		"audit_json_strict",
+		"audit_json_inclusive",
+	}
+
+	newCfg := func() MCPConfig {
+		cfg := defaultMCPConfig()
+		cfg.Enabled = true
+		cfg.ResultsDir = t.TempDir()
+		return cfg
+	}
+	startApp := func(t *testing.T, cfg MCPConfig) *app {
+		t.Helper()
+		a, err := newApp(appConfig{MCP: cfg, Runner: newImmediateFakeRunner(nil, nil), SSRF: testSSRFPolicy()})
+		if err != nil {
+			t.Fatalf("newApp: %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close(context.Background()) })
+		return a
+	}
+	startJobLinks := func(t *testing.T, session *mcp.ClientSession) (map[string]any, string) {
+		t.Helper()
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "https://example.com",
+		})
+		return nestedObject(t, out, "links"), auditString(t, out, "job_id")
+	}
+	assertLinks := func(t *testing.T, links map[string]any, prefix string) {
+		t.Helper()
+		if _, present := links["self"]; present {
+			t.Fatalf("links still advertise self: %v", links)
+		}
+		for _, kind := range kinds {
+			want := prefix + kind
+			if links[kind] != want {
+				t.Fatalf("links.%s = %v, want %q", kind, links[kind], want)
+			}
+		}
+	}
+
+	t.Run("forwarded proto and host use the first value", func(t *testing.T) {
+		cfg := newCfg()
+		a := startApp(t, cfg)
+		ts := httptest.NewServer(a.Handler())
+		t.Cleanup(ts.Close)
+
+		client := &http.Client{Transport: testHeaderTransport{
+			base: ts.Client().Transport,
+			headers: map[string]string{
+				"X-Forwarded-Proto": "https, http",
+				"X-Forwarded-Host":  "proxy.example.com, internal.example.com",
+			},
+		}}
+		session := connectMCPTestClient(t, ctx, ts.URL+cfg.Path, client)
+
+		links, jobID := startJobLinks(t, session)
+		assertLinks(t, links, "https://proxy.example.com/mcp/artifacts/"+jobID+"/")
+	})
+
+	t.Run("TLS selects https without a forwarded proto", func(t *testing.T) {
+		cfg := newCfg()
+		a := startApp(t, cfg)
+		ts := httptest.NewTLSServer(a.Handler())
+		t.Cleanup(ts.Close)
+
+		session := connectMCPTestClient(t, ctx, ts.URL+cfg.Path, ts.Client())
+
+		links, jobID := startJobLinks(t, session)
+		assertLinks(t, links, ts.URL+"/mcp/artifacts/"+jobID+"/")
+	})
+
+	t.Run("plain request host is the fallback", func(t *testing.T) {
+		cfg := newCfg()
+		a := startApp(t, cfg)
+		ts := httptest.NewServer(a.Handler())
+		t.Cleanup(ts.Close)
+
+		session := connectMCPTestClient(t, ctx, ts.URL+cfg.Path, ts.Client())
+
+		links, jobID := startJobLinks(t, session)
+		assertLinks(t, links, ts.URL+"/mcp/artifacts/"+jobID+"/")
+	})
+
+	t.Run("configured base wins over forwarded headers", func(t *testing.T) {
+		cfg := newCfg()
+		cfg.ArtifactBaseURL = "https://configured.example.com"
+		a := startApp(t, cfg)
+		ts := httptest.NewServer(a.Handler())
+		t.Cleanup(ts.Close)
+
+		client := &http.Client{Transport: testHeaderTransport{
+			base: ts.Client().Transport,
+			headers: map[string]string{
+				"X-Forwarded-Proto": "http",
+				"X-Forwarded-Host":  "proxy.example.com",
+			},
+		}}
+		session := connectMCPTestClient(t, ctx, ts.URL+cfg.Path, client)
+
+		links, jobID := startJobLinks(t, session)
+		assertLinks(t, links, "https://configured.example.com/mcp/artifacts/"+jobID+"/")
 	})
 }

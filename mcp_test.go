@@ -32,6 +32,14 @@ var mcpJobIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // an SDK client to its Streamable HTTP endpoint. Cleanup releases every resource.
 func newMCPTestSession(t *testing.T, ctx context.Context, cfg MCPConfig, runner crawlRunner) (*app, *mcp.ClientSession) {
 	t.Helper()
+	a, session, _ := newMCPTestSessionWithURL(t, ctx, cfg, runner)
+	return a, session
+}
+
+// newMCPTestSessionWithURL is newMCPTestSession plus the httptest server URL, so
+// request-derived artifact links can be asserted against the real origin.
+func newMCPTestSessionWithURL(t *testing.T, ctx context.Context, cfg MCPConfig, runner crawlRunner) (*app, *mcp.ClientSession, string) {
+	t.Helper()
 
 	cfg.Enabled = true
 	a, err := newApp(appConfig{MCP: cfg, Runner: runner, SSRF: testSSRFPolicy()})
@@ -43,14 +51,27 @@ func newMCPTestSession(t *testing.T, ctx context.Context, cfg MCPConfig, runner 
 	ts := httptest.NewServer(a.Handler())
 	t.Cleanup(ts.Close)
 
+	session := connectMCPTestClient(t, ctx, ts.URL+cfg.Path, ts.Client())
+	return a, session, ts.URL
+}
+
+// connectMCPTestClient connects an SDK client to one Streamable HTTP endpoint.
+func connectMCPTestClient(t *testing.T, ctx context.Context, endpoint string, httpClient *http.Client) *mcp.ClientSession {
+	t.Helper()
+
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "go-frog-test", Version: "0.0.1"}, nil)
-	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: ts.URL + cfg.Path}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:   endpoint,
+		HTTPClient: httpClient,
+	}, nil)
 	if err != nil {
 		t.Fatalf("MCP client connect: %v", err)
 	}
 	t.Cleanup(func() { _ = session.Close() })
-
-	return a, session
+	return session
 }
 
 // toolResultText joins the text content returned by a tool call.
@@ -4230,11 +4251,11 @@ func TestGetArtifact(t *testing.T) {
 		url         string
 	}
 	cases := []artifactCase{
-		{"csv", "text/csv", "-example.com.csv", baseURL + "/api/crawl/" + job.id + "/download"},
-		{"audit_strict_zip", "application/zip", "example.com-strict-audit.zip", baseURL + "/api/crawl/" + job.id + "/audit/bundle.zip"},
-		{"audit_inclusive_zip", "application/zip", "example.com-inclusive-audit.zip", baseURL + "/api/crawl/" + job.id + "/audit/inclusive/bundle.zip"},
-		{"audit_json_strict", "application/json", "-strict-audit.json", baseURL + "/api/crawl/" + job.id + "/audit/audit.json"},
-		{"audit_json_inclusive", "application/json", "-inclusive-audit.json", baseURL + "/api/crawl/" + job.id + "/audit/inclusive/audit.json"},
+		{"csv", "text/csv", "-example.com.csv", baseURL + "/mcp/artifacts/" + job.id + "/csv"},
+		{"audit_strict_zip", "application/zip", "example.com-strict-audit.zip", baseURL + "/mcp/artifacts/" + job.id + "/audit_strict_zip"},
+		{"audit_inclusive_zip", "application/zip", "example.com-inclusive-audit.zip", baseURL + "/mcp/artifacts/" + job.id + "/audit_inclusive_zip"},
+		{"audit_json_strict", "application/json", "-strict-audit.json", baseURL + "/mcp/artifacts/" + job.id + "/audit_json_strict"},
+		{"audit_json_inclusive", "application/json", "-inclusive-audit.json", baseURL + "/mcp/artifacts/" + job.id + "/audit_json_inclusive"},
 	}
 
 	outputs := make(map[string]map[string]any, len(cases))
@@ -4625,6 +4646,170 @@ func TestGetArtifact(t *testing.T) {
 		})
 		if content := auditString(t, jsonOut, "content"); !strings.Contains(content, "changed.example.com") {
 			t.Fatalf("audit JSON content was not refreshed: %s", content)
+		}
+	})
+}
+
+// TestArtifactURLContract covers the absolute, MCP-scoped artifact URL contract:
+//   - every start_crawl link is absolute and job-scoped under the MCP path;
+//   - configured bases win, request-derived origins are used otherwise, and
+//     custom MCP paths are preserved;
+//   - get_artifact returns the same absolute URL for every supported kind;
+//   - start_crawl no longer advertises a self link or any gofrog:// URI;
+//   - an idempotent replay returns identical absolute links.
+func TestArtifactURLContract(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	kinds := []string{
+		"csv",
+		"audit_strict_zip",
+		"audit_inclusive_zip",
+		"audit_json_strict",
+		"audit_json_inclusive",
+	}
+
+	// startAuditedJob runs a real start_crawl, waits for completion, and attaches
+	// audit fixtures so get_artifact can resolve every supported kind.
+	startAuditedJob := func(t *testing.T, app *app, session *mcp.ClientSession) (*crawlJob, map[string]any) {
+		t.Helper()
+		out := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "https://example.com",
+		})
+		jobID := auditString(t, out, "job_id")
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("start_crawl job %q is not in the manager", jobID)
+		}
+		waitForJobStatus(t, job, jobStatusDone)
+
+		report := auditpkg.Result{
+			Version:     auditpkg.AuditVersion,
+			StartURL:    "https://example.com/",
+			Domain:      "example.com",
+			GeneratedAt: time.Now().UTC(),
+			Summary:     auditpkg.AuditSummary{Pages: 1},
+		}
+		strictDir := t.TempDir()
+		inclusiveDir := t.TempDir()
+		writeAuditBundleFixture(t, strictDir, report)
+		writeAuditBundleFixture(t, inclusiveDir, report)
+
+		job.mu.Lock()
+		job.settings.Audit = true
+		job.auditReady = true
+		job.auditDir = strictDir
+		job.auditInclusiveReady = true
+		job.auditInclusiveDir = inclusiveDir
+		job.mu.Unlock()
+		return job, out
+	}
+
+	assertNoSelfLink := func(t *testing.T, links map[string]any) {
+		t.Helper()
+		if _, present := links["self"]; present {
+			t.Fatalf("start_crawl links still advertise self: %v", links)
+		}
+		encoded, err := json.Marshal(links)
+		if err != nil {
+			t.Fatalf("marshal links: %v", err)
+		}
+		if strings.Contains(string(encoded), "gofrog://") {
+			t.Fatalf("start_crawl links contain gofrog://: %s", encoded)
+		}
+	}
+
+	assertAbsoluteLinks := func(t *testing.T, links map[string]any, prefix string) {
+		t.Helper()
+		assertNoSelfLink(t, links)
+		for _, kind := range kinds {
+			want := prefix + kind
+			if links[kind] != want {
+				t.Fatalf("links.%s = %v, want %q", kind, links[kind], want)
+			}
+		}
+	}
+
+	assertArtifactURLs := func(t *testing.T, session *mcp.ClientSession, jobID string, links map[string]any) {
+		t.Helper()
+		for _, kind := range kinds {
+			out := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+				"job_id": jobID,
+				"kind":   kind,
+			})
+			if url := auditString(t, out, "url"); url != links[kind] {
+				t.Fatalf("%s url = %q, want %q", kind, url, links[kind])
+			}
+		}
+	}
+
+	t.Run("configured base and default MCP path", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.ResultsDir = t.TempDir()
+		cfg.ArtifactBaseURL = "https://crawler.example.com/"
+		app, session, _ := newMCPTestSessionWithURL(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+		job, out := startAuditedJob(t, app, session)
+		links := nestedObject(t, out, "links")
+		prefix := "https://crawler.example.com/mcp/artifacts/" + job.id + "/"
+		assertAbsoluteLinks(t, links, prefix)
+		assertArtifactURLs(t, session, job.id, links)
+	})
+
+	t.Run("request-derived base and default MCP path", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.ResultsDir = t.TempDir()
+		cfg.ArtifactBaseURL = ""
+		app, session, serverURL := newMCPTestSessionWithURL(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+		job, out := startAuditedJob(t, app, session)
+		links := nestedObject(t, out, "links")
+		prefix := serverURL + "/mcp/artifacts/" + job.id + "/"
+		assertAbsoluteLinks(t, links, prefix)
+		assertArtifactURLs(t, session, job.id, links)
+	})
+
+	t.Run("custom MCP path", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.ResultsDir = t.TempDir()
+		cfg.ArtifactBaseURL = ""
+		cfg.Path = "/crawl-api"
+		app, session, serverURL := newMCPTestSessionWithURL(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+		job, out := startAuditedJob(t, app, session)
+		links := nestedObject(t, out, "links")
+		prefix := serverURL + "/crawl-api/artifacts/" + job.id + "/"
+		assertAbsoluteLinks(t, links, prefix)
+	})
+
+	t.Run("idempotent replay returns identical absolute links", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.ResultsDir = t.TempDir()
+		cfg.ArtifactBaseURL = "https://crawler.example.com"
+		_, session, _ := newMCPTestSessionWithURL(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+		args := map[string]any{
+			"mode":              "spider",
+			"start_url":         "https://example.com",
+			"client_request_id": "artifact-url-replay",
+		}
+		first := callToolObject(t, ctx, session, "start_crawl", args)
+		second := callToolObject(t, ctx, session, "start_crawl", args)
+
+		jobID := auditString(t, first, "job_id")
+		if second["job_id"] != jobID {
+			t.Fatalf("replay job_id = %v, want %q", second["job_id"], jobID)
+		}
+		firstLinks := nestedObject(t, first, "links")
+		secondLinks := nestedObject(t, second, "links")
+		prefix := "https://crawler.example.com/mcp/artifacts/" + jobID + "/"
+		assertAbsoluteLinks(t, firstLinks, prefix)
+		assertAbsoluteLinks(t, secondLinks, prefix)
+		for _, kind := range kinds {
+			if secondLinks[kind] != firstLinks[kind] {
+				t.Fatalf("replay links.%s = %v, want %v", kind, secondLinks[kind], firstLinks[kind])
+			}
 		}
 	})
 }

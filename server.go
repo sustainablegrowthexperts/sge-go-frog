@@ -1302,6 +1302,50 @@ var errShuttingDown = newRetryableToolError(codeInternalError,
 // stopped by shutdown.
 const jobInterruptedMessage = "job interrupted by server shutdown"
 
+// withArtifactBase derives the artifact origin from the incoming MCP request
+// and stores it in the request context before the SDK handles the call. Tool
+// handlers use it only when no configured base URL is set.
+func withArtifactBase(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if base := requestArtifactBase(r); base != "" {
+			r = r.WithContext(context.WithValue(r.Context(), artifactBaseContextKey{}, base))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requestArtifactBase derives <scheme>://<host> from transport metadata only.
+// It never reads the query or body, so callers cannot influence the origin.
+func requestArtifactBase(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := firstForwardedValue(r.Header.Get("X-Forwarded-Proto")); proto != "" {
+		scheme = strings.ToLower(proto)
+	}
+	host := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" {
+		return ""
+	}
+	return normalizeArtifactBase(scheme + "://" + host)
+}
+
+// firstForwardedValue returns the first value of a comma-separated forwarding
+// header, matching the value the nearest proxy appended.
+func firstForwardedValue(value string) string {
+	if idx := strings.IndexByte(value, ','); idx >= 0 {
+		value = value[:idx]
+	}
+	return strings.TrimSpace(value)
+}
+
 // newApp builds the job manager and HTTP mux used by both the web UI and the
 // MCP endpoint. MCP is opt-in; when disabled, routing is exactly the previous
 // web-only behavior.
@@ -1364,7 +1408,7 @@ func newApp(cfg appConfig) (*app, error) {
 			return nil, fmt.Errorf("initialize MCP server: %w", err)
 		}
 		ms.app = a
-		mux.Handle(cfg.MCP.Path, ms.Handler())
+		mux.Handle(cfg.MCP.Path, withArtifactBase(ms.Handler()))
 		a.mcp = ms
 	}
 

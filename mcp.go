@@ -302,6 +302,36 @@ func writeMCPProtocolError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
+// artifactBaseContextKey carries the request-derived artifact origin from the
+// transport middleware into every tool handler. Configuration still wins when
+// a base URL is set.
+type artifactBaseContextKey struct{}
+
+// artifactBaseFromContext returns the request-derived origin, or "" when the
+// request did not pass through withArtifactBase.
+func artifactBaseFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	base, _ := ctx.Value(artifactBaseContextKey{}).(string)
+	return normalizeArtifactBase(base)
+}
+
+// artifactBase resolves the origin for this tool call. The configured base URL
+// wins; otherwise the incoming MCP request supplies scheme and host. When
+// neither is available the result is empty rather than a relative path.
+func (s *mcpServer) artifactBase(ctx context.Context) string {
+	if base := normalizeArtifactBase(s.config.ArtifactBaseURL); base != "" {
+		return base
+	}
+	return artifactBaseFromContext(ctx)
+}
+
+// mcpPath returns the normalized MCP mount prefix used in artifact URLs.
+func (s *mcpServer) mcpPath() string {
+	return normalizeMCPPath(s.config.Path)
+}
+
 // Handler returns the HTTP handler to mount at the configured MCP path.
 func (s *mcpServer) Handler() http.Handler {
 	return s.handler

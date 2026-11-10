@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -115,7 +116,7 @@ func looksLikeArtifactPath(value string) bool {
 // buildArtifact resolves and measures one artifact for a completed job. CSV is
 // regenerated on every call; ZIPs are cached until the audit directory changes;
 // audit JSON is read directly from the job-owned report directory.
-func (s *mcpServer) buildArtifact(job *crawlJob, kind string, inline bool) (getArtifactOutput, error) {
+func (s *mcpServer) buildArtifact(ctx context.Context, job *crawlJob, kind string, inline bool) (getArtifactOutput, error) {
 	snapshot := job.artifactSnapshot()
 	if snapshot.status != jobStatusDone {
 		return getArtifactOutput{}, newToolError(
@@ -125,7 +126,7 @@ func (s *mcpServer) buildArtifact(job *crawlJob, kind string, inline bool) (getA
 		)
 	}
 
-	desc, err := s.resolveArtifact(job.id, kind, snapshot)
+	desc, err := s.resolveArtifact(ctx, job.id, kind, snapshot)
 	if err != nil {
 		return getArtifactOutput{}, err
 	}
@@ -182,9 +183,11 @@ func artifactProfileForLog(kind string) string {
 const getArtifactResponseOverhead = 2048
 
 // resolveArtifact maps a whitelisted kind to its job-owned file and metadata.
-// It never accepts a path from the caller.
-func (s *mcpServer) resolveArtifact(jobID, kind string, snapshot artifactJobSnapshot) (artifactDescriptor, error) {
+// It never accepts a path from the caller, and every descriptor carries the
+// same absolute job-scoped URL contract used by start_crawl.
+func (s *mcpServer) resolveArtifact(ctx context.Context, jobID, kind string, snapshot artifactJobSnapshot) (artifactDescriptor, error) {
 	slug := sanitizeFileSlug(resultFileSlug(snapshot.settings))
+	url := absoluteArtifactURL(s.artifactBase(ctx), s.mcpPath(), jobID, kind)
 
 	switch kind {
 	case "csv":
@@ -201,7 +204,7 @@ func (s *mcpServer) resolveArtifact(jobID, kind string, snapshot artifactJobSnap
 			path:        path,
 			filename:    filepath.Base(buildResultsFilename(snapshot.settings, reportTime)),
 			contentType: "text/csv",
-			url:         s.artifactURL(jobID, kind),
+			url:         url,
 			inlineable:  true,
 		}, nil
 
@@ -219,7 +222,7 @@ func (s *mcpServer) resolveArtifact(jobID, kind string, snapshot artifactJobSnap
 			path:        path,
 			filename:    slug + "-" + profile + "-audit.zip",
 			contentType: "application/zip",
-			url:         s.artifactURL(jobID, kind),
+			url:         url,
 			inlineable:  false,
 		}, nil
 
@@ -240,7 +243,7 @@ func (s *mcpServer) resolveArtifact(jobID, kind string, snapshot artifactJobSnap
 			path:        path,
 			filename:    slug + "-" + profile + "-audit.json",
 			contentType: "application/json",
-			url:         s.artifactURL(jobID, kind),
+			url:         url,
 			inlineable:  true,
 		}, nil
 	}
@@ -288,28 +291,6 @@ func artifactExpiry(ttl time.Duration, snapshot artifactJobSnapshot) string {
 // inlineArtifactCap returns the configured inline byte cap.
 func (s *mcpServer) inlineArtifactCap() int64 {
 	return s.config.Limits.withDefaults().MaxInlineArtifactBytes
-}
-
-// artifactURL builds the job-scoped download URL. It reuses the start_crawl
-// link builders for the artifacts the web server already serves and adds the
-// audit JSON paths behind the same authenticated deployment.
-func (s *mcpServer) artifactURL(jobID, kind string) string {
-	links := jobLinks(s.config, jobID)
-	base := strings.TrimRight(strings.TrimSpace(s.config.ArtifactBaseURL), "/")
-	crawlPath := base + "/api/crawl/" + jobID
-	switch kind {
-	case "csv":
-		return links.CSV
-	case "audit_strict_zip":
-		return links.AuditStrictZIP
-	case "audit_inclusive_zip":
-		return links.AuditInclusiveZIP
-	case "audit_json_strict":
-		return crawlPath + "/audit/audit.json"
-	case "audit_json_inclusive":
-		return crawlPath + "/audit/inclusive/audit.json"
-	}
-	return ""
 }
 
 // jobOwnedDir returns the validated per-job directory below the configured

@@ -304,7 +304,7 @@ type startCrawlPlan struct {
 // handle and effective limits. A supplied client_request_id makes retries
 // idempotent: identical input returns the original job, while different input
 // returns a conflict.
-func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in startCrawlInput) (*mcp.CallToolResult, startCrawlOutput, error) {
+func (s *mcpServer) startCrawl(ctx context.Context, _ *mcp.CallToolRequest, in startCrawlInput) (*mcp.CallToolResult, startCrawlOutput, error) {
 	// Shutdown wins over every other check so a draining process never creates
 	// or replays a job.
 	if s.shuttingDown.Load() {
@@ -343,7 +343,7 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 	if replay {
 		// A replay returns the existing job and does not consume a slot.
 		reservation.Release()
-		return nil, s.startCrawlOutput(job), nil
+		return nil, s.startCrawlOutput(ctx, job), nil
 	}
 
 	// Archives live under the job-owned directory so retention removes them
@@ -374,7 +374,7 @@ func (s *mcpServer) startCrawl(_ context.Context, _ *mcp.CallToolRequest, in sta
 		go run(context.Background())
 	}
 
-	return nil, s.startCrawlOutput(job), nil
+	return nil, s.startCrawlOutput(ctx, job), nil
 }
 
 // jobArchiveDir returns the job-owned archive directory used for raw HTML and
@@ -392,10 +392,11 @@ func (s *mcpServer) checkToolRateLimit() error {
 	return s.quota.AllowToolCall(mcpQuotaKey())
 }
 
-// startCrawlOutput builds the start response from a job snapshot. Replays use
-// the same helper so the job ID, links, limits, and current lifecycle state are
-// reported consistently without exposing the client request ID.
-func (s *mcpServer) startCrawlOutput(job *crawlJob) startCrawlOutput {
+// startCrawlOutput builds the start response from a job snapshot and the
+// request-scoped artifact origin. Replays use the same helper so the job ID,
+// links, limits, and current lifecycle state are reported consistently without
+// exposing the client request ID.
+func (s *mcpServer) startCrawlOutput(ctx context.Context, job *crawlJob) startCrawlOutput {
 	job.mu.Lock()
 	defer job.mu.Unlock()
 
@@ -412,7 +413,7 @@ func (s *mcpServer) startCrawlOutput(job *crawlJob) startCrawlOutput {
 			MaxDepth:           job.limits.MaxDepth,
 			MaxDurationSeconds: int(job.limits.MaxDuration / time.Second),
 		},
-		Links: jobLinks(s.config, job.id),
+		Links: jobLinks(s.artifactBase(ctx), s.mcpPath(), job.id),
 	}
 }
 
@@ -835,7 +836,7 @@ func refreshAuditPageEnvelope(out *getAuditOutput, shown int) {
 // MCP-owned job. CSV is generated at request time; audit ZIPs are built with
 // auditbundle; audit JSON comes from the job-owned report directory. The
 // handler never accepts a filesystem path.
-func (s *mcpServer) getArtifact(_ context.Context, _ *mcp.CallToolRequest, in getArtifactInput) (*mcp.CallToolResult, getArtifactOutput, error) {
+func (s *mcpServer) getArtifact(ctx context.Context, _ *mcp.CallToolRequest, in getArtifactInput) (*mcp.CallToolResult, getArtifactOutput, error) {
 	if err := s.checkToolRateLimit(); err != nil {
 		return nil, getArtifactOutput{}, err
 	}
@@ -850,7 +851,7 @@ func (s *mcpServer) getArtifact(_ context.Context, _ *mcp.CallToolRequest, in ge
 		return nil, getArtifactOutput{}, err
 	}
 
-	out, err := s.buildArtifact(job, kind, in.Inline)
+	out, err := s.buildArtifact(ctx, job, kind, in.Inline)
 	if err != nil {
 		return nil, getArtifactOutput{}, err
 	}
