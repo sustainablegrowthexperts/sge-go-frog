@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +18,29 @@ import (
 // csvArtifactName is the on-disk name of the request-time CSV artifact. The
 // public filename keeps the existing timestamp/slug convention.
 const csvArtifactName = "report.csv"
+
+// Download failures are split into two internal classes so the HTTP handler can
+// map them to 404 or 500 while buildArtifact keeps the existing tool error
+// codes. Neither error is ever returned to a client verbatim.
+var (
+	errArtifactUnavailable = errors.New("artifact unavailable")
+	errArtifactGeneration  = errors.New("artifact generation failed")
+)
+
+// artifactUnavailable marks a missing job-scoped input (a directory, report, or
+// generated cache entry) that the HTTP handler maps to 404 and the tool maps to
+// its existing not-available code.
+func artifactUnavailable(kind string) error {
+	return fmt.Errorf("%w: %s", errArtifactUnavailable, kind)
+}
+
+// Generic HTTP bodies. They never include a path, a kind echoed from the
+// request, or a builder error.
+const (
+	artifactNotFoundBody   = "artifact not found"
+	artifactNotReadyBody   = "job is not finished"
+	artifactGenerationBody = "artifact could not be generated"
+)
 
 // artifactJobSnapshot is one consistent copy of the job fields the artifact
 // builder needs. It is taken under the job mutex so status, pages, and audit
@@ -142,7 +167,7 @@ func (s *mcpServer) buildArtifact(ctx context.Context, job *crawlJob, kind strin
 
 	desc, err := s.resolveArtifact(ctx, job.id, kind, snapshot)
 	if err != nil {
-		return getArtifactOutput{}, err
+		return getArtifactOutput{}, artifactToolError(err, job.id, kind)
 	}
 	info, err := os.Stat(desc.path)
 	if err != nil {
@@ -180,6 +205,23 @@ func (s *mcpServer) buildArtifact(ctx context.Context, job *crawlJob, kind strin
 	return out, nil
 }
 
+// artifactToolError translates an internal resolution failure back to the
+// stable get_artifact tool error codes. The download handler maps the same
+// sentinels to HTTP statuses independently.
+func artifactToolError(err error, jobID, kind string) error {
+	switch {
+	case errors.Is(err, errArtifactGeneration):
+		return newToolError(codeInternalError, fmt.Sprintf("could not generate %s artifact for job %q", kind, jobID), nil)
+	case errors.Is(err, errArtifactUnavailable):
+		if strings.HasPrefix(kind, "audit_") {
+			return auditNotAvailableError(kind, jobID)
+		}
+		return artifactUnavailableError(kind, jobID)
+	default:
+		return err
+	}
+}
+
 // artifactProfileForLog maps audit artifact kinds to their report profile.
 func artifactProfileForLog(kind string) string {
 	switch kind {
@@ -208,7 +250,7 @@ func (s *mcpServer) resolveArtifact(ctx context.Context, jobID, kind string, sna
 		path := filepath.Join(s.jobOwnedDir(jobID), csvArtifactName)
 		if err := writeResultsCSVAtomic(path, snapshot.pages, snapshot.settings.KeywordsRaw); err != nil {
 			// Never echo the writer error: it may contain a temporary path.
-			return artifactDescriptor{}, newToolError(codeInternalError, fmt.Sprintf("could not generate CSV artifact for job %q", jobID), nil)
+			return artifactDescriptor{}, fmt.Errorf("%w: csv", errArtifactGeneration)
 		}
 		reportTime := snapshot.finishedAt
 		if reportTime.IsZero() {
@@ -225,12 +267,12 @@ func (s *mcpServer) resolveArtifact(ctx context.Context, jobID, kind string, sna
 	case "audit_strict_zip", "audit_inclusive_zip":
 		profile, dir, ready := auditProfileState(kind, snapshot)
 		if !snapshot.auditEnabled || !ready || strings.TrimSpace(dir) == "" {
-			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+			return artifactDescriptor{}, artifactUnavailable(kind)
 		}
 		path, err := s.auditBundlePath(jobID, profile, dir)
 		if err != nil {
 			// Never echo the builder error: it contains the audit directory.
-			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+			return artifactDescriptor{}, err
 		}
 		return artifactDescriptor{
 			path:        path,
@@ -243,15 +285,15 @@ func (s *mcpServer) resolveArtifact(ctx context.Context, jobID, kind string, sna
 	case "audit_json_strict", "audit_json_inclusive":
 		profile, dir, ready := auditProfileState(kind, snapshot)
 		if !snapshot.auditEnabled || !ready || strings.TrimSpace(dir) == "" {
-			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+			return artifactDescriptor{}, artifactUnavailable(kind)
 		}
 		clean, err := cleanArtifactDirectory(dir)
 		if err != nil {
-			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+			return artifactDescriptor{}, artifactUnavailable(kind)
 		}
 		path := filepath.Join(clean, strictAuditFileName)
 		if info, err := os.Stat(path); err != nil || info.IsDir() {
-			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+			return artifactDescriptor{}, artifactUnavailable(kind)
 		}
 		return artifactDescriptor{
 			path:        path,
@@ -264,12 +306,12 @@ func (s *mcpServer) resolveArtifact(ctx context.Context, jobID, kind string, sna
 	case "audit_xlsx_strict", "audit_xlsx_inclusive":
 		profile, dir, ready := auditProfileState(kind, snapshot)
 		if !snapshot.auditEnabled || !ready || strings.TrimSpace(dir) == "" {
-			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+			return artifactDescriptor{}, artifactUnavailable(kind)
 		}
 		path, err := s.auditWorkbookPath(jobID, kind, profile, dir)
 		if err != nil {
 			// Never echo the builder error: it contains the audit directory.
-			return artifactDescriptor{}, auditNotAvailableError(kind, jobID)
+			return artifactDescriptor{}, err
 		}
 		return artifactDescriptor{
 			path:        path,
@@ -323,6 +365,185 @@ func artifactExpiry(ttl time.Duration, snapshot artifactJobSnapshot) string {
 // inlineArtifactCap returns the configured inline byte cap.
 func (s *mcpServer) inlineArtifactCap() int64 {
 	return s.config.Limits.withDefaults().MaxInlineArtifactBytes
+}
+
+// artifactSubtreePattern returns the mux pattern for the artifact download
+// subtree. The MCP path is normalized so /mcp and /mcp/ both mount at
+// /mcp/artifacts/.
+func artifactSubtreePattern(mcpPath string) string {
+	return normalizeMCPPath(mcpPath) + "/artifacts/"
+}
+
+// serveArtifactDownload serves one job-scoped artifact over HTTP. It shares
+// resolveArtifact with get_artifact, so the HTTP and tool contracts cannot
+// drift, but maps internal failures to generic HTTP statuses instead of tool
+// codes.
+func (s *mcpServer) serveArtifactDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		s.logArtifactDownload("", "", "", "method_not_allowed")
+		return
+	}
+
+	jobID, kind, ok := s.parseArtifactDownloadPath(r)
+	if !ok {
+		writeArtifactHTTPError(w, http.StatusNotFound, artifactNotFoundBody)
+		s.logArtifactDownload("", "", "", "not_found")
+		return
+	}
+
+	job := s.jobs.get(jobID)
+	if job == nil || !job.ownedBy(ownerMCP) {
+		// Unknown jobs and UI-owned jobs deliberately share one response.
+		writeArtifactHTTPError(w, http.StatusNotFound, artifactNotFoundBody)
+		s.logArtifactDownload(jobID, kind, "", "not_found")
+		return
+	}
+
+	snapshot := job.artifactSnapshot()
+	if snapshot.status != jobStatusDone {
+		writeArtifactHTTPError(w, http.StatusConflict, artifactNotReadyBody)
+		s.logArtifactDownload(jobID, kind, snapshot.status, "not_finished")
+		return
+	}
+	if artifactDownloadExpired(snapshot, s.jobs.retention.withDefaults().MCPTTL, s.jobs.now()) {
+		writeArtifactHTTPError(w, http.StatusNotFound, artifactNotFoundBody)
+		s.logArtifactDownload(jobID, kind, snapshot.status, "expired")
+		return
+	}
+
+	desc, err := s.resolveArtifact(r.Context(), jobID, kind, snapshot)
+	if err != nil {
+		if errors.Is(err, errArtifactGeneration) {
+			writeArtifactHTTPError(w, http.StatusInternalServerError, artifactGenerationBody)
+			s.logArtifactDownload(jobID, kind, snapshot.status, "generation_failed")
+			return
+		}
+		writeArtifactHTTPError(w, http.StatusNotFound, artifactNotFoundBody)
+		s.logArtifactDownload(jobID, kind, snapshot.status, "not_found")
+		return
+	}
+
+	file, err := os.Open(desc.path)
+	if err != nil {
+		writeArtifactHTTPError(w, http.StatusInternalServerError, artifactGenerationBody)
+		s.logArtifactDownload(jobID, kind, snapshot.status, "read_failed")
+		return
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		writeArtifactHTTPError(w, http.StatusInternalServerError, artifactGenerationBody)
+		s.logArtifactDownload(jobID, kind, snapshot.status, "read_failed")
+		return
+	}
+
+	filename := sanitizeAttachmentFilename(desc.filename)
+	w.Header().Set("Content-Type", desc.contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, filename, info.ModTime(), file)
+
+	s.logArtifactDownload(jobID, kind, snapshot.status, "served")
+}
+
+// parseArtifactDownloadPath extracts exactly one job ID and one whitelisted
+// kind from the artifact subtree. It rejects encoded separators, extra or empty
+// segments, trailing slashes, and path-like values.
+func (s *mcpServer) parseArtifactDownloadPath(r *http.Request) (jobID, kind string, ok bool) {
+	if r == nil || r.URL == nil {
+		return "", "", false
+	}
+
+	escaped := strings.ToLower(r.URL.EscapedPath())
+	for _, encoded := range []string{"%2f", "%5c", "%00"} {
+		if strings.Contains(escaped, encoded) {
+			return "", "", false
+		}
+	}
+
+	prefix := s.mcpPath() + "/artifacts/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	if strings.ContainsRune(rest, 0) || strings.ContainsRune(rest, '\\') {
+		return "", "", false
+	}
+
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	jobID, kind = parts[0], parts[1]
+	if looksLikeArtifactPath(jobID) || looksLikeArtifactPath(kind) {
+		return "", "", false
+	}
+	if !slices.Contains(getArtifactKinds, kind) {
+		return "", "", false
+	}
+	return jobID, kind, true
+}
+
+// artifactDownloadExpired applies the same TTL anchor as retention. A job that
+// exists in memory but is past its TTL is treated as gone.
+func artifactDownloadExpired(snapshot artifactJobSnapshot, ttl time.Duration, now time.Time) bool {
+	if ttl <= 0 {
+		ttl = defaultMCPJobTTL
+	}
+	anchor := snapshot.finishedAt
+	if anchor.IsZero() {
+		anchor = snapshot.createdAt
+	}
+	if anchor.IsZero() {
+		return false
+	}
+	return !anchor.Add(ttl).After(now)
+}
+
+// sanitizeAttachmentFilename removes path components and characters that could
+// break or inject a Content-Disposition header.
+func sanitizeAttachmentFilename(name string) string {
+	name = sanitizeFileSlug(filepath.Base(strings.TrimSpace(name)))
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\r' || r == '\n' || r == '"' || r == '\\':
+			return -1
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return "artifact"
+	}
+	return name
+}
+
+// writeArtifactHTTPError writes one generic, non-leaking response body.
+func writeArtifactHTTPError(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintln(w, body)
+}
+
+// logArtifactDownload records only identifiers, status, and outcome. Paths and
+// builder errors never enter a log line.
+func (s *mcpServer) logArtifactDownload(jobID, kind, status, outcome string) {
+	attrs := []any{}
+	if kind != "" {
+		attrs = append(attrs, "kind", kind)
+	}
+	if status != "" {
+		attrs = append(attrs, "status", status)
+	}
+	attrs = append(attrs, "outcome", outcome)
+	logJobEvent(s.loggerOr(), "artifact download", jobID, attrs...)
 }
 
 // jobOwnedDir returns the validated per-job directory below the configured
@@ -391,11 +612,11 @@ func writeResultsCSVAtomic(path string, pages []Page, keywordsRaw string) error 
 func (s *mcpServer) auditBundlePath(jobID, profile, dir string) (string, error) {
 	clean, err := cleanArtifactDirectory(dir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: audit directory", errArtifactUnavailable)
 	}
 	info, err := os.Stat(clean)
 	if err != nil || !info.IsDir() {
-		return "", fmt.Errorf("audit directory is unavailable")
+		return "", fmt.Errorf("%w: audit directory", errArtifactUnavailable)
 	}
 
 	path := filepath.Join(s.jobOwnedDir(jobID), profile+"-audit.zip")
@@ -411,10 +632,10 @@ func (s *mcpServer) auditBundlePath(jobID, profile, dir string) (string, error) 
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: bundle destination", errArtifactGeneration)
 	}
 	if err := auditbundle.WriteFile(clean, path); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: bundle", errArtifactGeneration)
 	}
 
 	auditBundleCache.Lock()
@@ -432,11 +653,11 @@ func (s *mcpServer) auditBundlePath(jobID, profile, dir string) (string, error) 
 func (s *mcpServer) auditWorkbookPath(jobID, kind, profile, dir string) (string, error) {
 	clean, err := cleanArtifactDirectory(dir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: audit directory", errArtifactUnavailable)
 	}
 	info, err := os.Stat(clean)
 	if err != nil || !info.IsDir() {
-		return "", fmt.Errorf("audit directory is unavailable")
+		return "", fmt.Errorf("%w: audit directory", errArtifactUnavailable)
 	}
 
 	path := filepath.Join(s.jobOwnedDir(jobID), profile+"-audit.xlsx")
@@ -452,10 +673,10 @@ func (s *mcpServer) auditWorkbookPath(jobID, kind, profile, dir string) (string,
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: workbook destination", errArtifactGeneration)
 	}
 	if err := auditbundle.WriteWorkbook(clean, path); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: workbook", errArtifactGeneration)
 	}
 
 	auditXLSXCache.Lock()

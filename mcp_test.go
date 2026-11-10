@@ -4824,6 +4824,340 @@ func TestGetArtifactXLSX(t *testing.T) {
 	})
 }
 
+// newMCPTestApp starts an MCP-enabled application and returns the app plus the
+// httptest server base URL. It is the HTTP-level counterpart to
+// newMCPTestSession, for tests that exercise the artifact download endpoint
+// directly instead of through an SDK client.
+func newMCPTestApp(t *testing.T, cfg MCPConfig, runner crawlRunner) (*app, string) {
+	t.Helper()
+
+	cfg.Enabled = true
+	a, err := newApp(appConfig{MCP: cfg, Runner: runner, SSRF: testSSRFPolicy()})
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close(context.Background()) })
+
+	ts := httptest.NewServer(a.Handler())
+	t.Cleanup(ts.Close)
+	return a, ts.URL
+}
+
+// artifactDownload performs one HTTP request and returns the response plus its
+// fully-read body. The response body is always closed.
+func artifactDownload(t *testing.T, client *http.Client, method, rawURL string, headers map[string]string) (*http.Response, []byte) {
+	t.Helper()
+
+	req, err := http.NewRequest(method, rawURL, nil)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, rawURL, err)
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	if client == nil {
+		client = &http.Client{}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, rawURL, err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read %s %s body: %v", method, rawURL, err)
+	}
+	return resp, body
+}
+
+// attachmentFilename returns the filename from a strict attachment header.
+func attachmentFilename(t *testing.T, resp *http.Response) string {
+	t.Helper()
+
+	disposition := resp.Header.Get("Content-Disposition")
+	const prefix = `attachment; filename="`
+	if !strings.HasPrefix(disposition, prefix) || !strings.HasSuffix(disposition, `"`) {
+		t.Fatalf("Content-Disposition = %q, want an attachment filename", disposition)
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(disposition, prefix), `"`)
+	if name == "" || strings.ContainsAny(name, `/\`+"\r\n") {
+		t.Fatalf("attachment filename = %q, want a safe base name", name)
+	}
+	return name
+}
+
+// TestArtifactDownloadEndpoint covers the HTTP artifact contract:
+//   - a completed crawl's start_crawl CSV link downloads the real CSV;
+//   - every CSV, audit ZIP, audit JSON, and audit XLSX kind downloads with the
+//     descriptor content type, an attachment filename, and a non-empty body;
+//   - HEAD returns the same headers without a body;
+//   - a range request returns 206 with a Content-Range and the requested bytes.
+func TestArtifactDownloadEndpoint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resultsDir := t.TempDir()
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = resultsDir
+
+	app, baseURL := newMCPTestApp(t, cfg, newImmediateFakeRunner([]Page{{
+		URL:        "https://example.com/",
+		StatusCode: 200,
+		Title:      "Home",
+	}}, nil))
+	session := connectMCPTestClient(t, ctx, baseURL+cfg.Path, nil)
+	client := &http.Client{}
+
+	started := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":      "spider",
+		"start_url": "https://example.com",
+	})
+	jobID := auditString(t, started, "job_id")
+	links := nestedObject(t, started, "links")
+	csvURL := auditString(t, links, "csv")
+	waitForJobStatus(t, app.jobs.get(jobID), jobStatusDone)
+
+	resp, body := artifactDownload(t, client, http.MethodGet, csvURL, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET csv status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/csv" {
+		t.Fatalf("csv Content-Type = %q, want text/csv", got)
+	}
+	if name := attachmentFilename(t, resp); !strings.HasSuffix(name, ".csv") {
+		t.Fatalf("csv filename = %q, want a .csv suffix", name)
+	}
+	if resp.ContentLength <= 0 || len(body) == 0 {
+		t.Fatalf("csv response length = %d (body %d bytes), want a non-empty download", resp.ContentLength, len(body))
+	}
+	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("csv X-Content-Type-Options = %q, want nosniff", resp.Header.Get("X-Content-Type-Options"))
+	}
+
+	report := auditpkg.Result{
+		Version:     auditpkg.AuditVersion,
+		StartURL:    "https://example.com/",
+		Domain:      "example.com",
+		GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+		Summary:     auditpkg.AuditSummary{Pages: 2, ContentLinks: 1},
+	}
+	strictDir := t.TempDir()
+	inclusiveDir := t.TempDir()
+	writeAuditBundleFixture(t, strictDir, report)
+	writeAuditBundleFixture(t, inclusiveDir, report)
+
+	auditJob := createDoneResultsJob(t, app, "alpha|beta", []Page{
+		{URL: "https://example.com/", StatusCode: 200, Title: "Home"},
+		{URL: "https://example.com/a", StatusCode: 200, Title: "A"},
+	})
+	auditJob.mu.Lock()
+	auditJob.settings.Audit = true
+	auditJob.auditReady = true
+	auditJob.auditDir = strictDir
+	auditJob.auditInclusiveReady = true
+	auditJob.auditInclusiveDir = inclusiveDir
+	auditJob.mu.Unlock()
+
+	const xlsxContentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	cases := []struct {
+		kind        string
+		contentType string
+		suffix      string
+	}{
+		{"csv", "text/csv", ".csv"},
+		{"audit_strict_zip", "application/zip", "-strict-audit.zip"},
+		{"audit_inclusive_zip", "application/zip", "-inclusive-audit.zip"},
+		{"audit_json_strict", "application/json", "-strict-audit.json"},
+		{"audit_json_inclusive", "application/json", "-inclusive-audit.json"},
+		{"audit_xlsx_strict", xlsxContentType, "-strict-audit.xlsx"},
+		{"audit_xlsx_inclusive", xlsxContentType, "-inclusive-audit.xlsx"},
+	}
+	urls := make(map[string]string, len(cases))
+	headers := make(map[string]http.Header, len(cases))
+	for _, tc := range cases {
+		url := baseURL + "/mcp/artifacts/" + auditJob.id + "/" + tc.kind
+		urls[tc.kind] = url
+
+		resp, body := artifactDownload(t, client, http.MethodGet, url, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200: %s", tc.kind, resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("Content-Type"); got != tc.contentType {
+			t.Fatalf("%s Content-Type = %q, want %q", tc.kind, got, tc.contentType)
+		}
+		if name := attachmentFilename(t, resp); !strings.HasSuffix(name, tc.suffix) {
+			t.Fatalf("%s filename = %q, want suffix %q", tc.kind, name, tc.suffix)
+		}
+		if resp.ContentLength <= 0 || len(body) == 0 {
+			t.Fatalf("%s response length = %d (body %d bytes), want a non-empty download", tc.kind, resp.ContentLength, len(body))
+		}
+		headers[tc.kind] = resp.Header.Clone()
+	}
+
+	for _, kind := range []string{"csv", "audit_strict_zip"} {
+		resp, body := artifactDownload(t, client, http.MethodHead, urls[kind], nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD %s status = %d, want 200", kind, resp.StatusCode)
+		}
+		if len(body) != 0 {
+			t.Fatalf("HEAD %s body = %d bytes, want none", kind, len(body))
+		}
+		for _, header := range []string{"Content-Type", "Content-Disposition", "Content-Length"} {
+			if got, want := resp.Header.Get(header), headers[kind].Get(header); got != want {
+				t.Fatalf("HEAD %s %s = %q, want %q", kind, header, got, want)
+			}
+		}
+	}
+
+	resp, body = artifactDownload(t, client, http.MethodGet, urls["csv"], map[string]string{
+		"Range": "bytes=0-9",
+	})
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("range status = %d, want 206: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Range"); !strings.HasPrefix(got, "bytes 0-9/") {
+		t.Fatalf("Content-Range = %q, want bytes 0-9/<size>", got)
+	}
+	if len(body) != 10 {
+		t.Fatalf("range body = %d bytes, want 10", len(body))
+	}
+}
+
+// TestArtifactDownloadErrors covers the HTTP failure contract:
+//   - unknown jobs and UI-owned jobs both return an indistinguishable 404;
+//   - unknown kinds and malformed paths return 404;
+//   - unfinished jobs return 409;
+//   - missing artifacts return 404 while builder failures return a generic 500;
+//   - unsupported methods return 405 with Allow: GET, HEAD and no body.
+func TestArtifactDownloadErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resultsDir := t.TempDir()
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = resultsDir
+
+	runner := newFakeCrawlRunner()
+	t.Cleanup(runner.Release)
+	app, baseURL := newMCPTestApp(t, cfg, runner)
+	session := connectMCPTestClient(t, ctx, baseURL+cfg.Path, nil)
+	client := &http.Client{}
+
+	doneJob := createDoneResultsJob(t, app, "", []Page{{
+		URL:        "https://example.com/",
+		StatusCode: 200,
+		Title:      "Home",
+	}})
+	doneURL := baseURL + "/mcp/artifacts/" + doneJob.id + "/"
+
+	assertStatus := func(t *testing.T, method, url string, want int, headers map[string]string) (*http.Response, []byte) {
+		t.Helper()
+		resp, body := artifactDownload(t, client, method, url, headers)
+		if resp.StatusCode != want {
+			t.Fatalf("%s %s status = %d, want %d: %s", method, url, resp.StatusCode, want, body)
+		}
+		return resp, body
+	}
+
+	_, unknownBody := assertStatus(t, http.MethodGet, baseURL+"/mcp/artifacts/does-not-exist/csv", http.StatusNotFound, nil)
+
+	uiJob := app.jobs.createWithOwner(ownerUI, "spider", "https://example.com", WizardSettings{
+		Mode:     1,
+		StartURL: "https://example.com",
+	})
+	uiJob.mu.Lock()
+	uiJob.status = jobStatusDone
+	uiJob.phase = jobPhaseDone
+	uiJob.finishedAt = time.Now().UTC()
+	uiJob.result = []Page{{URL: "https://example.com/", StatusCode: 200}}
+	uiJob.mu.Unlock()
+	_, uiBody := assertStatus(t, http.MethodGet, baseURL+"/mcp/artifacts/"+uiJob.id+"/csv", http.StatusNotFound, nil)
+	if !bytes.Equal(unknownBody, uiBody) {
+		t.Fatalf("UI job body = %q, want the same generic body as an unknown job %q", uiBody, unknownBody)
+	}
+
+	assertStatus(t, http.MethodGet, doneURL+"pdf", http.StatusNotFound, nil)
+	assertStatus(t, http.MethodGet, baseURL+"/mcp/artifacts/..job/csv", http.StatusNotFound, nil)
+	assertStatus(t, http.MethodGet, baseURL+"/mcp/artifacts/job%2Fid/csv", http.StatusNotFound, nil)
+	assertStatus(t, http.MethodGet, doneURL+"..csv", http.StatusNotFound, nil)
+	assertStatus(t, http.MethodGet, doneURL+"csv/extra", http.StatusNotFound, nil)
+	assertStatus(t, http.MethodGet, doneURL+"csv/", http.StatusNotFound, nil)
+
+	expiredJob := createDoneResultsJob(t, app, "", []Page{{URL: "https://example.com/", StatusCode: 200}})
+	expiredJob.mu.Lock()
+	expiredJob.finishedAt = time.Now().Add(-48 * time.Hour)
+	expiredJob.mu.Unlock()
+	assertStatus(t, http.MethodGet, baseURL+"/mcp/artifacts/"+expiredJob.id+"/csv", http.StatusNotFound, nil)
+
+	started := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+		"mode":      "spider",
+		"start_url": "https://example.com",
+	})
+	runningID := auditString(t, started, "job_id")
+	assertStatus(t, http.MethodGet, baseURL+"/mcp/artifacts/"+runningID+"/csv", http.StatusConflict, nil)
+
+	missingReport := auditpkg.Result{
+		Version:     auditpkg.AuditVersion,
+		StartURL:    "https://example.com/",
+		Domain:      "example.com",
+		GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+		Summary:     auditpkg.AuditSummary{Pages: 1},
+	}
+	missingDir := t.TempDir()
+	writeAuditBundleFixture(t, missingDir, missingReport)
+	missingJob := createDoneResultsJob(t, app, "", []Page{{URL: "https://example.com/", StatusCode: 200}})
+	missingJob.mu.Lock()
+	missingJob.settings.Audit = true
+	missingJob.auditReady = true
+	missingJob.auditDir = missingDir
+	missingJob.auditInclusiveReady = true
+	missingJob.auditInclusiveDir = missingDir
+	missingJob.mu.Unlock()
+
+	missingURL := baseURL + "/mcp/artifacts/" + missingJob.id + "/audit_json_strict"
+	assertStatus(t, http.MethodGet, missingURL, http.StatusOK, nil)
+	if err := os.Remove(filepath.Join(missingDir, "audit.json")); err != nil {
+		t.Fatalf("remove audit.json: %v", err)
+	}
+	assertStatus(t, http.MethodGet, missingURL, http.StatusNotFound, nil)
+
+	brokenDir := t.TempDir()
+	writeAuditBundleFixture(t, brokenDir, missingReport)
+	if err := os.Remove(filepath.Join(brokenDir, "audit-pages.csv")); err != nil {
+		t.Fatalf("remove audit-pages.csv: %v", err)
+	}
+	brokenJob := createDoneResultsJob(t, app, "", []Page{{URL: "https://example.com/", StatusCode: 200}})
+	brokenJob.mu.Lock()
+	brokenJob.settings.Audit = true
+	brokenJob.auditReady = true
+	brokenJob.auditDir = brokenDir
+	brokenJob.auditInclusiveReady = true
+	brokenJob.auditInclusiveDir = brokenDir
+	brokenJob.mu.Unlock()
+
+	for _, kind := range []string{"audit_strict_zip", "audit_xlsx_strict"} {
+		_, body := assertStatus(t, http.MethodGet, baseURL+"/mcp/artifacts/"+brokenJob.id+"/"+kind, http.StatusInternalServerError, nil)
+		if !strings.Contains(string(body), "artifact could not be generated") {
+			t.Fatalf("%s body = %q, want the generic generation failure", kind, body)
+		}
+		for _, leaked := range []string{brokenDir, "audit-pages.csv", "open "} {
+			if strings.Contains(string(body), leaked) {
+				t.Fatalf("%s body leaked %q: %s", kind, leaked, body)
+			}
+		}
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		resp, body := assertStatus(t, method, doneURL+"csv", http.StatusMethodNotAllowed, nil)
+		if got := resp.Header.Get("Allow"); got != "GET, HEAD" {
+			t.Fatalf("%s Allow = %q, want GET, HEAD", method, got)
+		}
+		if len(body) != 0 {
+			t.Fatalf("%s body = %q, want no body", method, body)
+		}
+	}
+}
+
 // TestArtifactURLContract covers the absolute, MCP-scoped artifact URL contract:
 //   - every start_crawl link is absolute and job-scoped under the MCP path;
 //   - configured bases win, request-derived origins are used otherwise, and

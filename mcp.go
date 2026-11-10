@@ -337,6 +337,12 @@ func (s *mcpServer) Handler() http.Handler {
 	return s.handler
 }
 
+// ArtifactHandler returns the HTTP handler for the job-scoped artifact
+// subtree. It is separate from the Streamable HTTP handler.
+func (s *mcpServer) ArtifactHandler() http.Handler {
+	return http.HandlerFunc(s.serveArtifactDownload)
+}
+
 // beginShutdown makes every new start_crawl request fail with the stable
 // retryable shutdown error. It is safe to call more than once.
 func (s *mcpServer) beginShutdown() {

@@ -1,7 +1,7 @@
 ---
 id: task-025
 title: "[Slice] AI downloads every artifact over HTTP from the MCP artifact subtree"
-status: pending
+status: completed
 depends_on: ["task-024"]
 target_files:
   - "server.go"

@@ -1187,3 +1187,152 @@ func TestArtifactBaseFromRequest(t *testing.T) {
 		assertLinks(t, links, "https://configured.example.com/mcp/artifacts/"+jobID+"/")
 	})
 }
+
+// TestArtifactRouteMounting covers the route-mounting contract:
+//   - the artifact subtree is absent when MCP is disabled;
+//   - a custom MCP path serves downloads under its own subtree;
+//   - the exact MCP endpoint still initializes and lists tools;
+//   - the existing UI CSV and audit ZIP download routes are unchanged.
+func TestArtifactRouteMounting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	t.Run("MCP disabled mounts no artifact handler", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		a, err := newApp(appConfig{MCP: cfg, Runner: newImmediateFakeRunner(nil, nil), SSRF: testSSRFPolicy()})
+		if err != nil {
+			t.Fatalf("newApp: %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close(context.Background()) })
+		if a.mcp != nil {
+			t.Fatal("MCP server was constructed while disabled")
+		}
+
+		ts := httptest.NewServer(a.Handler())
+		t.Cleanup(ts.Close)
+
+		resp, body := artifactDownload(t, ts.Client(), http.MethodGet, ts.URL+"/mcp/artifacts/job/csv", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("disabled artifact status = %d, want 404: %s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("custom MCP path serves artifacts and keeps tools working", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Path = "/crawl-api"
+		cfg.ResultsDir = t.TempDir()
+
+		a, baseURL := newMCPTestApp(t, cfg, newImmediateFakeRunner([]Page{{
+			URL:        "https://example.com/",
+			StatusCode: 200,
+		}}, nil))
+		session := connectMCPTestClient(t, ctx, baseURL+cfg.Path, nil)
+		tools, err := session.ListTools(ctx, nil)
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		found := false
+		for _, tool := range tools.Tools {
+			if tool.Name == "start_crawl" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("tools/list = %v, want start_crawl", tools.Tools)
+		}
+
+		job := createDoneResultsJob(t, a, "", []Page{{URL: "https://example.com/", StatusCode: 200}})
+		client := &http.Client{}
+		resp, body := artifactDownload(t, client, http.MethodGet, baseURL+"/crawl-api/artifacts/"+job.id+"/csv", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("custom-path artifact status = %d, want 200: %s", resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("Content-Type"); got != "text/csv" {
+			t.Fatalf("custom-path Content-Type = %q, want text/csv", got)
+		}
+		if len(body) == 0 {
+			t.Fatal("custom-path CSV body is empty")
+		}
+
+		resp, _ = artifactDownload(t, client, http.MethodGet, baseURL+"/mcp/artifacts/"+job.id+"/csv", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("default-path artifact status = %d, want 404 with a custom MCP path", resp.StatusCode)
+		}
+	})
+
+	t.Run("existing UI downloads are unchanged", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		a, err := newApp(appConfig{MCP: cfg, Runner: newImmediateFakeRunner(nil, nil), SSRF: testSSRFPolicy()})
+		if err != nil {
+			t.Fatalf("newApp: %v", err)
+		}
+		t.Cleanup(func() { _ = a.Close(context.Background()) })
+
+		report := auditpkg.Result{
+			Version:     auditpkg.AuditVersion,
+			StartURL:    "https://example.com/",
+			Domain:      "example.com",
+			GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+			Summary:     auditpkg.AuditSummary{Pages: 1},
+		}
+		strictDir := t.TempDir()
+		inclusiveDir := t.TempDir()
+		writeAuditBundleFixture(t, strictDir, report)
+		writeAuditBundleFixture(t, inclusiveDir, report)
+
+		job := a.jobs.createWithOwner(ownerUI, "spider", "https://example.com", WizardSettings{
+			Mode:     1,
+			StartURL: "https://example.com",
+		})
+		job.mu.Lock()
+		job.status = jobStatusDone
+		job.phase = jobPhaseDone
+		job.finishedAt = time.Now().UTC()
+		job.result = []Page{{URL: "https://example.com/", StatusCode: 200}}
+		job.auditReady = true
+		job.auditDir = strictDir
+		job.auditInclusiveReady = true
+		job.auditInclusiveDir = inclusiveDir
+		job.mu.Unlock()
+
+		ts := httptest.NewServer(a.Handler())
+		t.Cleanup(ts.Close)
+		client := ts.Client()
+
+		resp, body := artifactDownload(t, client, http.MethodGet, ts.URL+"/api/crawl/"+job.id+"/download", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("UI CSV status = %d, want 200: %s", resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("Content-Type"); got != "text/csv" {
+			t.Fatalf("UI CSV Content-Type = %q, want text/csv", got)
+		}
+		if name := attachmentFilename(t, resp); !strings.HasSuffix(name, ".csv") {
+			t.Fatalf("UI CSV filename = %q, want a .csv suffix", name)
+		}
+		if len(body) == 0 {
+			t.Fatal("UI CSV body is empty")
+		}
+
+		for _, tc := range []struct {
+			path    string
+			profile string
+		}{
+			{"/api/crawl/" + job.id + "/audit/bundle.zip", "strict"},
+			{"/api/crawl/" + job.id + "/audit/inclusive/bundle.zip", "inclusive"},
+		} {
+			resp, body := artifactDownload(t, client, http.MethodGet, ts.URL+tc.path, nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("UI %s zip status = %d, want 200: %s", tc.profile, resp.StatusCode, body)
+			}
+			if got := resp.Header.Get("Content-Type"); got != "application/zip" {
+				t.Fatalf("UI %s zip Content-Type = %q, want application/zip", tc.profile, got)
+			}
+			if name := attachmentFilename(t, resp); !strings.HasSuffix(name, tc.profile+"-audit.zip") {
+				t.Fatalf("UI %s zip filename = %q, want a %s-audit.zip suffix", tc.profile, name, tc.profile)
+			}
+			if _, err := zip.NewReader(bytes.NewReader(body), int64(len(body))); err != nil {
+				t.Fatalf("UI %s zip body is not a ZIP: %v", tc.profile, err)
+			}
+		}
+	})
+}

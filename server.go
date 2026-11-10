@@ -1411,6 +1411,7 @@ func newApp(cfg appConfig) (*app, error) {
 		}
 		ms.app = a
 		mux.Handle(cfg.MCP.Path, withArtifactBase(ms.Handler()))
+		mux.Handle(artifactSubtreePattern(cfg.MCP.Path), ms.ArtifactHandler())
 		a.mcp = ms
 	}
 
