@@ -168,6 +168,290 @@ func waitForJobStatus(t *testing.T, job *crawlJob, want string) {
 	}
 }
 
+// waitForSignal blocks until ch is closed or the test deadline expires.
+func waitForSignal(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+// collectPhases reads want phase names from the fake runner's emission channel.
+func collectPhases(t *testing.T, ch <-chan string, want int) []string {
+	t.Helper()
+	out := make([]string, 0, want)
+	for len(out) < want {
+		select {
+		case phase := <-ch:
+			out = append(out, phase)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("received %v, want %d emitted phases", out, want)
+		}
+	}
+	return out
+}
+
+// TestJobPhases covers the phase lifecycle contract:
+//   - a spider audit job reports starting, sitemap discovery/coverage,
+//     crawling, both audit phases, and done in order;
+//   - list mode emits only starting and crawling and never runs an audit;
+//   - a runner error ends in the error phase;
+//   - started_at is set on the first active phase, finished_at only at a
+//     terminal phase, and terminal phases never regress.
+func TestJobPhases(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Run("spider audit job walks active and audit phases", func(t *testing.T) {
+		runner := newFakeCrawlRunner()
+		runner.phases = []string{
+			jobPhaseStarting,
+			jobPhaseDiscoveringSitemap,
+			jobPhaseCrawling,
+			jobPhaseSitemapCoverage,
+		}
+		runner.pages = []Page{{URL: "https://example.com/", StatusCode: 200}}
+		t.Cleanup(runner.Release)
+
+		strictGate := make(chan struct{})
+		inclusiveGate := make(chan struct{})
+		strictSeen := make(chan struct{})
+		inclusiveSeen := make(chan struct{})
+
+		previousAnalyze := auditAnalyze
+		auditAnalyze = func(dir string, opts auditpkg.Options) (*auditpkg.Result, error) {
+			outDir := opts.OutDir
+			if outDir == "" {
+				outDir = dir
+				close(strictSeen)
+				<-strictGate
+			} else {
+				close(inclusiveSeen)
+				<-inclusiveGate
+			}
+			return &auditpkg.Result{OutputDir: outDir}, nil
+		}
+		t.Cleanup(func() { auditAnalyze = previousAnalyze })
+
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		start := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "https://example.com",
+			"audit":     true,
+		})
+		jobID, _ := start["job_id"].(string)
+		if jobID == "" {
+			t.Fatal("start_crawl did not return a job ID")
+		}
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+
+		waitForSignal(t, runner.started, "crawl runner start")
+
+		emitted := collectPhases(t, runner.emitted, 4)
+		wantActive := []string{
+			jobPhaseStarting,
+			jobPhaseDiscoveringSitemap,
+			jobPhaseCrawling,
+			jobPhaseSitemapCoverage,
+		}
+		if !slices.Equal(emitted, wantActive) {
+			t.Fatalf("runner phases = %v, want %v", emitted, wantActive)
+		}
+		transitions := append([]string(nil), emitted...)
+
+		out := callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		if out["phase"] != jobPhaseSitemapCoverage {
+			t.Fatalf("phase = %v, want %q", out["phase"], jobPhaseSitemapCoverage)
+		}
+		if out["finished_at"] != nil {
+			t.Fatalf("finished_at = %v, want null before the audit", out["finished_at"])
+		}
+		audit := nestedObject(t, out, "audit")
+		if audit["state"] != auditStatePending {
+			t.Fatalf("audit.state = %v, want %q before the audit", audit["state"], auditStatePending)
+		}
+
+		runner.Release()
+		waitForSignal(t, strictSeen, "strict audit start")
+
+		out = callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		if out["phase"] != jobPhaseAuditingStrict {
+			t.Fatalf("phase = %v, want %q", out["phase"], jobPhaseAuditingStrict)
+		}
+		transitions = append(transitions, out["phase"].(string))
+		audit = nestedObject(t, out, "audit")
+		if audit["state"] != auditStateRunning {
+			t.Fatalf("audit.state = %v, want %q during the strict audit", audit["state"], auditStateRunning)
+		}
+		close(strictGate)
+
+		waitForSignal(t, inclusiveSeen, "inclusive audit start")
+		out = callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		if out["phase"] != jobPhaseAuditingInclusive {
+			t.Fatalf("phase = %v, want %q", out["phase"], jobPhaseAuditingInclusive)
+		}
+		transitions = append(transitions, out["phase"].(string))
+		close(inclusiveGate)
+
+		waitForJobStatus(t, job, jobStatusDone)
+		out = callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		audit = nestedObject(t, out, "audit")
+		if audit["state"] != auditStateReady {
+			t.Fatalf("audit.state = %v, want %q after both audits", audit["state"], auditStateReady)
+		}
+		if out["finished_at"] == nil {
+			t.Fatal("finished_at is null after done")
+		}
+		transitions = append(transitions, out["phase"].(string))
+
+		want := []string{
+			jobPhaseStarting,
+			jobPhaseDiscoveringSitemap,
+			jobPhaseCrawling,
+			jobPhaseSitemapCoverage,
+			jobPhaseAuditingStrict,
+			jobPhaseAuditingInclusive,
+			jobPhaseDone,
+		}
+		if !slices.Equal(transitions, want) {
+			t.Fatalf("phase sequence = %v, want %v", transitions, want)
+		}
+	})
+
+	t.Run("list mode emits no sitemap or audit phases", func(t *testing.T) {
+		runner := newFakeCrawlRunner()
+		runner.phases = []string{jobPhaseStarting, jobPhaseCrawling}
+		t.Cleanup(runner.Release)
+
+		previousAnalyze := auditAnalyze
+		auditAnalyze = func(string, auditpkg.Options) (*auditpkg.Result, error) {
+			t.Error("list job ran an audit")
+			return &auditpkg.Result{}, nil
+		}
+		t.Cleanup(func() { auditAnalyze = previousAnalyze })
+
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		start := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode": "list",
+			"urls": []string{"https://example.com"},
+		})
+		jobID, _ := start["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+
+		waitForSignal(t, runner.started, "list runner start")
+		emitted := collectPhases(t, runner.emitted, 2)
+		if want := []string{jobPhaseStarting, jobPhaseCrawling}; !slices.Equal(emitted, want) {
+			t.Fatalf("list phases = %v, want %v", emitted, want)
+		}
+
+		runner.Release()
+		waitForJobStatus(t, job, jobStatusDone)
+
+		out := callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		if out["phase"] != jobPhaseDone {
+			t.Fatalf("phase = %v, want %q", out["phase"], jobPhaseDone)
+		}
+	})
+
+	t.Run("runner error ends in the error phase", func(t *testing.T) {
+		runner := newImmediateFakeRunner(nil, errors.New("phase failure"))
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), runner)
+
+		start := callToolObject(t, ctx, session, "start_crawl", map[string]any{
+			"mode":      "spider",
+			"start_url": "https://example.com",
+		})
+		jobID, _ := start["job_id"].(string)
+		job := app.jobs.get(jobID)
+		if job == nil {
+			t.Fatalf("job %q is not in the manager", jobID)
+		}
+		waitForJobStatus(t, job, jobStatusError)
+
+		out := callToolObject(t, ctx, session, "get_job", map[string]any{"job_id": jobID})
+		if out["phase"] != jobPhaseError {
+			t.Fatalf("phase = %v, want %q", out["phase"], jobPhaseError)
+		}
+		if out["finished_at"] == nil {
+			t.Fatal("finished_at is null after an error")
+		}
+	})
+
+	t.Run("startedAt and terminal transitions follow the lifecycle", func(t *testing.T) {
+		job := &crawlJob{status: jobStatusRunning}
+
+		job.setPhase(jobPhaseQueued)
+		job.mu.Lock()
+		started, finished := job.startedAt, job.finishedAt
+		job.mu.Unlock()
+		if !started.IsZero() || !finished.IsZero() {
+			t.Fatalf("queued timestamps = started:%v finished:%v, want both zero", started, finished)
+		}
+
+		job.setPhase(jobPhaseStarting)
+		job.mu.Lock()
+		started = job.startedAt
+		job.mu.Unlock()
+		if started.IsZero() {
+			t.Fatal("startedAt is zero after the first active phase")
+		}
+
+		for _, phase := range []string{jobPhaseDiscoveringSitemap, jobPhaseCrawling, jobPhaseSitemapCoverage, jobPhaseAuditingStrict, jobPhaseAuditingInclusive} {
+			job.setPhase(phase)
+			job.mu.Lock()
+			finished = job.finishedAt
+			job.mu.Unlock()
+			if !finished.IsZero() {
+				t.Fatalf("finishedAt set during active phase %q", phase)
+			}
+		}
+
+		job.setPhase(jobPhaseDone)
+		job.mu.Lock()
+		finished = job.finishedAt
+		job.mu.Unlock()
+		if finished.IsZero() {
+			t.Fatal("finishedAt is zero after done")
+		}
+
+		job.setPhase(jobPhaseCrawling)
+		if _, phase := job.statusPhase(); phase != jobPhaseDone {
+			t.Fatalf("phase after terminal = %q, want %q (no regression)", phase, jobPhaseDone)
+		}
+	})
+
+	t.Run("phase transitions persist through the job store", func(t *testing.T) {
+		store, err := newJobStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("newJobStore: %v", err)
+		}
+		jm := newJobManager(jobManagerConfig{Store: store, DisableReaper: true})
+		job := jm.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{Mode: 1})
+
+		job.setPhase(jobPhaseCrawling)
+		loaded, err := store.load(job.id)
+		if err != nil {
+			t.Fatalf("store.load: %v", err)
+		}
+		loaded.mu.Lock()
+		phase := loaded.phase
+		loaded.mu.Unlock()
+		if phase != jobPhaseCrawling {
+			t.Fatalf("persisted phase = %q, want %q", phase, jobPhaseCrawling)
+		}
+	})
+}
+
 // TestMCPInitializeHandshake covers the slice contract:
 //   - an MCP client can initialize over Streamable HTTP at /mcp and read the
 //     go-frog server metadata;
@@ -1792,11 +2076,11 @@ func (r *gatedCrawlRunner) run() (crawlOutcome, error) {
 	return crawlOutcome{}, nil
 }
 
-func (r *gatedCrawlRunner) Spider(_ context.Context, _ WizardSettings, _ progressFunc) (crawlOutcome, error) {
+func (r *gatedCrawlRunner) Spider(_ context.Context, _ WizardSettings, _ progressFunc, _ phaseFunc) (crawlOutcome, error) {
 	return r.run()
 }
 
-func (r *gatedCrawlRunner) List(_ context.Context, _ []string, _ WizardSettings, _ progressFunc) (crawlOutcome, error) {
+func (r *gatedCrawlRunner) List(_ context.Context, _ []string, _ WizardSettings, _ progressFunc, _ phaseFunc) (crawlOutcome, error) {
 	return r.run()
 }
 

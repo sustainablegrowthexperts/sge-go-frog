@@ -14,22 +14,32 @@ type crawlOutcome struct {
 	LimitReason string
 }
 
+// phaseFunc is called when a crawl enters a new lifecycle phase.
+type phaseFunc func(phase string)
+
+// emitPhase reports a phase transition when a caller supplied a callback.
+func emitPhase(onPhase phaseFunc, phase string) {
+	if onPhase != nil {
+		onPhase(phase)
+	}
+}
+
 // crawlRunner starts a crawl and returns its outcome. The interface exists so
 // the MCP tools and the web UI share one pipeline while tests can substitute a
 // deterministic fake. Context is threaded so a caller can bound the run.
 type crawlRunner interface {
-	Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error)
-	List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error)
+	Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error)
+	List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error)
 }
 
 // realCrawlRunner adapts the existing crawl implementations to crawlRunner.
 type realCrawlRunner struct{}
 
-func (realCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
+func (realCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		return crawlOutcome{}, err
 	}
-	outcome, err := runSpiderContext(ctx, settings, onProgress)
+	outcome, err := runSpiderContext(ctx, settings, onProgress, onPhase)
 	if err != nil {
 		return crawlOutcome{}, err
 	}
@@ -39,11 +49,11 @@ func (realCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onPr
 	return outcome, nil
 }
 
-func (realCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
+func (realCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		return crawlOutcome{}, err
 	}
-	outcome, err := runListContext(ctx, urls, settings, onProgress)
+	outcome, err := runListContext(ctx, urls, settings, onProgress, onPhase)
 	if err != nil {
 		return crawlOutcome{}, err
 	}
@@ -59,10 +69,12 @@ func (realCrawlRunner) List(ctx context.Context, urls []string, settings WizardS
 type fakeCrawlRunner struct {
 	started chan struct{}
 	release chan struct{}
+	emitted chan string
 
 	releaseOnce  sync.Once
 	block        bool
 	progressURLs []string
+	phases       []string
 	pages        []Page
 	truncated    bool
 	limitReason  string
@@ -80,6 +92,7 @@ func newFakeCrawlRunner() *fakeCrawlRunner {
 	return &fakeCrawlRunner{
 		started: make(chan struct{}, 1),
 		release: make(chan struct{}),
+		emitted: make(chan string, 16),
 		block:   true,
 	}
 }
@@ -106,7 +119,7 @@ func (r *fakeCrawlRunner) signalStarted() {
 	}
 }
 
-func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls []string, list bool, onProgress progressFunc) (crawlOutcome, error) {
+func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls []string, list bool, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error) {
 	r.mu.Lock()
 	if list {
 		r.listCalls++
@@ -122,12 +135,25 @@ func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls
 	limitReason := r.limitReason
 	err := r.err
 	progressURLs := append([]string(nil), r.progressURLs...)
+	phases := append([]string(nil), r.phases...)
 	r.mu.Unlock()
+
+	// Default to the phases every crawler emits so existing tests observe the
+	// same running phase they did before phase callbacks existed.
+	if len(phases) == 0 {
+		phases = []string{jobPhaseStarting, jobPhaseCrawling}
+	}
 
 	for _, url := range progressURLs {
 		if onProgress != nil {
 			onProgress(url)
 		}
+	}
+	for _, phase := range phases {
+		if onPhase != nil {
+			onPhase(phase)
+		}
+		r.emit(phase)
 	}
 	r.signalStarted()
 
@@ -141,10 +167,18 @@ func (r *fakeCrawlRunner) run(ctx context.Context, settings WizardSettings, urls
 	return crawlOutcome{Pages: pages, Truncated: truncated, LimitReason: limitReason}, err
 }
 
-func (r *fakeCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
-	return r.run(ctx, settings, nil, false, onProgress)
+// emit records one phase for tests that assert the emitted sequence.
+func (r *fakeCrawlRunner) emit(phase string) {
+	select {
+	case r.emitted <- phase:
+	default:
+	}
 }
 
-func (r *fakeCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc) (crawlOutcome, error) {
-	return r.run(ctx, settings, urls, true, onProgress)
+func (r *fakeCrawlRunner) Spider(ctx context.Context, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error) {
+	return r.run(ctx, settings, nil, false, onProgress, onPhase)
+}
+
+func (r *fakeCrawlRunner) List(ctx context.Context, urls []string, settings WizardSettings, onProgress progressFunc, onPhase phaseFunc) (crawlOutcome, error) {
+	return r.run(ctx, settings, urls, true, onProgress, onPhase)
 }

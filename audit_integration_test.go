@@ -471,7 +471,7 @@ func TestCrawlerPageAndDepthLimits(t *testing.T) {
 			Concurrency: 2,
 			ssrfPolicy:  testSSRFPolicy(),
 			limits:      &limits,
-		}, nil)
+		}, nil, nil)
 		if err != nil {
 			t.Fatalf("runListContext: %v", err)
 		}

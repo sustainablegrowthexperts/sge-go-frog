@@ -716,7 +716,7 @@ func (j *crawlJob) persist() {
 func (j *crawlJob) markQueued() {
 	j.mu.Lock()
 	j.status = jobStatusQueued
-	j.phase = jobPhaseQueued
+	j.setPhaseLocked(jobPhaseQueued)
 	j.mu.Unlock()
 	j.persist()
 }
@@ -730,22 +730,35 @@ func (j *crawlJob) startFromQueue() {
 		return
 	}
 	j.status = jobStatusRunning
-	j.phase = jobPhaseStarting
-	j.startedAt = time.Now().UTC()
+	j.setPhaseLocked(jobPhaseStarting)
 	j.mu.Unlock()
 	j.persist()
 }
 
-// setPhase moves the job to an active phase and records startedAt the first
-// time it becomes active. Only a real phase change is persisted; progress
-// callbacks never write.
-func (j *crawlJob) setPhase(phase string) {
-	j.mu.Lock()
+// setPhaseLocked applies the phase lifecycle rules while the caller holds the
+// job mutex. It reports whether the phase changed. startedAt is recorded the
+// first time the job enters an active phase, finishedAt at a terminal phase,
+// and a terminal phase never regresses to an active one.
+func (j *crawlJob) setPhaseLocked(phase string) bool {
+	if isTerminalPhase(j.phase) && !isTerminalPhase(phase) {
+		return false
+	}
 	changed := j.phase != phase
 	j.phase = phase
-	if j.startedAt.IsZero() && phase != jobPhaseDone && phase != jobPhaseError {
+	if j.startedAt.IsZero() && isActivePhase(phase) {
 		j.startedAt = time.Now().UTC()
 	}
+	if isTerminalPhase(phase) && j.finishedAt.IsZero() {
+		j.finishedAt = time.Now().UTC()
+	}
+	return changed
+}
+
+// setPhase moves the job to a new lifecycle phase and persists real changes.
+// Progress callbacks never write.
+func (j *crawlJob) setPhase(phase string) {
+	j.mu.Lock()
+	changed := j.setPhaseLocked(phase)
 	j.mu.Unlock()
 	if changed {
 		j.persist()
@@ -785,8 +798,7 @@ func (j *crawlJob) progress(url string) {
 func (j *crawlJob) finish(pages []Page) {
 	j.mu.Lock()
 	j.status = jobStatusDone
-	j.phase = jobPhaseDone
-	j.finishedAt = time.Now().UTC()
+	j.setPhaseLocked(jobPhaseDone)
 	j.result = pages
 	j.pages = len(pages)
 	j.mu.Unlock()
@@ -808,8 +820,7 @@ func (j *crawlJob) setTruncation(truncated bool, reason string) {
 func (j *crawlJob) fail(err error) {
 	j.mu.Lock()
 	j.status = jobStatusError
-	j.phase = jobPhaseError
-	j.finishedAt = time.Now().UTC()
+	j.setPhaseLocked(jobPhaseError)
 	j.errMsg = err.Error()
 	j.mu.Unlock()
 	j.persist()
@@ -818,8 +829,7 @@ func (j *crawlJob) fail(err error) {
 func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Result, inclusiveErr error) {
 	j.mu.Lock()
 	j.status = jobStatusDone
-	j.phase = jobPhaseDone
-	j.finishedAt = time.Now().UTC()
+	j.setPhaseLocked(jobPhaseDone)
 	j.result = pages
 	j.pages = len(pages)
 	j.auditReady = true
@@ -845,8 +855,7 @@ func (j *crawlJob) finishWithAudits(pages []Page, strict, inclusive *auditpkg.Re
 func (j *crawlJob) finishWithAuditError(pages []Page, err error) {
 	j.mu.Lock()
 	j.status = jobStatusDone
-	j.phase = jobPhaseDone
-	j.finishedAt = time.Now().UTC()
+	j.setPhaseLocked(jobPhaseDone)
 	j.result = pages
 	j.pages = len(pages)
 	j.auditReady = false
@@ -1293,11 +1302,16 @@ func runMCPCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner, 
 	runCrawlJob(job, settings, runner)
 }
 
+// auditAnalyze is the audit pipeline entry point. It is a variable so tests
+// can observe the strict/inclusive phase transitions without depending on a
+// real archive. Production always uses auditpkg.Analyze.
+var auditAnalyze = auditpkg.Analyze
+
 // runCrawlJob is the single launch path shared by the web UI and the MCP
 // tools. It runs the crawler and then, when enabled, the strict/inclusive
 // audit pipeline.
 func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
-	job.setPhase(jobPhaseCrawling)
+	job.setPhase(jobPhaseStarting)
 
 	// Only MCP jobs carry resolved limits. UI and CLI runs keep their current
 	// unbounded behavior.
@@ -1306,13 +1320,15 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 		settings.limits = &limits
 	}
 
+	onPhase := func(phase string) { job.setPhase(phase) }
+
 	var outcome crawlOutcome
 	var err error
 	switch settings.Mode {
 	case 1:
-		outcome, err = runner.Spider(context.Background(), settings, job.progress)
+		outcome, err = runner.Spider(context.Background(), settings, job.progress, onPhase)
 	case 2:
-		outcome, err = runner.List(context.Background(), settings.listURLs, settings, job.progress)
+		outcome, err = runner.List(context.Background(), settings.listURLs, settings, job.progress, onPhase)
 	default:
 		err = fmt.Errorf("unknown mode %d", settings.Mode)
 	}
@@ -1330,8 +1346,11 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 			job.finishWithAuditError(pages, fmt.Errorf("audit skipped: crawl truncated at %s", outcome.LimitReason))
 			return
 		}
+		// Mark the audit running before the phase write so the persisted
+		// auditing_strict snapshot already reports audit.state=running.
 		job.beginAudit()
-		result, auditErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
+		job.setPhase(jobPhaseAuditingStrict)
+		result, auditErr := auditAnalyze(settings.AuditArchiveDir, auditpkg.Options{Filters: settings.AuditFilters})
 		if auditErr != nil {
 			job.finishWithAuditError(pages, fmt.Errorf("internal linking audit: %w", auditErr))
 			return
@@ -1340,7 +1359,8 @@ func runCrawlJob(job *crawlJob, settings WizardSettings, runner crawlRunner) {
 		// Build the inclusive report from the same archive. It keeps the
 		// strict run's navigation filters but counts every other
 		// widget/listing link as content.
-		inclusive, inclusiveErr := auditpkg.Analyze(settings.AuditArchiveDir, auditpkg.Options{
+		job.setPhase(jobPhaseAuditingInclusive)
+		inclusive, inclusiveErr := auditAnalyze(settings.AuditArchiveDir, auditpkg.Options{
 			Filters: inclusiveAuditFilters(result),
 			OutDir:  filepath.Join(settings.AuditArchiveDir, "inclusive"),
 		})

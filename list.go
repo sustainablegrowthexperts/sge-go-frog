@@ -13,14 +13,16 @@ import (
 )
 
 func runList(urls []string, s WizardSettings, onProgress progressFunc) ([]Page, error) {
-	outcome, err := runListContext(context.Background(), urls, s, onProgress)
+	outcome, err := runListContext(context.Background(), urls, s, onProgress, nil)
 	return outcome.Pages, err
 }
 
 // runListContext is the context-aware list entry point. It deduplicates the
 // input, enforces the list-URL cap before any visit, and applies the same page
 // and duration caps as spider mode.
-func runListContext(ctx context.Context, urls []string, s WizardSettings, onProgress progressFunc) (outcome crawlOutcome, err error) {
+func runListContext(ctx context.Context, urls []string, s WizardSettings, onProgress progressFunc, onPhase phaseFunc) (outcome crawlOutcome, err error) {
+	emitPhase(onPhase, jobPhaseStarting)
+
 	if len(urls) == 0 {
 		return crawlOutcome{}, fmt.Errorf("no URLs to visit")
 	}
@@ -82,6 +84,7 @@ func runListContext(ctx context.Context, urls []string, s WizardSettings, onProg
 	attachHTTPTiming(c, starts, budget)
 	attachPageRecording(c, starts, nil, store, budget, s.KeywordsRaw, onProgress, archive)
 
+	emitPhase(onPhase, jobPhaseCrawling)
 	for _, u := range urls {
 		if budget.stopForWork() {
 			break

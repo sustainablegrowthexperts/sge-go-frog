@@ -1,7 +1,7 @@
 ---
 id: task-014
 title: "[Slice] get_job shows live crawl and audit phases"
-status: pending
+status: completed
 depends_on: ["task-013"]
 target_files:
   - "spider.go"

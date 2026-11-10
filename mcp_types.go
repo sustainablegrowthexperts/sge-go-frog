@@ -35,15 +35,41 @@ const (
 	maxListJobsLimit     = 100
 )
 
-// Job phase values. A job moves from queued to starting, then crawling, and
-// ends in done or error.
+// Job phase values. A job moves from queued to starting, then optionally
+// through sitemap discovery/coverage and the two audit phases, and ends in a
+// terminal phase.
 const (
-	jobPhaseQueued   = "queued"
-	jobPhaseStarting = "starting"
-	jobPhaseCrawling = "crawling"
-	jobPhaseDone     = "done"
-	jobPhaseError    = "error"
+	jobPhaseQueued             = "queued"
+	jobPhaseStarting           = "starting"
+	jobPhaseDiscoveringSitemap = "discovering_sitemap"
+	jobPhaseCrawling           = "crawling"
+	jobPhaseSitemapCoverage    = "sitemap_coverage"
+	jobPhaseAuditingStrict     = "auditing_strict"
+	jobPhaseAuditingInclusive  = "auditing_inclusive"
+	jobPhaseDone               = "done"
+	jobPhaseError              = "error"
+	jobPhaseCancelled          = "cancelled"
 )
+
+// isTerminalPhase reports whether a phase ends the job lifecycle.
+func isTerminalPhase(phase string) bool {
+	switch phase {
+	case jobPhaseDone, jobPhaseError, jobPhaseCancelled:
+		return true
+	}
+	return false
+}
+
+// isActivePhase reports whether a phase means the job has begun work and is
+// still running. queued is not active; terminal phases are not active.
+func isActivePhase(phase string) bool {
+	switch phase {
+	case jobPhaseStarting, jobPhaseDiscoveringSitemap, jobPhaseCrawling,
+		jobPhaseSitemapCoverage, jobPhaseAuditingStrict, jobPhaseAuditingInclusive:
+		return true
+	}
+	return false
+}
 
 // Audit lifecycle states reported by get_job.
 const (

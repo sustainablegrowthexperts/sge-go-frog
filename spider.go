@@ -13,14 +13,16 @@ import (
 )
 
 func runSpider(s WizardSettings, onProgress progressFunc) ([]Page, error) {
-	outcome, err := runSpiderContext(context.Background(), s, onProgress)
+	outcome, err := runSpiderContext(context.Background(), s, onProgress, nil)
 	return outcome.Pages, err
 }
 
 // runSpiderContext is the context-aware spider entry point. A non-nil
 // settings.limits enforces the per-job page, depth, and duration caps; a nil
 // limits keeps the CLI/UI behavior unbounded.
-func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progressFunc) (outcome crawlOutcome, err error) {
+func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progressFunc, onPhase phaseFunc) (outcome crawlOutcome, err error) {
+	emitPhase(onPhase, jobPhaseStarting)
+
 	start, err := normalizeHTTPURL(s.StartURL)
 	if err != nil {
 		return crawlOutcome{}, fmt.Errorf("starting URL: %w", err)
@@ -77,6 +79,7 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 		// Sitemap discovery stays tied to audit for v1; archive_html alone
 		// does not fetch sitemaps.
 		if s.Audit {
+			emitPhase(onPhase, jobPhaseDiscoveringSitemap)
 			discovery := discoverSitemap(root, host, s.ProxyURL, policy)
 			archive.SetSitemap(discovery.Meta)
 			sitemapPages = discovery.Pages
@@ -168,6 +171,7 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 			archive.MarkSource(u.String(), "start")
 		}
 	}
+	emitPhase(onPhase, jobPhaseCrawling)
 	if !budget.stopForWork() {
 		if err := c.Visit(start); err != nil {
 			return crawlOutcome{}, err
@@ -181,6 +185,7 @@ func runSpiderContext(ctx context.Context, s WizardSettings, onProgress progress
 	// are outside the link frontier, so they are treated as depth 0 and only
 	// the page/duration caps apply.
 	if s.Audit && len(sitemapPages) > 0 {
+		emitPhase(onPhase, jobPhaseSitemapCoverage)
 		seen := make(map[string]struct{})
 		for _, page := range store.snapshot() {
 			if canonical, ok := auditpkg.CanonicalURL(page.URL, nil); ok {
