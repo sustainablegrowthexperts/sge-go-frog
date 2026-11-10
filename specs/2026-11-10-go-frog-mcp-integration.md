@@ -177,3 +177,22 @@ Add an embedded Model Context Protocol (MCP) server to go-frog so MCP-capable AI
 31. **Add regression tests** — existing HTML fragments, CSV columns, audit artifact contents, `--cli`, and `go-frog-audit` behavior remain unchanged.
 32. **Update documentation** — README, DEPLOYMENT, client configuration examples, limits/retention, proxy routing, and the restart/runbook procedure.
 33. **Run the acceptance suite** — `go test ./...`, `go test -race ./...`, and `go vet ./...`; verify every item in `MCP.md` §23; document any deliberate deviation in this spec.
+
+---
+
+## 6. Documentation and deployment acceptance (task-022)
+
+### Verification
+
+- `go test ./...` — passed.
+- `go vet ./...` — passed.
+- `go test -race ./...` — passed in `golang:1.26-alpine` with `gcc` and `musl-dev` installed. The host has no C compiler, so `-race` cannot run directly on the workstation.
+- `MCP.md` §23 items are covered by the MCP test suite (initialize/tools, job lifecycle, results, audit, search, artifacts, TTL, limits, auth boundary, SSRF, unchanged UI/CSV/CLI, graceful shutdown) with documentation and the deployment runbook added by task-022.
+- `.env.example` and `compose.yml` are guarded by `TestMCPDocumentationContract` in `mcp_test.go`.
+
+### Deliberate deviations
+
+1. **Enable variable name.** The task prose refers to `GOFROG_MCP_HTTP`, but the implementation exposes `GOFROG_MCP_ENABLED` plus the `--mcp` flag. The README and deployment files document the implemented names.
+2. **Listener model.** MCP shares the existing web listener at `GOFROG_MCP_PATH` (`/mcp` by default); there is no separate MCP port, address, or token-file setting. Authentication stays at oauth2-proxy with one shared Bearer token, as decided in this specification.
+3. **Persistence default in compose.** `compose.yml` sets `GOFROG_MCP_PERSIST=true` so the documented restart survival behavior holds in the deployment. The application default remains `false`; when persistence is disabled, jobs are explicitly documented as in-memory and lost on restart.
+4. **Unsupported features are not advertised.** The docs do not mention stdio transport, `cancel_job`, MCP resources (`gofrog://`), multiple tokens, or horizontal scaling. `TestMCPDocumentationContract` rejects those claims to prevent drift.

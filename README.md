@@ -94,6 +94,105 @@ The auditor looks for overrides in this order: `--config <path>`, `GOFROG_AUDIT_
 
 ---
 
+## MCP server (AI agents)
+
+go-frog can expose an embedded Model Context Protocol (MCP) server over Streamable HTTP. An MCP client such as Claude can start spider or list crawls, poll them, read results and audits, search archived pages, and download artifacts without using the web UI. The MCP endpoint reuses the same crawl, job, audit, and artifact pipeline as the UI. MCP tools only see jobs created through MCP; web UI jobs stay browser-only.
+
+### Enabling the endpoint
+
+MCP is off by default. Enable it on the existing listener (port `8080` by default) and keep the default path:
+
+```bash
+GOFROG_MCP_ENABLED=true GOFROG_MCP_PATH=/mcp ./go-frog
+```
+
+The equivalent flags are `--mcp` and `--mcp-path`. When running under Docker, copy `.env.example` to `.env` (or edit `compose.yml`) and set at least:
+
+```bash
+GOFROG_MCP_ENABLED=true
+GOFROG_MCP_PATH=/mcp
+GOFROG_MCP_RESULTS_DIR=/results
+GOFROG_MCP_PERSIST=true
+```
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for proxy routing, the results volume, restart behavior, and the operational runbook.
+
+### Authentication
+
+There is no app-level token validation, OAuth flow, or per-caller ownership. Authentication is enforced by the deployment's oauth2-proxy with one shared Bearer token: clients send `Authorization: Bearer <token>`, the proxy validates it, and go-frog assumes the request is already authenticated. Tokens are never logged. Use TLS at the proxy; do not send the token over plain HTTP.
+
+### The seven tools
+
+| Tool | What it does |
+|------|--------------|
+| `start_crawl` | Start an asynchronous spider or list crawl with optional keywords, audit, `archive_html`, per-job audit filters, per-job limits, and `client_request_id`. Returns a job ID immediately. |
+| `get_job` | Poll a job for status, phase, page progress, current URL, limits, truncation, audit state, and artifact readiness. |
+| `list_jobs` | List MCP-created jobs newest first, filtered by status or mode and paginated. |
+| `get_results` | Read completed page rows with filtering, sorting, pagination, keyword counts, summary counts, manifest depth/discovery, and an optional strict-audit join. |
+| `search_pages` | Search crawl metadata without an archive, or archived raw HTML and visible text when the job has an archive. Supports literal and RE2 regex patterns, case sensitivity, snippets, and pagination. |
+| `get_audit` | Read a strict or inclusive audit section: summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, or all. |
+| `get_artifact` | Get an authenticated download URL, size, and expiry for the CSV report, strict/inclusive audit ZIP, or strict/inclusive audit JSON. Small CSV and JSON bodies can be returned inline. |
+
+### Job lifecycle and polling
+
+`start_crawl` returns immediately; crawls run in the background. Polling with `get_job` is the v1 progress mechanism. Use `status` (`queued`, `running`, `done`, `error`, `cancelled`) to decide when to stop, and `phase` (`queued`, `starting`, `discovering_sitemap`, `crawling`, `sitemap_coverage`, `auditing_strict`, `auditing_inclusive`, `done`, `error`, `cancelled`) to see what the job is doing. `list_jobs` shows only jobs created by MCP tools. Reuse the same `client_request_id` to retry `start_crawl` safely: an identical request returns the existing job, while different input with the same ID returns a `conflict` error. `get_results`, `get_audit`, and `get_artifact` refuse jobs that are still running.
+
+### Search, archives, and audits
+
+`search_pages` can search page metadata without an archive. The HTML and text scopes need the saved page archive, so start the job with `audit=true` or `archive_html=true`. `get_audit` requires `audit=true`. If no archive exists, `search_pages` returns `search_not_available` with a hint; `get_audit` returns `audit_not_available`.
+
+### Artifacts
+
+`get_artifact` returns an authenticated URL, size, and expiry for CSV, audit ZIP, and audit JSON artifacts. Set `inline=true` to return small CSV or JSON content directly, up to the 1 MB inline cap. Download URLs pass through the same oauth2-proxy, so clients must send the same Bearer token when they fetch them. Artifact URLs expire when the job leaves the retention window.
+
+### Limits
+
+The server enforces these defaults; per-job limits can lower them, never raise them. MCP limits do not change web UI or CLI behavior.
+
+- **Max pages:** 5,000 pages per job
+- **Max depth:** depth 10
+- **Max list URLs:** 1,000 list URLs per list job
+- **Max duration:** 30 minutes
+- **Concurrency:** concurrency 20 per job
+- **Max keywords:** 20 keywords of up to 100 characters each
+- **Pattern length:** 512 characters for `search_pages` patterns
+- **Max URL length:** 2,048 characters
+- **Max request size:** 1 MB
+- **Max response size:** 5 MB
+- **Rate limit:** 60 tool calls per minute
+- **Max concurrent jobs:** 4 global and 2 per token (the deployment uses one shared token)
+- **Max retained jobs:** 100 finished jobs
+- **Search limit:** 500 results per request
+- **Inline artifacts:** 1 MB
+
+Each limit has a `GOFROG_MCP_*` environment variable and a matching `--mcp-*` flag; see `.env.example`.
+
+### Retention
+
+Completed MCP jobs and their artifacts are kept for 24 hours after they finish. Running jobs are never reaped. With `GOFROG_MCP_PERSIST=true`, jobs are stored under `/results/jobs/<job_id>/`, so completed jobs survive a restart or redeploy for the retention window. A restart marks jobs that were running as `error` with code `interrupted`. Web UI jobs keep their existing 30-minute retention.
+
+### Client configuration
+
+Configure a remote Streamable HTTP MCP server with the MCP URL and the Bearer token issued by your proxy:
+
+```json
+{
+  "mcpServers": {
+    "go-frog": {
+      "type": "http",
+      "url": "https://crawler.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+Some clients infer Streamable HTTP from `url`; others need `"type": "http"` or a different top-level key. The server may return an `Mcp-Session-Id` header, and clients and proxies must forward it on subsequent requests.
+
+---
+
 ## `--cli` flag (terminal wizard)
 
 Run with `--cli` for the original interactive terminal wizard. Useful on servers, over SSH, or when you prefer typing to clicking:

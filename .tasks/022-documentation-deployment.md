@@ -1,7 +1,7 @@
 ---
 id: task-022
 title: "[Slice] Operators and clients have complete MCP documentation"
-status: pending
+status: completed
 depends_on: ["task-021"]
 target_files:
   - "README.md"
@@ -119,12 +119,12 @@ target_files:
 
 ## Definition of Done
 
-- [ ] Failing test written and executed first — failure observed and confirmed to be due to missing functionality (not an unrelated syntax/import error)
-- [ ] Implementation completed and tests re-run — all tests pass cleanly
-- [ ] Entire test suite passes without regressions (`go test ./...`)
-- [ ] `go test -race ./...` passes
-- [ ] `go vet ./...` passes
-- [ ] README documents the seven tools, auth, limits, retention, search requirements, and client setup
-- [ ] DEPLOYMENT documents the results volume, `/mcp` proxy routing, restart behavior, retention, and runbook
-- [ ] `compose.yml` and `.env.example` match the documented configuration and contain no real secrets
-- [ ] `MCP.md` §23 acceptance items are verified; deliberate deviations are recorded in the spec
+- [x] Failing test written and executed first — failure observed and confirmed to be due to missing functionality (not an unrelated syntax/import error)
+- [x] Implementation completed and tests re-run — all tests pass cleanly
+- [x] Entire test suite passes without regressions (`go test ./...`)
+- [x] `go test -race ./...` passes
+- [x] `go vet ./...` passes
+- [x] README documents the seven tools, auth, limits, retention, search requirements, and client setup
+- [x] DEPLOYMENT documents the results volume, `/mcp` proxy routing, restart behavior, retention, and runbook
+- [x] `compose.yml` and `.env.example` match the documented configuration and contain no real secrets
+- [x] `MCP.md` §23 acceptance items are verified; deliberate deviations are recorded in the spec

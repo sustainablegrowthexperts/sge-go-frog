@@ -162,7 +162,9 @@ scp dist/go-frog dist/go-frog-audit \
 ```
 /home/sge_admin/go-frog/
 ├── compose.yml                  # image: sge-go-frog-go-frog, 4374:8080
+├── .env                         # local values copied from .env.example; never committed
 ├── sge-go-frog-image.tar.gz     # latest transferred image
+├── results/                     # persisted CSV, archives, and MCP job directories
 └── DEPLOYMENT.md                # this document
 ```
 
@@ -178,7 +180,17 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
+    environment:
+      GOFROG_MCP_ENABLED: "${GOFROG_MCP_ENABLED:-false}"
+      GOFROG_MCP_PATH: "${GOFROG_MCP_PATH:-/mcp}"
+      GOFROG_MCP_RESULTS_DIR: "${GOFROG_MCP_RESULTS_DIR:-/results}"
+      GOFROG_MCP_PERSIST: "${GOFROG_MCP_PERSIST:-true}"
+      GOFROG_MCP_JOB_TTL: "${GOFROG_MCP_JOB_TTL:-24h}"
+    volumes:
+      - ./results:/results
 ```
+
+The full MCP environment surface is in `.env.example`. Set `GOFROG_MCP_ENABLED=true` only after the proxy route exists.
 
 ---
 
@@ -199,17 +211,94 @@ Run `docker compose` from `/home/sge_admin/go-frog` so the project name and comp
 
 ---
 
-## 6. Notes and troubleshooting
+## 6. MCP deployment and runbook
+
+MCP runs inside the same `go-frog` process as the web UI, on the same listener. It is disabled by default; set `GOFROG_MCP_ENABLED=true` and leave `GOFROG_MCP_PATH=/mcp`. The checked-in `compose.yml` reads these values from `.env`; copy `.env.example` to `.env` on the host and fill in deployment values. Never commit `.env`.
+
+### Results volume
+
+MCP jobs must persist across container recreation. Keep the results volume in `compose.yml`:
+
+```yaml
+volumes:
+  - ./results:/results
+```
+
+`GOFROG_MCP_RESULTS_DIR=/results` and `GOFROG_MCP_PERSIST=true` make the app write one directory per job under `/results/jobs/<job_id>/` (`job.json`, page rows, CSV, and audit artifacts). Without the volume, `docker compose up --force-recreate` discards completed jobs and downloads. The same volume holds the web UI's CSV files and audit archives, so it is required for both.
+
+### Proxy routing for /mcp
+
+Keep the published port on localhost or behind a firewall and terminate TLS at oauth2-proxy. Do not expose an unauthenticated MCP listener. Publish `/mcp` on the existing port/path; no second listener is needed.
+
+Nginx (the upstream is the published host port `4374` for Docker, or the container's `8080` for a host process):
+
+```nginx
+location /mcp {
+    proxy_pass http://127.0.0.1:4374;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Mcp-Session-Id $http_mcp_session_id;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+- `proxy_buffering off` and a generous `proxy_read_timeout` keep Streamable HTTP responses flowing; a buffering proxy can make tool calls appear to hang.
+- Forward `Authorization` and `Mcp-Session-Id` unchanged. oauth2-proxy performs authentication; go-frog does not validate the Bearer token itself.
+- Keep `Content-Type: application/json` intact and do not strip request headers other than hop-by-hop headers.
+- Publish only one replica. Sessions and jobs are process-local even when job files are persisted.
+
+### Restart behavior
+
+```bash
+sudo docker compose restart                  # restart in place
+sudo docker compose up -d --force-recreate   # after loading a new image
+```
+
+On SIGINT/SIGTERM, go-frog stops accepting new MCP jobs, marks every queued or running MCP job `error` with code `interrupted`, waits for in-flight archives to close, then shuts the HTTP server down with a timeout. Completed jobs survive on the results volume and remain readable until their retention window ends. If `GOFROG_MCP_PERSIST` is false, jobs exist only in memory and are lost on any restart.
+
+### Retention and disk usage
+
+- Retain completed MCP jobs for 24 hours after completion (`GOFROG_MCP_JOB_TTL`).
+- Never reap queued or running jobs.
+- Keep at most 100 finished MCP jobs (`GOFROG_MCP_MAX_RETAINED_JOBS`); the oldest finished jobs are evicted first.
+- The reaper runs every 5 minutes (`GOFROG_JOB_REAP_INTERVAL`) and also cleans expired directories at startup.
+- Disk use is dominated by archived HTML when `archive_html` or `audit` is enabled, plus audit ZIPs. Budget roughly the size of the crawled site per job. Check usage with `du -sh results/jobs` and free space with `df -h`.
+- Web UI jobs keep their existing 30-minute in-memory retention; this is unchanged.
+
+### Restart/runbook procedure
+
+1. Announce a restart if agents may be mid-crawl: running jobs will be marked interrupted.
+2. Confirm the results volume is mounted: inspect `/home/sge_admin/go-frog/results` or run `sudo docker compose config`.
+3. Record disk usage: `du -sh results/jobs && df -h .`.
+4. Restart or deploy as above.
+5. Check the logs for MCP startup and tool-call records: `sudo docker compose logs --tail=100`.
+6. Verify the endpoint through the proxy with an initialize or tools/list request from the MCP client; never test by exposing the port publicly.
+7. Confirm a completed job is still listed (`list_jobs`) and that a previously running job reports `interrupted`.
+8. If disk use is high, lower `GOFROG_MCP_JOB_TTL` or `GOFROG_MCP_MAX_RETAINED_JOBS`, then restart so the reaper applies the new limits.
+
+### Troubleshooting
+
+- **404 at `/mcp`** — `GOFROG_MCP_ENABLED` is not true, or `GOFROG_MCP_PATH` does not match the client URL. Check `sudo docker compose config` and the logs.
+- **401/403 from the proxy** — the client is missing or sending the wrong Bearer token. The app never sees or logs the token.
+- **Tool call hangs or a stream stalls** — the proxy is buffering responses or has a short read timeout. Set `proxy_buffering off` and `proxy_read_timeout 3600s` for `/mcp`.
+- **Session errors after the first request** — the proxy is dropping `Mcp-Session-Id`; forward it unchanged.
+- **Jobs disappeared after a restart** — the `/results` volume is missing, `GOFROG_MCP_RESULTS_DIR` points elsewhere, or `GOFROG_MCP_PERSIST=false`.
+- **Job says `interrupted`** — the process restarted while it was queued or running. Start a new job; v1 does not resume.
+- **`limit_exceeded`** — a per-job or server limit was hit. Check the `limits` in `get_job` and the `GOFROG_MCP_*` values.
+- **`search_not_available`** — the job has no archive. Start it with `audit=true` or `archive_html=true`.
+- **`audit_not_available`** — the job did not run with `audit=true`, or the audit has not finished.
+- **Disk full** — the results volume is full. Remove old runs after the retention window or lower the TTL/retained-job cap.
+
+---
+
+## 7. Notes and troubleshooting
 
 - **`permission denied ... /var/run/docker.sock`** — the command was run without `sudo`. Only the root user can talk to Docker on this host.
 - **`docker compose up -d` did not pick up the new build** — check `sudo docker images` shows a recent image ID for `sge-go-frog-go-frog:latest`, then run `sudo docker compose up -d --force-recreate`.
 - **Port 4374 already in use** — another process/container owns it. `sudo ss -ltnp | grep 4374` and `sudo docker ps` will show the owner.
 - **The tarball will not load** — verify the checksum on both sides. If it is truncated, re-run `docker save | gzip` and `scp` again. `gzip -1` is intentional for faster transfers.
-- **Crawl results are not persisted by compose.** Without a volume mount, `results/` lives inside the container and is removed when the container is recreated. Download any CSVs/audit bundles you need before deploying, or add a bind mount to `compose.yml`:
-  ```yaml
-  volumes:
-    - /home/sge_admin/go-frog/results:/results
-  ```
-  (Only add this if the app is configured to write to `/results`; the default is relative to the container's working directory.)
-- **oauth2-proxy** — if the service is fronted by oauth2-proxy, keep the port bound to localhost (`127.0.0.1:4374:8080`) and restart the proxy only if its upstream port changed. The current compose file publishes on all interfaces.
+- **Crawl results are not persisted without a volume.** `compose.yml` maps `./results:/results`, and `.env` sets `GOFROG_MCP_RESULTS_DIR=/results`, so CSV files, audit archives, and MCP job directories survive container recreation. If you remove the volume, download anything you need before redeploying; MCP jobs also require `GOFROG_MCP_PERSIST=true` to survive a restart.
+- **oauth2-proxy** — if the service is fronted by oauth2-proxy, keep the port bound to localhost (`127.0.0.1:4374:8080`) and restart the proxy only if its upstream port changed. The checked-in compose file publishes on all interfaces, so restrict it with a firewall or change the port mapping before enabling MCP.
 - **Build cache** — local `docker build` reuses the cached module/download layers; `docker build --no-cache .` forces a clean build if a dependency looks stale.

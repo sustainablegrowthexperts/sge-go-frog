@@ -5992,3 +5992,241 @@ func TestToolSchemasGolden(t *testing.T) {
 		})
 	}
 }
+
+// readContractFile reads one checked-in documentation or deployment file.
+func readContractFile(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(data)
+}
+
+// requireContractText fails when any required phrase is absent from a file.
+func requireContractText(t *testing.T, name, text string, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s must mention %q", name, want)
+		}
+	}
+}
+
+// rejectContractText fails when a file advertises an unsupported feature or
+// leaks a value that looks like a credential.
+func rejectContractText(t *testing.T, name, text string, unwanted ...string) {
+	t.Helper()
+	for _, no := range unwanted {
+		if strings.Contains(text, no) {
+			t.Errorf("%s must not mention %q", name, no)
+		}
+	}
+}
+
+// secretAssignmentPattern matches environment assignments whose key implies a
+// credential. Values are inspected separately so comments can still explain
+// that no app-level secrets belong in the template.
+var secretAssignmentPattern = regexp.MustCompile(`(?i)^\s*(?:export\s+)?([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIAL|PRIVATE_?KEY)[A-Z0-9_]*)\s*=\s*(.*)$`)
+
+// secretValuePatterns match values that look like real credentials rather than
+// placeholders. The docs contract test only needs to catch obvious leaks.
+var secretValuePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	regexp.MustCompile(`ghp_[A-Za-z0-9]{20,}`),
+	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),
+	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}`),
+	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
+	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/-]{16,}`),
+}
+
+// TestMCPDocumentationContract guards the operator and client documentation
+// from drifting away from the MCP implementation. It reads the checked-in docs
+// and deployment files; it does not exercise the MCP server itself.
+func TestMCPDocumentationContract(t *testing.T) {
+	readme := readContractFile(t, "README.md")
+	deployment := readContractFile(t, "DEPLOYMENT.md")
+	compose := readContractFile(t, "compose.yml")
+	envExample := readContractFile(t, ".env.example")
+
+	t.Run("README documents the seven tools", func(t *testing.T) {
+		requireContractText(t, "README.md", readme,
+			"`start_crawl`",
+			"`get_job`",
+			"`list_jobs`",
+			"`get_results`",
+			"`search_pages`",
+			"`get_audit`",
+			"`get_artifact`",
+		)
+	})
+
+	t.Run("README documents endpoint configuration and authentication", func(t *testing.T) {
+		requireContractText(t, "README.md", readme,
+			"GOFROG_MCP_ENABLED",
+			"GOFROG_MCP_PATH",
+			"oauth2-proxy",
+			"Bearer",
+			"no app-level token",
+		)
+	})
+
+	t.Run("README documents server limits", func(t *testing.T) {
+		requireContractText(t, "README.md", readme,
+			"Max pages",
+			"Max depth",
+			"Max list URLs",
+			"Max duration",
+			"Concurrency",
+			"Max keywords",
+			"Pattern length",
+			"Max URL length",
+			"Max request size",
+			"Max response size",
+			"Rate limit",
+			"5,000 pages",
+			"depth 10",
+			"1,000 list URLs",
+			"30 minutes",
+			"concurrency 20",
+			"20 keywords",
+			"100 characters",
+			"512 characters",
+			"2,048 characters",
+			"1 MB",
+			"5 MB",
+			"60 tool calls per minute",
+		)
+	})
+
+	t.Run("README documents retention, archive search, and artifacts", func(t *testing.T) {
+		requireContractText(t, "README.md", readme,
+			"24 hours",
+			"Retention",
+			"archive_html",
+			"audit=true",
+			"search_pages",
+			"Job lifecycle",
+			"Polling",
+			"authenticated",
+		)
+	})
+
+	t.Run("README includes a remote Streamable HTTP client example", func(t *testing.T) {
+		requireContractText(t, "README.md", readme,
+			`"mcpServers"`,
+			`"url"`,
+			`"Authorization"`,
+			"Mcp-Session-Id",
+		)
+	})
+
+	t.Run("DEPLOYMENT documents the results volume and proxy routing", func(t *testing.T) {
+		requireContractText(t, "DEPLOYMENT.md", deployment,
+			"/results",
+			"results volume",
+			"/mcp",
+			"oauth2-proxy",
+			"proxy_buffering off",
+			"proxy_set_header Authorization",
+			"Mcp-Session-Id",
+			"proxy_read_timeout",
+		)
+	})
+
+	t.Run("DEPLOYMENT documents restart behavior, retention, and the runbook", func(t *testing.T) {
+		requireContractText(t, "DEPLOYMENT.md", deployment,
+			"Restart",
+			"interrupted",
+			"24 hours",
+			"retention",
+			"Troubleshooting",
+			"runbook",
+		)
+	})
+
+	t.Run("compose.yml mounts results and passes MCP configuration", func(t *testing.T) {
+		requireContractText(t, "compose.yml", compose,
+			"./results:/results",
+			"GOFROG_MCP_ENABLED",
+			"GOFROG_MCP_PATH",
+			"GOFROG_MCP_JOB_TTL",
+			"GOFROG_MCP_RESULTS_DIR",
+			"GOFROG_MCP_PERSIST",
+			"GOFROG_MCP_MAX_PAGES",
+			"GOFROG_MCP_MAX_DEPTH",
+			"GOFROG_MCP_MAX_LIST_URLS",
+			"GOFROG_MCP_MAX_DURATION",
+			"GOFROG_MCP_MAX_JOBS",
+			"GOFROG_MCP_DEFAULT_ARCHIVE",
+			"GOFROG_MCP_ARTIFACT_BASE_URL",
+		)
+	})
+
+	t.Run(".env.example is a placeholder-only template", func(t *testing.T) {
+		requireContractText(t, ".env.example", envExample,
+			"GOFROG_MCP_ENABLED",
+			"GOFROG_MCP_PATH",
+			"GOFROG_MCP_JOB_TTL",
+			"GOFROG_MCP_RESULTS_DIR",
+			"GOFROG_MCP_PERSIST",
+			"GOFROG_MCP_MAX_PAGES",
+			"GOFROG_MCP_MAX_DEPTH",
+			"GOFROG_MCP_MAX_LIST_URLS",
+			"GOFROG_MCP_MAX_DURATION",
+			"GOFROG_MCP_MAX_JOBS",
+			"GOFROG_MCP_DEFAULT_ARCHIVE",
+			"GOFROG_MCP_ARTIFACT_BASE_URL",
+			"example.com",
+		)
+		rejectContractText(t, ".env.example", envExample,
+			"sustainable-growth-experts.com",
+			"GOFROG_MCP_TOKEN",
+		)
+
+		for lineNo, line := range strings.Split(envExample, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			match := secretAssignmentPattern.FindStringSubmatch(trimmed)
+			if match == nil {
+				continue
+			}
+			key, value := match[1], strings.TrimSpace(match[2])
+			// Limit counters can contain TOKEN in their name without holding a
+			// credential (for example GOFROG_MCP_MAX_JOBS_PER_TOKEN).
+			if strings.HasPrefix(key, "GOFROG_MCP_MAX_") {
+				continue
+			}
+			placeholder := value == "" ||
+				strings.HasPrefix(value, "<") ||
+				strings.Contains(strings.ToLower(value), "placeholder") ||
+				strings.Contains(strings.ToLower(value), "changeme") ||
+				strings.Contains(strings.ToLower(value), "example")
+			if !placeholder {
+				t.Errorf(".env.example:%d assigns a non-placeholder value to %s", lineNo+1, key)
+			}
+		}
+		for _, pattern := range secretValuePatterns {
+			if loc := pattern.FindStringIndex(envExample); loc != nil {
+				t.Errorf(".env.example contains a value that looks like a real secret near %q", envExample[loc[0]:loc[1]])
+			}
+		}
+	})
+
+	t.Run("docs do not advertise unsupported features", func(t *testing.T) {
+		for name, text := range map[string]string{
+			"README.md":     readme,
+			"DEPLOYMENT.md": deployment,
+		} {
+			rejectContractText(t, name, text,
+				"cancel_job",
+				"stdio",
+				"gofrog://",
+				"multiple tokens",
+				"horizontal scaling",
+			)
+		}
+	})
+}
