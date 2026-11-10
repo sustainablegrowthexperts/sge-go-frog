@@ -80,18 +80,18 @@ var auditBundleCache = struct {
 func validateGetArtifactInput(in getArtifactInput) (jobID, kind string, err error) {
 	jobID = strings.TrimSpace(in.JobID)
 	if jobID == "" {
-		return "", "", fmt.Errorf("invalid_argument: job_id is required")
+		return "", "", newToolError(codeInvalidArgument, "job_id is required", nil)
 	}
 	if looksLikeArtifactPath(jobID) {
-		return "", "", fmt.Errorf("invalid_argument: job_id must not be a path")
+		return "", "", newToolError(codeInvalidArgument, "job_id must not be a path", nil)
 	}
 
 	kind = strings.TrimSpace(in.Kind)
 	if kind == "" {
-		return "", "", fmt.Errorf("invalid_argument: kind is required")
+		return "", "", newToolError(codeInvalidArgument, "kind is required", nil)
 	}
 	if looksLikeArtifactPath(kind) || !slices.Contains(getArtifactKinds, kind) {
-		return "", "", fmt.Errorf("invalid_argument: kind must be one of %s", strings.Join(getArtifactKinds, ", "))
+		return "", "", newToolError(codeInvalidArgument, fmt.Sprintf("kind must be one of %s", strings.Join(getArtifactKinds, ", ")), nil)
 	}
 	return jobID, kind, nil
 }
@@ -118,9 +118,10 @@ func looksLikeArtifactPath(value string) bool {
 func (s *mcpServer) buildArtifact(job *crawlJob, kind string, inline bool) (getArtifactOutput, error) {
 	snapshot := job.artifactSnapshot()
 	if snapshot.status != jobStatusDone {
-		return getArtifactOutput{}, fmt.Errorf(
-			"job_not_finished: job %q is %s; artifacts are available only when the job is done",
-			job.id, snapshot.status,
+		return getArtifactOutput{}, newToolError(
+			codeJobNotFinished,
+			fmt.Sprintf("job %q is %s; artifacts are available only when the job is done", job.id, snapshot.status),
+			map[string]any{"job_id": job.id, "status": snapshot.status},
 		)
 	}
 
@@ -147,11 +148,20 @@ func (s *mcpServer) buildArtifact(job *crawlJob, kind string, inline bool) (getA
 		if err != nil {
 			return getArtifactOutput{}, artifactUnavailableError(kind, job.id)
 		}
-		out.Inline = true
-		out.Content = string(data)
+		// Inline content shares the tool response cap. Above it, fall back to
+		// download metadata rather than returning an oversized result.
+		budget := s.config.Limits.withDefaults().MaxResponseBytes
+		if budget <= 0 || int64(len(data))+getArtifactResponseOverhead <= budget {
+			out.Inline = true
+			out.Content = string(data)
+		}
 	}
 	return out, nil
 }
+
+// getArtifactResponseOverhead reserves envelope and metadata bytes when
+// applying the tool response cap to inline content.
+const getArtifactResponseOverhead = 2048
 
 // resolveArtifact maps a whitelisted kind to its job-owned file and metadata.
 // It never accepts a path from the caller.
@@ -163,7 +173,7 @@ func (s *mcpServer) resolveArtifact(jobID, kind string, snapshot artifactJobSnap
 		path := filepath.Join(s.jobOwnedDir(jobID), csvArtifactName)
 		if err := writeResultsCSVAtomic(path, snapshot.pages, snapshot.settings.KeywordsRaw); err != nil {
 			// Never echo the writer error: it may contain a temporary path.
-			return artifactDescriptor{}, fmt.Errorf("internal_error: could not generate CSV artifact for job %q", jobID)
+			return artifactDescriptor{}, newToolError(codeInternalError, fmt.Sprintf("could not generate CSV artifact for job %q", jobID), nil)
 		}
 		reportTime := snapshot.finishedAt
 		if reportTime.IsZero() {
@@ -217,7 +227,7 @@ func (s *mcpServer) resolveArtifact(jobID, kind string, snapshot artifactJobSnap
 		}, nil
 	}
 
-	return artifactDescriptor{}, fmt.Errorf("invalid_argument: kind must be one of %s", strings.Join(getArtifactKinds, ", "))
+	return artifactDescriptor{}, newToolError(codeInvalidArgument, fmt.Sprintf("kind must be one of %s", strings.Join(getArtifactKinds, ", ")), nil)
 }
 
 // auditProfileState maps a kind to its profile, directory, and readiness flag.
@@ -231,7 +241,7 @@ func auditProfileState(kind string, snapshot artifactJobSnapshot) (profile, dir 
 // auditNotAvailableError is the shared audit artifact error. It deliberately
 // omits the on-disk directory.
 func auditNotAvailableError(kind, jobID string) error {
-	return fmt.Errorf("audit_not_available: %s is not available for job %q", kind, jobID)
+	return newToolError(codeAuditNotAvailable, fmt.Sprintf("%s is not available for job %q", kind, jobID), nil)
 }
 
 // artifactUnavailableError describes a missing artifact without leaking a path.
@@ -239,7 +249,7 @@ func artifactUnavailableError(kind, jobID string) error {
 	if strings.HasPrefix(kind, "audit_") {
 		return auditNotAvailableError(kind, jobID)
 	}
-	return fmt.Errorf("internal_error: %s artifact is missing for job %q", kind, jobID)
+	return newToolError(codeInternalError, fmt.Sprintf("%s artifact is missing for job %q", kind, jobID), nil)
 }
 
 // artifactExpiry is the job's retention completion time in RFC 3339 UTC.

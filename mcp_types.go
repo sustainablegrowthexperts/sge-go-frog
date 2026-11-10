@@ -1,12 +1,109 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	auditpkg "go-frog/internal/audit"
 )
+
+// Stable MCP tool error codes. Clients switch on these values, so they are part
+// of the public contract and must not change.
+const (
+	codeInvalidArgument    = "invalid_argument"
+	codeUnauthorized       = "unauthorized"
+	codeForbidden          = "forbidden"
+	codeJobNotFound        = "job_not_found"
+	codeJobNotFinished     = "job_not_finished"
+	codeAuditNotAvailable  = "audit_not_available"
+	codeSearchNotAvailable = "search_not_available"
+	codeLimitExceeded      = "limit_exceeded"
+	codeConflict           = "conflict"
+	codeInternalError      = "internal_error"
+)
+
+// toolError is the stable domain/tool error envelope. The SDK adapter turns a
+// returned error into an MCP tool result with isError=true; domain failures are
+// never encoded as successful content.
+type toolError struct {
+	Code      string         `json:"code"`
+	Message   string         `json:"message"`
+	Retryable bool           `json:"retryable"`
+	Details   map[string]any `json:"details"`
+}
+
+// Error renders the envelope as a single stable line. The code and retryable
+// markers stay easy to scan in text-only clients, while details carries the
+// machine-readable fields.
+func (e *toolError) Error() string {
+	details := e.Details
+	if details == nil {
+		details = map[string]any{}
+	}
+	encoded, err := json.Marshal(details)
+	if err != nil {
+		encoded = []byte("{}")
+	}
+	return fmt.Sprintf("%s: %s; retryable=%t; details=%s", e.Code, e.Message, e.Retryable, encoded)
+}
+
+// newToolError builds one error envelope and applies the retryable policy:
+//   - limit_exceeded is retryable after retry_after_ms.
+//   - job_not_finished is retryable because polling again is the expected
+//     client behavior.
+//   - internal_error is not retryable by default: repeating the same request
+//     after an unexpected failure is unlikely to help. Callers use
+//     newRetryableToolError only for a specific transient failure.
+//   - validation, ownership, not-found, not-available, and conflict errors are
+//     never retryable.
+func newToolError(code, message string, details map[string]any) *toolError {
+	return &toolError{
+		Code:      code,
+		Message:   sanitizeDiagnosticText(message),
+		Retryable: toolErrorRetryable(code),
+		Details:   details,
+	}
+}
+
+// newRetryableToolError overrides the default policy for a specific failure
+// that is known to be transient.
+func newRetryableToolError(code, message string, details map[string]any) *toolError {
+	err := newToolError(code, message, details)
+	err.Retryable = true
+	return err
+}
+
+// toolErrorRetryable is the default retryable mapping for each code.
+func toolErrorRetryable(code string) bool {
+	switch code {
+	case codeLimitExceeded, codeJobNotFinished:
+		return true
+	default:
+		return false
+	}
+}
+
+// diagnosticSecretPattern redacts the credential shapes that could otherwise
+// reach an error or a log line.
+var diagnosticSecretPattern = regexp.MustCompile(`(?i)(authorization|bearer|cookie|token)(\s*[:=]\s*)[^\s,;]+`)
+
+// sanitizeDiagnosticText collapses whitespace, redacts credential-looking
+// values, and caps the length of diagnostic text. Known filesystem directories
+// are replaced by the caller when available.
+func sanitizeDiagnosticText(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	text = diagnosticSecretPattern.ReplaceAllString(text, "$1$2[redacted]")
+	const maxDiagnosticText = 300
+	if utf8.RuneCountInString(text) > maxDiagnosticText {
+		runes := []rune(text)
+		text = string(runes[:maxDiagnosticText]) + "..."
+	}
+	return text
+}
 
 // Job owners. The web UI and the MCP tools share one job manager, but MCP
 // reads only MCP-created jobs so browser and agent work stay separate.
@@ -99,7 +196,11 @@ type idempotencyConflictError struct {
 }
 
 func (e *idempotencyConflictError) Error() string {
-	return fmt.Sprintf("conflict: client_request_id was already used with different input by job %s; retryable=false", e.ExistingJobID)
+	return newToolError(
+		codeConflict,
+		fmt.Sprintf("client_request_id was already used with different input by job %s", e.ExistingJobID),
+		e.Details(),
+	).Error()
 }
 
 // Retryable reports whether a client may repeat the same call unchanged.

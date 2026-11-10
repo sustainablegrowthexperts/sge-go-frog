@@ -143,20 +143,20 @@ func (l MCPLimits) resolveJobLimits(in *startCrawlLimits) (jobLimits, error) {
 	}
 	if in.MaxPages != nil {
 		if *in.MaxPages < 1 || *in.MaxPages > l.MaxPages {
-			return jobLimits{}, fmt.Errorf("invalid_argument: max_pages must be between 1 and %d", l.MaxPages)
+			return jobLimits{}, newToolError(codeInvalidArgument, fmt.Sprintf("max_pages must be between 1 and %d", l.MaxPages), nil)
 		}
 		out.MaxPages = *in.MaxPages
 	}
 	if in.MaxDepth != nil {
 		if *in.MaxDepth < 0 || *in.MaxDepth > l.MaxDepth {
-			return jobLimits{}, fmt.Errorf("invalid_argument: max_depth must be between 0 and %d", l.MaxDepth)
+			return jobLimits{}, newToolError(codeInvalidArgument, fmt.Sprintf("max_depth must be between 0 and %d", l.MaxDepth), nil)
 		}
 		out.MaxDepth = *in.MaxDepth
 	}
 	if in.MaxDurationSeconds != nil {
 		maxSeconds := int(l.MaxDuration / time.Second)
 		if *in.MaxDurationSeconds < 1 || *in.MaxDurationSeconds > maxSeconds {
-			return jobLimits{}, fmt.Errorf("invalid_argument: max_duration_seconds must be between 1 and %d", maxSeconds)
+			return jobLimits{}, newToolError(codeInvalidArgument, fmt.Sprintf("max_duration_seconds must be between 1 and %d", maxSeconds), nil)
 		}
 		out.MaxDuration = time.Duration(*in.MaxDurationSeconds) * time.Second
 	}
@@ -170,7 +170,7 @@ func (l MCPLimits) resolveConcurrency(in int) (int, error) {
 		concurrency = defaultConcurrency
 	}
 	if concurrency < 1 || concurrency > l.MaxConcurrency {
-		return 0, fmt.Errorf("invalid_argument: concurrency must be between 1 and %d", l.MaxConcurrency)
+		return 0, newToolError(codeInvalidArgument, fmt.Sprintf("concurrency must be between 1 and %d", l.MaxConcurrency), nil)
 	}
 	return concurrency, nil
 }
@@ -179,18 +179,18 @@ func (l MCPLimits) resolveConcurrency(in int) (int, error) {
 func validateStartURL(raw string, limits MCPLimits) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", fmt.Errorf("invalid_argument: start_url is required for spider mode")
+		return "", newToolError(codeInvalidArgument, "start_url is required for spider mode", nil)
 	}
 	start, err := normalizeHTTPURL(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid_argument: start_url is invalid: %v", err)
+		return "", newToolError(codeInvalidArgument, fmt.Sprintf("start_url is invalid: %v", err), nil)
 	}
 	parsed, err := url.Parse(start)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return "", fmt.Errorf("invalid_argument: start_url must be an http or https URL")
+		return "", newToolError(codeInvalidArgument, "start_url must be an http or https URL", nil)
 	}
 	if len(start) > limits.MaxURLLength {
-		return "", fmt.Errorf("invalid_argument: start_url exceeds the maximum URL length of %d", limits.MaxURLLength)
+		return "", newToolError(codeInvalidArgument, fmt.Sprintf("start_url exceeds the maximum URL length of %d", limits.MaxURLLength), nil)
 	}
 	return start, nil
 }
@@ -198,21 +198,21 @@ func validateStartURL(raw string, limits MCPLimits) (string, error) {
 // validateListURLs normalizes, deduplicates, and caps a list-mode URL set.
 func validateListURLs(raw []string, limits MCPLimits) ([]string, error) {
 	if len(raw) == 0 {
-		return nil, fmt.Errorf("invalid_argument: urls is required for list mode")
+		return nil, newToolError(codeInvalidArgument, "urls is required for list mode", nil)
 	}
 	out := make([]string, 0, len(raw))
 	seen := make(map[string]struct{}, len(raw))
 	for i, entry := range raw {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
-			return nil, fmt.Errorf("invalid_argument: urls[%d] must not be empty", i+1)
+			return nil, newToolError(codeInvalidArgument, fmt.Sprintf("urls[%d] must not be empty", i+1), nil)
 		}
 		normalized, ok := parseHTTPLike(entry)
 		if !ok {
-			return nil, fmt.Errorf("invalid_argument: urls[%d] must be an http or https URL", i+1)
+			return nil, newToolError(codeInvalidArgument, fmt.Sprintf("urls[%d] must be an http or https URL", i+1), nil)
 		}
 		if len(normalized) > limits.MaxURLLength {
-			return nil, fmt.Errorf("invalid_argument: urls[%d] exceeds the maximum URL length of %d", i+1, limits.MaxURLLength)
+			return nil, newToolError(codeInvalidArgument, fmt.Sprintf("urls[%d] exceeds the maximum URL length of %d", i+1, limits.MaxURLLength), nil)
 		}
 		if _, dup := seen[normalized]; dup {
 			continue
@@ -221,7 +221,7 @@ func validateListURLs(raw []string, limits MCPLimits) ([]string, error) {
 		out = append(out, normalized)
 	}
 	if len(out) > limits.MaxListURLs {
-		return nil, fmt.Errorf("invalid_argument: urls contains %d unique URLs, maximum is %d", len(out), limits.MaxListURLs)
+		return nil, newToolError(codeInvalidArgument, fmt.Sprintf("urls contains %d unique URLs, maximum is %d", len(out), limits.MaxListURLs), nil)
 	}
 	return out, nil
 }
@@ -230,19 +230,19 @@ func validateListURLs(raw []string, limits MCPLimits) ([]string, error) {
 // caps. A pipe is rejected because KeywordsRaw joins entries with it.
 func validateKeywords(raw []string, limits MCPLimits) ([]string, error) {
 	if len(raw) > limits.MaxKeywords {
-		return nil, fmt.Errorf("invalid_argument: keywords must contain at most %d entries", limits.MaxKeywords)
+		return nil, newToolError(codeInvalidArgument, fmt.Sprintf("keywords must contain at most %d entries", limits.MaxKeywords), nil)
 	}
 	out := make([]string, len(raw))
 	for i, keyword := range raw {
 		keyword = strings.TrimSpace(keyword)
 		if keyword == "" {
-			return nil, fmt.Errorf("invalid_argument: keywords[%d] must not be empty", i+1)
+			return nil, newToolError(codeInvalidArgument, fmt.Sprintf("keywords[%d] must not be empty", i+1), nil)
 		}
 		if utf8.RuneCountInString(keyword) > limits.MaxKeywordLength {
-			return nil, fmt.Errorf("invalid_argument: keywords[%d] must be at most %d characters", i+1, limits.MaxKeywordLength)
+			return nil, newToolError(codeInvalidArgument, fmt.Sprintf("keywords[%d] must be at most %d characters", i+1, limits.MaxKeywordLength), nil)
 		}
 		if strings.Contains(keyword, "|") {
-			return nil, fmt.Errorf("invalid_argument: keywords[%d] must not contain a pipe character", i+1)
+			return nil, newToolError(codeInvalidArgument, fmt.Sprintf("keywords[%d] must not contain a pipe character", i+1), nil)
 		}
 		out[i] = keyword
 	}
@@ -274,11 +274,7 @@ type limitExceededError struct {
 }
 
 func (e *limitExceededError) Error() string {
-	return fmt.Sprintf(
-		"limit_exceeded: %s limit reached; retryable=true; retry_after_ms=%d",
-		e.Limit,
-		e.retryAfterMS(),
-	)
+	return newToolError(codeLimitExceeded, fmt.Sprintf("%s limit reached", e.Limit), e.Details()).Error()
 }
 
 // Retryable reports that a client may repeat the request after RetryAfter.

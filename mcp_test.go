@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -4624,6 +4625,404 @@ func TestGetArtifact(t *testing.T) {
 		})
 		if content := auditString(t, jsonOut, "content"); !strings.Contains(content, "changed.example.com") {
 			t.Fatalf("audit JSON content was not refreshed: %s", content)
+		}
+	})
+}
+
+// TestToolErrorContract covers the shared error and ownership contract:
+//   - every domain error returns isError=true with the stable
+//     {code, message, retryable, details} envelope;
+//   - validation, ownership, not-found, not-available, and conflict errors are
+//     not retryable, while a not-finished job is;
+//   - UI-owned jobs are indistinguishable from unknown IDs;
+//   - oversized request bodies are rejected before tool execution;
+//   - no error leaks filesystem paths, tokens, cookies, or page bodies.
+func TestToolErrorContract(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+	doneNoAudit := createDoneResultsJob(t, app, "", []Page{{URL: "https://example.com/", StatusCode: 200}})
+
+	uiJob := app.jobs.createWithOwner(ownerUI, "spider", "https://ui.example.com", WizardSettings{
+		Mode:     1,
+		StartURL: "https://ui.example.com",
+		Audit:    true,
+	})
+	uiAuditDir := t.TempDir()
+	uiJob.mu.Lock()
+	uiJob.status = jobStatusDone
+	uiJob.phase = jobPhaseDone
+	uiJob.finishedAt = time.Now().UTC()
+	uiJob.result = []Page{{URL: "https://ui.example.com/private", StatusCode: 200}}
+	uiJob.pages = 1
+	uiJob.auditReady = true
+	uiJob.auditDir = uiAuditDir
+	uiJob.mu.Unlock()
+
+	running := app.jobs.createWithOwner(ownerMCP, "spider", "https://example.com", WizardSettings{
+		Mode:     1,
+		StartURL: "https://example.com",
+	})
+	running.mu.Lock()
+	running.status = jobStatusRunning
+	running.phase = jobPhaseCrawling
+	running.result = []Page{{URL: "https://example.com/partial", StatusCode: 200}}
+	running.mu.Unlock()
+
+	cases := []struct {
+		name      string
+		tool      string
+		args      map[string]any
+		code      string
+		retryable bool
+	}{
+		{"validation error", "get_job", map[string]any{}, "invalid_argument", false},
+		{"unknown job", "get_job", map[string]any{"job_id": "00000000000000000000000000000000"}, "job_not_found", false},
+		{"UI job", "get_job", map[string]any{"job_id": uiJob.id}, "job_not_found", false},
+		{"running results", "get_results", map[string]any{"job_id": running.id}, "job_not_finished", true},
+		{"audit disabled", "get_audit", map[string]any{"job_id": doneNoAudit.id}, "audit_not_available", false},
+		{"search without archive", "search_pages", map[string]any{"job_id": doneNoAudit.id, "pattern": "example", "scope": []string{"html"}}, "search_not_available", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := callTool(t, ctx, session, tc.tool, tc.args)
+			if !res.IsError {
+				t.Fatalf("%s accepted the request and did not return isError=true: %v", tc.tool, res.StructuredContent)
+			}
+			text := toolResultText(res)
+			lower := strings.ToLower(text)
+			if !strings.Contains(lower, tc.code) {
+				t.Fatalf("error = %q, want code %q", text, tc.code)
+			}
+			wantRetryable := fmt.Sprintf("retryable=%t", tc.retryable)
+			if !strings.Contains(lower, wantRetryable) {
+				t.Fatalf("error = %q, want %q", text, wantRetryable)
+			}
+			if !strings.Contains(lower, "details=") {
+				t.Fatalf("error = %q, want a details payload", text)
+			}
+			for _, leak := range []string{uiAuditDir, "authorization:", "bearer ", "cookie:"} {
+				if leak != "" && strings.Contains(lower, strings.ToLower(leak)) {
+					t.Fatalf("error leaked %q: %q", leak, text)
+				}
+			}
+		})
+	}
+
+	t.Run("UI jobs are indistinguishable from unknown jobs", func(t *testing.T) {
+		uiRes := callTool(t, ctx, session, "get_job", map[string]any{"job_id": uiJob.id})
+		unknownRes := callTool(t, ctx, session, "get_job", map[string]any{"job_id": "00000000000000000000000000000000"})
+		uiText, unknownText := toolResultText(uiRes), toolResultText(unknownRes)
+		if !uiRes.IsError || !unknownRes.IsError {
+			t.Fatal("both UI-owned and unknown job IDs must fail")
+		}
+		if strings.Contains(strings.ToLower(uiText), "ui") {
+			t.Fatalf("UI job error discloses ownership: %q", uiText)
+		}
+		uiPrefix := "job_not_found: job "
+		if !strings.HasPrefix(uiText, uiPrefix) || !strings.HasPrefix(unknownText, uiPrefix) {
+			t.Fatalf("UI and unknown errors differ: %q vs %q", uiText, unknownText)
+		}
+		if strings.Count(uiText, "job_not_found") != strings.Count(unknownText, "job_not_found") {
+			t.Fatalf("UI and unknown errors differ in shape: %q vs %q", uiText, unknownText)
+		}
+	})
+
+	t.Run("conflict errors are stable and not retryable", func(t *testing.T) {
+		conflictApp, conflictSession := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+
+		callToolObject(t, ctx, conflictSession, "start_crawl", map[string]any{
+			"mode":              "spider",
+			"start_url":         "https://example.com",
+			"client_request_id": "error-contract-key",
+		})
+		res := callTool(t, ctx, conflictSession, "start_crawl", map[string]any{
+			"mode":              "spider",
+			"start_url":         "https://example.org",
+			"client_request_id": "error-contract-key",
+		})
+		if !res.IsError {
+			t.Fatal("conflicting client_request_id did not fail")
+		}
+		text := toolResultText(res)
+		for _, want := range []string{"conflict", "retryable=false", "details="} {
+			if !strings.Contains(strings.ToLower(text), want) {
+				t.Fatalf("conflict error = %q, want %q", text, want)
+			}
+		}
+		_ = conflictApp
+	})
+
+	t.Run("rate limit errors are retryable", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.RateLimitPerMinute = 1
+		_, limitedSession := newMCPTestSession(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+		// The first call consumes the bucket; the second must be rejected.
+		callTool(t, ctx, limitedSession, "get_job", map[string]any{})
+		res := callTool(t, ctx, limitedSession, "get_job", map[string]any{"job_id": "missing"})
+		if !res.IsError {
+			t.Fatal("rate-limited call succeeded")
+		}
+		text := toolResultText(res)
+		for _, want := range []string{"limit_exceeded", "retryable=true", "retry_after_ms", "details="} {
+			if !strings.Contains(strings.ToLower(text), want) {
+				t.Fatalf("limit error = %q, want %q", text, want)
+			}
+		}
+	})
+
+	t.Run("oversized request bodies are rejected before tool execution", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Enabled = true
+		cfg.Limits.MaxRequestBytes = 256
+
+		capApp, err := newApp(appConfig{MCP: cfg, Runner: newImmediateFakeRunner(nil, nil), SSRF: testSSRFPolicy()})
+		if err != nil {
+			t.Fatalf("newApp: %v", err)
+		}
+		t.Cleanup(func() { _ = capApp.Close(context.Background()) })
+
+		ts := httptest.NewServer(capApp.Handler())
+		t.Cleanup(ts.Close)
+
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "tools/list",
+			"params":  map[string]any{"cursor": strings.Repeat("x", 1024)},
+		})
+		if err != nil {
+			t.Fatalf("marshal oversized request: %v", err)
+		}
+		resp, err := http.Post(ts.URL+cfg.Path, "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST oversized request: %v", err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want %d (body %q)", resp.StatusCode, http.StatusRequestEntityTooLarge, data)
+		}
+		lower := strings.ToLower(string(data))
+		if !strings.Contains(lower, "request") {
+			t.Fatalf("rejection body = %q, want a request-size message", data)
+		}
+	})
+}
+
+// toolErrorEnvelope is the decoded stable error contract used by tests. The
+// wire format is still one text line, but these are the fields every client can
+// rely on.
+type toolErrorEnvelope struct {
+	Code      string
+	Message   string
+	Retryable bool
+	Details   map[string]any
+}
+
+var toolErrorEnvelopePattern = regexp.MustCompile(`^([a-z_]+): (.*); retryable=(true|false); details=(\{.*\})$`)
+
+// parseToolErrorEnvelope decodes the shared error envelope from tool text.
+func parseToolErrorEnvelope(t *testing.T, text string) toolErrorEnvelope {
+	t.Helper()
+	match := toolErrorEnvelopePattern.FindStringSubmatch(text)
+	if match == nil {
+		t.Fatalf("error %q does not match the {code, message, retryable, details} envelope", text)
+	}
+	details := make(map[string]any)
+	if err := json.Unmarshal([]byte(match[4]), &details); err != nil {
+		t.Fatalf("error details %q are not JSON: %v", match[4], err)
+	}
+	return toolErrorEnvelope{
+		Code:      match[1],
+		Message:   match[2],
+		Retryable: match[3] == "true",
+		Details:   details,
+	}
+}
+
+// TestToolErrorContractCodes covers the code mapping and the uniform envelope
+// across all seven tools, including panic recovery.
+func TestToolErrorContractCodes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Run("all ten codes map to the expected retryability", func(t *testing.T) {
+		cases := []struct {
+			code      string
+			retryable bool
+		}{
+			{"invalid_argument", false},
+			{"unauthorized", false},
+			{"forbidden", false},
+			{"job_not_found", false},
+			{"job_not_finished", true},
+			{"audit_not_available", false},
+			{"search_not_available", false},
+			{"limit_exceeded", true},
+			{"conflict", false},
+			{"internal_error", false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.code, func(t *testing.T) {
+				err := newToolError(tc.code, "stable message", map[string]any{"field": "value"})
+				envelope := parseToolErrorEnvelope(t, err.Error())
+				if envelope.Code != tc.code {
+					t.Fatalf("code = %q, want %q", envelope.Code, tc.code)
+				}
+				if envelope.Message != "stable message" {
+					t.Fatalf("message = %q, want the stable message", envelope.Message)
+				}
+				if envelope.Retryable != tc.retryable {
+					t.Fatalf("retryable = %t, want %t", envelope.Retryable, tc.retryable)
+				}
+				if envelope.Details["field"] != "value" {
+					t.Fatalf("details = %v, want the supplied field", envelope.Details)
+				}
+			})
+		}
+	})
+
+	t.Run("every tool returns the same envelope shape", func(t *testing.T) {
+		app, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+		_ = app
+
+		cases := []struct {
+			tool string
+			args map[string]any
+		}{
+			{"start_crawl", map[string]any{"mode": "bogus"}},
+			{"get_job", map[string]any{}},
+			{"list_jobs", map[string]any{"status": "bogus"}},
+			{"get_results", map[string]any{}},
+			{"search_pages", map[string]any{}},
+			{"get_audit", map[string]any{}},
+			{"get_artifact", map[string]any{}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.tool, func(t *testing.T) {
+				res := callTool(t, ctx, session, tc.tool, tc.args)
+				if !res.IsError {
+					t.Fatalf("%s did not return isError=true", tc.tool)
+				}
+				envelope := parseToolErrorEnvelope(t, toolResultText(res))
+				if envelope.Code == "" || envelope.Message == "" {
+					t.Fatalf("%s envelope = %+v, want code and message", tc.tool, envelope)
+				}
+				if envelope.Details == nil {
+					t.Fatalf("%s details = nil, want an object", tc.tool)
+				}
+				if envelope.Code != "invalid_argument" {
+					t.Fatalf("%s code = %q, want invalid_argument", tc.tool, envelope.Code)
+				}
+				if envelope.Retryable {
+					t.Fatalf("%s retryable = true, want false for a validation error", tc.tool)
+				}
+			})
+		}
+	})
+
+	t.Run("paginated audit responses stop at the response cap", func(t *testing.T) {
+		cfg := defaultMCPConfig()
+		cfg.Limits.MaxResponseBytes = 1400
+		capApp, capSession := newMCPTestSession(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+		dir := t.TempDir()
+		pages := make(map[string]*auditpkg.Page, 40)
+		for i := 0; i < 40; i++ {
+			key := fmt.Sprintf("https://example.com/page-%02d", i)
+			pages[key] = &auditpkg.Page{
+				URL:        key,
+				Title:      strings.Repeat("title", 20),
+				StatusCode: 200,
+			}
+		}
+		writeAuditResultFixture(t, dir, auditpkg.Result{
+			Version:     auditpkg.AuditVersion,
+			StartURL:    "https://example.com/",
+			GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+			Pages:       pages,
+		})
+
+		job := createDoneResultsJob(t, capApp, "", nil)
+		job.mu.Lock()
+		job.settings.Audit = true
+		job.auditReady = true
+		job.auditDir = dir
+		job.mu.Unlock()
+
+		out := callToolObject(t, ctx, capSession, "get_audit", map[string]any{
+			"job_id":  job.id,
+			"section": "pages",
+			"limit":   40,
+		})
+		rows := auditObjectList(t, out, "pages")
+		if len(rows) == 0 || len(rows) >= 40 {
+			t.Fatalf("audit rows = %d, want a non-empty page below the requested limit", len(rows))
+		}
+		if out["truncated"] != true {
+			t.Fatalf("truncated = %v, want true", out["truncated"])
+		}
+		if out["has_more"] != true {
+			t.Fatalf("has_more = %v, want true", out["has_more"])
+		}
+		assertNumber(t, "next_offset", out["next_offset"], float64(len(rows)))
+	})
+
+	t.Run("SDK schema validation is normalized to a field-named invalid_argument", func(t *testing.T) {
+		_, session := newMCPTestSession(t, ctx, defaultMCPConfig(), newImmediateFakeRunner(nil, nil))
+		cases := []struct {
+			name      string
+			args      map[string]any
+			wantField string
+		}{
+			{"unknown field", map[string]any{"job_id": "missing", "surprise": true}, "surprise"},
+			{"malformed type", map[string]any{"job_id": 123}, "job_id"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "get_job", tc.args)
+				if !res.IsError {
+					t.Fatalf("get_job accepted %s", tc.name)
+				}
+				envelope := parseToolErrorEnvelope(t, toolResultText(res))
+				if envelope.Code != "invalid_argument" {
+					t.Fatalf("code = %q, want invalid_argument", envelope.Code)
+				}
+				if envelope.Details["field"] != tc.wantField {
+					t.Fatalf("details.field = %v, want %q", envelope.Details["field"], tc.wantField)
+				}
+			})
+		}
+	})
+
+	t.Run("panics become a generic internal_error", func(t *testing.T) {
+		const secretPath = "/tmp/secret-audit-dir"
+		server := &mcpServer{config: MCPConfig{ResultsDir: secretPath}}
+		handler := wrapMCPTool(server, "panic_tool", func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+			panic("boom at " + secretPath + " with token=abc123")
+		})
+
+		_, _, err := handler(context.Background(), nil, struct{}{})
+		if err == nil {
+			t.Fatal("panicking handler returned no error")
+		}
+		envelope := parseToolErrorEnvelope(t, err.Error())
+		if envelope.Code != "internal_error" {
+			t.Fatalf("code = %q, want internal_error", envelope.Code)
+		}
+		if envelope.Retryable {
+			t.Fatalf("retryable = true, want false for an unexpected panic")
+		}
+		text := err.Error()
+		for _, leak := range []string{"boom", secretPath, "abc123", "goroutine", "stack"} {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(leak)) {
+				t.Fatalf("panic error leaked %q: %q", leak, text)
+			}
 		}
 	})
 }

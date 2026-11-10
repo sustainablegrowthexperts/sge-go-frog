@@ -150,10 +150,10 @@ func validateAuditSectionArgs(section, sortField string, filter map[string]any) 
 	allowedSorts, sortable := auditSectionSortFields[section]
 	if sortField != "" {
 		if !sortable {
-			return "", fmt.Errorf("invalid_argument: sort is not supported for section %s", section)
+			return "", newToolError(codeInvalidArgument, fmt.Sprintf("sort is not supported for section %s", section), nil)
 		}
 		if !slices.Contains(allowedSorts, sortField) {
-			return "", fmt.Errorf("invalid_argument: sort must be one of %s for section %s", strings.Join(allowedSorts, ", "), section)
+			return "", newToolError(codeInvalidArgument, fmt.Sprintf("sort must be one of %s for section %s", strings.Join(allowedSorts, ", "), section), nil)
 		}
 	} else {
 		sortField = auditSectionDefaultSort[section]
@@ -164,11 +164,11 @@ func validateAuditSectionArgs(section, sortField string, filter map[string]any) 
 	}
 	allowedFilters, filterable := auditSectionFilterFields[section]
 	if !filterable {
-		return "", fmt.Errorf("invalid_argument: filter is not supported for section %s", section)
+		return "", newToolError(codeInvalidArgument, fmt.Sprintf("filter is not supported for section %s", section), nil)
 	}
 	for key := range filter {
 		if !slices.Contains(allowedFilters, key) {
-			return "", fmt.Errorf("invalid_argument: filter.%s is not valid for section %s", key, section)
+			return "", newToolError(codeInvalidArgument, fmt.Sprintf("filter.%s is not valid for section %s", key, section), nil)
 		}
 	}
 	return sortField, nil
@@ -257,7 +257,7 @@ func filterAuditBool(filter map[string]any, key string) (bool, bool, error) {
 	}
 	b, ok := value.(bool)
 	if !ok {
-		return false, true, fmt.Errorf("invalid_argument: filter.%s must be a boolean", key)
+		return false, true, newToolError(codeInvalidArgument, fmt.Sprintf("filter.%s must be a boolean", key), nil)
 	}
 	return b, true, nil
 }
@@ -269,7 +269,7 @@ func filterAuditInt(filter map[string]any, key string) (int, bool, error) {
 	}
 	n, ok := statusCodeValue(value)
 	if !ok {
-		return 0, true, fmt.Errorf("invalid_argument: filter.%s must be an integer", key)
+		return 0, true, newToolError(codeInvalidArgument, fmt.Sprintf("filter.%s must be an integer", key), nil)
 	}
 	return n, true, nil
 }
@@ -293,11 +293,11 @@ func filterAuditFloat(filter map[string]any, key string) (float64, bool, error) 
 	case json.Number:
 		f, err := v.Float64()
 		if err != nil {
-			return 0, true, fmt.Errorf("invalid_argument: filter.%s must be a number", key)
+			return 0, true, newToolError(codeInvalidArgument, fmt.Sprintf("filter.%s must be a number", key), nil)
 		}
 		return f, true, nil
 	default:
-		return 0, true, fmt.Errorf("invalid_argument: filter.%s must be a number", key)
+		return 0, true, newToolError(codeInvalidArgument, fmt.Sprintf("filter.%s must be a number", key), nil)
 	}
 }
 
@@ -308,7 +308,7 @@ func filterAuditString(filter map[string]any, key string) (string, bool, error) 
 	}
 	s, ok := value.(string)
 	if !ok {
-		return "", true, fmt.Errorf("invalid_argument: filter.%s must be a string", key)
+		return "", true, newToolError(codeInvalidArgument, fmt.Sprintf("filter.%s must be a string", key), nil)
 	}
 	return strings.TrimSpace(s), true, nil
 }
@@ -741,7 +741,7 @@ func populateAuditSection(out *getAuditOutput, result *auditpkg.Result, sortFiel
 		out.Sections = &sections
 		applyAuditCountEnvelope(out, len(sections))
 	default:
-		return fmt.Errorf("invalid_argument: section must be one of %s", strings.Join(getAuditSections, ", "))
+		return newToolError(codeInvalidArgument, fmt.Sprintf("section must be one of %s", strings.Join(getAuditSections, ", ")), nil)
 	}
 	return nil
 }
@@ -760,7 +760,7 @@ func sanitizeAuditError(text string, dirs ...string) string {
 		}
 		text = strings.ReplaceAll(text, dir, "<audit>")
 	}
-	return strings.Join(strings.Fields(text), " ")
+	return sanitizeDiagnosticText(text)
 }
 
 // getResultsAuditFromPage maps the strict audit row into the compact get_results

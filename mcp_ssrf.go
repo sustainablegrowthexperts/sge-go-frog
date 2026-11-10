@@ -341,5 +341,5 @@ func (settings WizardSettings) ssrfGuard() *ssrfPolicy {
 // blockedTargetError formats a non-leaky invalid_argument error for a blocked
 // MCP crawl target.
 func blockedTargetError(field string) error {
-	return fmt.Errorf("invalid_argument: %s is not a public http or https URL", field)
+	return newToolError(codeInvalidArgument, fmt.Sprintf("%s is not a public http or https URL", field), nil)
 }

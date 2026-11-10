@@ -33,7 +33,7 @@ type searchPattern struct {
 // with Go's linear-time RE2 engine.
 func compileSearchPattern(raw string, isRegex, caseSensitive bool) (*searchPattern, error) {
 	if utf8.RuneCountInString(raw) > maxSearchPatternLength {
-		return nil, fmt.Errorf("invalid_argument: pattern must be at most %d characters", maxSearchPatternLength)
+		return nil, newToolError(codeInvalidArgument, fmt.Sprintf("pattern must be at most %d characters", maxSearchPatternLength), nil)
 	}
 	if isRegex {
 		expr := raw
@@ -44,7 +44,7 @@ func compileSearchPattern(raw string, isRegex, caseSensitive bool) (*searchPatte
 		if err != nil {
 			// The regexp error can echo the pattern; the client already knows
 			// it, but keep the tool error stable and free of parser details.
-			return nil, fmt.Errorf("invalid_argument: pattern is not a valid RE2 regular expression")
+			return nil, newToolError(codeInvalidArgument, "pattern is not a valid RE2 regular expression", nil)
 		}
 		return &searchPattern{caseSensitive: caseSensitive, re: re}, nil
 	}
@@ -198,7 +198,7 @@ func normalizeSearchScopes(raw []string) ([]string, error) {
 	for _, entry := range raw {
 		entry = strings.TrimSpace(entry)
 		if !slices.Contains(searchScopes, entry) {
-			return nil, fmt.Errorf("invalid_argument: scope must be one of %s", strings.Join(searchScopes, ", "))
+			return nil, newToolError(codeInvalidArgument, fmt.Sprintf("scope must be one of %s", strings.Join(searchScopes, ", ")), nil)
 		}
 		if !slices.Contains(out, entry) {
 			out = append(out, entry)
@@ -445,7 +445,7 @@ func sortSearchMatches(matches []searchMatch) {
 // searchUnavailableError keeps the no-archive contract helpful without
 // exposing any job-owned path.
 func searchUnavailableError(jobID string) error {
-	return fmt.Errorf("search_not_available: job %q has no crawl archive; start the crawl with audit=true or archive_html=true to search html, text, or all scopes", jobID)
+	return newToolError(codeSearchNotAvailable, fmt.Sprintf("job %q has no crawl archive; start the crawl with audit=true or archive_html=true to search html, text, or all scopes", jobID), nil)
 }
 
 // searchPages searches metadata, archived HTML, or visible text for a literal
@@ -455,19 +455,14 @@ func (s *mcpServer) searchPages(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, searchPagesOutput{}, err
 	}
 
-	jobID := strings.TrimSpace(in.JobID)
-	if jobID == "" {
-		return nil, searchPagesOutput{}, fmt.Errorf("invalid_argument: job_id is required")
-	}
-
-	job := s.jobs.get(jobID)
-	if job == nil || !job.ownedBy(ownerMCP) {
-		return nil, searchPagesOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	job, jobID, err := s.lookupMCPJob(in.JobID)
+	if err != nil {
+		return nil, searchPagesOutput{}, err
 	}
 
 	patternText := strings.TrimSpace(in.Pattern)
 	if patternText == "" {
-		return nil, searchPagesOutput{}, fmt.Errorf("invalid_argument: pattern is required")
+		return nil, searchPagesOutput{}, newToolError(codeInvalidArgument, "pattern is required", nil)
 	}
 	pattern, err := compileSearchPattern(patternText, in.Regex, in.CaseSensitive)
 	if err != nil {
@@ -480,14 +475,14 @@ func (s *mcpServer) searchPages(ctx context.Context, _ *mcp.CallToolRequest, in 
 	}
 
 	if in.Offset < 0 {
-		return nil, searchPagesOutput{}, fmt.Errorf("invalid_argument: offset must be non-negative")
+		return nil, searchPagesOutput{}, newToolError(codeInvalidArgument, "offset must be non-negative", nil)
 	}
 	limit := in.Limit
 	switch {
 	case limit == 0:
 		limit = defaultSearchLimit
 	case limit < 0:
-		return nil, searchPagesOutput{}, fmt.Errorf("invalid_argument: limit must be non-negative")
+		return nil, searchPagesOutput{}, newToolError(codeInvalidArgument, "limit must be non-negative", nil)
 	case limit > maxSearchLimit:
 		limit = maxSearchLimit
 	}
@@ -497,9 +492,9 @@ func (s *mcpServer) searchPages(ctx context.Context, _ *mcp.CallToolRequest, in 
 	case contextChars == 0:
 		contextChars = defaultSearchContextChars
 	case contextChars < 0:
-		return nil, searchPagesOutput{}, fmt.Errorf("invalid_argument: context_chars must be non-negative")
+		return nil, searchPagesOutput{}, newToolError(codeInvalidArgument, "context_chars must be non-negative", nil)
 	case contextChars > maxSearchContextChars:
-		return nil, searchPagesOutput{}, fmt.Errorf("invalid_argument: context_chars must be at most %d", maxSearchContextChars)
+		return nil, searchPagesOutput{}, newToolError(codeInvalidArgument, fmt.Sprintf("context_chars must be at most %d", maxSearchContextChars), nil)
 	}
 
 	maxMatches := in.MaxMatchesPerPage
@@ -507,14 +502,14 @@ func (s *mcpServer) searchPages(ctx context.Context, _ *mcp.CallToolRequest, in 
 	case maxMatches == 0:
 		maxMatches = defaultSearchMatchesPerPage
 	case maxMatches < 0:
-		return nil, searchPagesOutput{}, fmt.Errorf("invalid_argument: max_matches_per_page must be non-negative")
+		return nil, searchPagesOutput{}, newToolError(codeInvalidArgument, "max_matches_per_page must be non-negative", nil)
 	case maxMatches > maxSearchMatchesPerPage:
 		maxMatches = maxSearchMatchesPerPage
 	}
 
 	state := job.resultsSnapshot()
 	if state.status != jobStatusDone {
-		return nil, searchPagesOutput{}, fmt.Errorf("job_not_finished: job %q is %s; search is available only when the job is done", jobID, state.status)
+		return nil, searchPagesOutput{}, newToolError(codeJobNotFinished, fmt.Sprintf("job %q is %s; search is available only when the job is done", jobID, state.status), nil)
 	}
 
 	selection := selectSearchScopes(scopes)
@@ -588,7 +583,7 @@ func (s *mcpServer) searchPages(ctx context.Context, _ *mcp.CallToolRequest, in 
 	for _, match := range matches[start:end] {
 		data, err := json.Marshal(match)
 		if err != nil {
-			return nil, searchPagesOutput{}, fmt.Errorf("internal_error: encode search match: %v", err)
+			return nil, searchPagesOutput{}, newToolError(codeInternalError, "could not encode a search match", map[string]any{"job_id": jobID})
 		}
 		if used+len(data)+1 > budget {
 			out.Truncated = true

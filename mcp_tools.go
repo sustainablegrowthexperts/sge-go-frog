@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -24,7 +25,7 @@ func (s *mcpServer) registerTools() {
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "start_crawl",
 		Description: "Start an asynchronous spider or list crawl with optional keywords, audit, and per-job limits; returns a job ID for polling with get_job.",
-	}, s.startCrawl)
+	}, wrapMCPTool(s, "start_crawl", s.startCrawl))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_job",
@@ -33,7 +34,7 @@ func (s *mcpServer) registerTools() {
 			ReadOnlyHint:   true,
 			IdempotentHint: true,
 		},
-	}, s.getJob)
+	}, wrapMCPTool(s, "get_job", s.getJob))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "list_jobs",
@@ -43,7 +44,7 @@ func (s *mcpServer) registerTools() {
 			IdempotentHint: true,
 			OpenWorldHint:  boolPtr(false),
 		},
-	}, s.listJobs)
+	}, wrapMCPTool(s, "list_jobs", s.listJobs))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_results",
@@ -53,7 +54,7 @@ func (s *mcpServer) registerTools() {
 			IdempotentHint: true,
 			OpenWorldHint:  boolPtr(false),
 		},
-	}, s.getResults)
+	}, wrapMCPTool(s, "get_results", s.getResults))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "search_pages",
@@ -63,7 +64,7 @@ func (s *mcpServer) registerTools() {
 			IdempotentHint: true,
 			OpenWorldHint:  boolPtr(false),
 		},
-	}, s.searchPages)
+	}, wrapMCPTool(s, "search_pages", s.searchPages))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_audit",
@@ -73,7 +74,7 @@ func (s *mcpServer) registerTools() {
 			IdempotentHint: true,
 			OpenWorldHint:  boolPtr(false),
 		},
-	}, s.getAudit)
+	}, wrapMCPTool(s, "get_audit", s.getAudit))
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "get_artifact",
@@ -83,7 +84,56 @@ func (s *mcpServer) registerTools() {
 			IdempotentHint: true,
 			OpenWorldHint:  boolPtr(false),
 		},
-	}, s.getArtifact)
+	}, wrapMCPTool(s, "get_artifact", s.getArtifact))
+}
+
+// wrapMCPTool applies the shared panic boundary to one typed tool handler. A
+// panic becomes a generic internal_error result, and the sanitized cause is
+// logged server-side without a stack trace, page body, or credential.
+func wrapMCPTool[In, Out any](s *mcpServer, tool string, handler func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, Out, error)) func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, Out, error) {
+	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (result *mcp.CallToolResult, out Out, err error) {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				return
+			}
+			s.logToolPanic(tool, recovered)
+			var zero Out
+			result, out, err = nil, zero, newToolError(codeInternalError, "the tool failed unexpectedly", map[string]any{"tool": tool})
+		}()
+		return handler(ctx, req, in)
+	}
+}
+
+// logToolPanic records the tool and a sanitized cause. Job IDs and tool names
+// are safe; page bodies and raw panic values are not.
+func (s *mcpServer) logToolPanic(tool string, recovered any) {
+	logger := slog.Default()
+	if s != nil && s.jobs != nil && s.jobs.logger != nil {
+		logger = s.jobs.logger
+	}
+	cause := sanitizeDiagnosticText(fmt.Sprint(recovered))
+	if s != nil {
+		if dir := strings.TrimSpace(s.config.ResultsDir); dir != "" {
+			cause = strings.ReplaceAll(cause, dir, "<results>")
+		}
+	}
+	logger.Error("mcp tool panic", "tool", tool, "cause", cause)
+}
+
+// lookupMCPJob centralizes the ownership boundary. Only MCP-created jobs are
+// visible; a UI-owned ID and an unknown ID both return the same job_not_found
+// error so the caller cannot discover that a browser job exists.
+func (s *mcpServer) lookupMCPJob(rawJobID string) (*crawlJob, string, error) {
+	jobID := strings.TrimSpace(rawJobID)
+	if jobID == "" {
+		return nil, "", newToolError(codeInvalidArgument, "job_id is required", map[string]any{"field": "job_id"})
+	}
+	job := s.jobs.get(jobID)
+	if job == nil || !job.ownedBy(ownerMCP) {
+		return nil, jobID, newToolError(codeJobNotFound, fmt.Sprintf("job %q not found", jobID), map[string]any{"job_id": jobID})
+	}
+	return job, jobID, nil
 }
 
 // startCrawlPlan is the validated request shared by job creation and launch.
@@ -201,14 +251,9 @@ func (s *mcpServer) getJob(_ context.Context, _ *mcp.CallToolRequest, in getJobI
 		return nil, getJobOutput{}, err
 	}
 
-	jobID := strings.TrimSpace(in.JobID)
-	if jobID == "" {
-		return nil, getJobOutput{}, fmt.Errorf("invalid_argument: job_id is required")
-	}
-
-	job := s.jobs.get(jobID)
-	if job == nil || !job.ownedBy(ownerMCP) {
-		return nil, getJobOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	job, _, err := s.lookupMCPJob(in.JobID)
+	if err != nil {
+		return nil, getJobOutput{}, err
 	}
 
 	out := job.statusSnapshot()
@@ -238,12 +283,12 @@ func (s *mcpServer) listJobs(_ context.Context, _ *mcp.CallToolRequest, in listJ
 	case limit == 0:
 		limit = defaultListJobsLimit
 	case limit < 0:
-		return nil, listJobsOutput{}, fmt.Errorf("invalid_argument: limit must be non-negative")
+		return nil, listJobsOutput{}, newToolError(codeInvalidArgument, "limit must be non-negative", nil)
 	case limit > maxListJobsLimit:
 		limit = maxListJobsLimit
 	}
 	if in.Offset < 0 {
-		return nil, listJobsOutput{}, fmt.Errorf("invalid_argument: offset must be non-negative")
+		return nil, listJobsOutput{}, newToolError(codeInvalidArgument, "offset must be non-negative", nil)
 	}
 
 	jobs, total := s.jobs.listPage(jobFilter{
@@ -292,14 +337,9 @@ func (s *mcpServer) getResults(_ context.Context, _ *mcp.CallToolRequest, in get
 		return nil, getResultsOutput{}, err
 	}
 
-	jobID := strings.TrimSpace(in.JobID)
-	if jobID == "" {
-		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: job_id is required")
-	}
-
-	job := s.jobs.get(jobID)
-	if job == nil || !job.ownedBy(ownerMCP) {
-		return nil, getResultsOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	job, jobID, err := s.lookupMCPJob(in.JobID)
+	if err != nil {
+		return nil, getResultsOutput{}, err
 	}
 
 	statusCodes, err := parseStatusCodeFilter(in.StatusCode)
@@ -327,7 +367,7 @@ func (s *mcpServer) getResults(_ context.Context, _ *mcp.CallToolRequest, in get
 	}
 
 	if in.Offset < 0 {
-		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: offset must be non-negative")
+		return nil, getResultsOutput{}, newToolError(codeInvalidArgument, "offset must be non-negative", nil)
 	}
 
 	limit := in.Limit
@@ -335,25 +375,25 @@ func (s *mcpServer) getResults(_ context.Context, _ *mcp.CallToolRequest, in get
 	case limit == 0:
 		limit = defaultGetResultsLimit
 	case limit < 0:
-		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: limit must be non-negative")
+		return nil, getResultsOutput{}, newToolError(codeInvalidArgument, "limit must be non-negative", nil)
 	case limit > maxGetResultsLimit:
 		limit = maxGetResultsLimit
 	}
 
 	keyword := strings.TrimSpace(in.Keyword)
 	if in.MinKeywordHits < 0 {
-		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: min_keyword_hits must be non-negative")
+		return nil, getResultsOutput{}, newToolError(codeInvalidArgument, "min_keyword_hits must be non-negative", nil)
 	}
 	if in.MinKeywordHits > 0 && keyword == "" {
-		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: min_keyword_hits requires keyword")
+		return nil, getResultsOutput{}, newToolError(codeInvalidArgument, "min_keyword_hits requires keyword", nil)
 	}
 	if sortField == "keyword_hits" && keyword == "" {
-		return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: keyword is required when sort is keyword_hits")
+		return nil, getResultsOutput{}, newToolError(codeInvalidArgument, "keyword is required when sort is keyword_hits", nil)
 	}
 
 	state := job.resultsSnapshot()
 	if state.status != jobStatusDone {
-		return nil, getResultsOutput{}, fmt.Errorf("job_not_finished: job %q is %s; results are available only when the job is done", jobID, state.status)
+		return nil, getResultsOutput{}, newToolError(codeJobNotFinished, fmt.Sprintf("job %q is %s; results are available only when the job is done", jobID, state.status), nil)
 	}
 
 	keywords := splitJobKeywords(state.keywordsRaw)
@@ -367,19 +407,19 @@ func (s *mcpServer) getResults(_ context.Context, _ *mcp.CallToolRequest, in get
 			}
 		}
 		if keywordIndex < 0 {
-			return nil, getResultsOutput{}, fmt.Errorf("invalid_argument: keyword must be one of the job keywords: %s", strings.Join(keywords, ", "))
+			return nil, getResultsOutput{}, newToolError(codeInvalidArgument, fmt.Sprintf("keyword must be one of the job keywords: %s", strings.Join(keywords, ", ")), nil)
 		}
 	}
 
 	var auditResult *auditpkg.Result
 	if in.IncludeAudit {
 		if !state.auditReady {
-			return nil, getResultsOutput{}, fmt.Errorf("audit_not_available: strict audit is not ready for job %q", jobID)
+			return nil, getResultsOutput{}, newToolError(codeAuditNotAvailable, fmt.Sprintf("strict audit is not ready for job %q", jobID), nil)
 		}
 		auditResult, err = loadStrictAuditResult(state.auditDir)
 		if err != nil {
 			// Never echo the loader error: it contains the on-disk path.
-			return nil, getResultsOutput{}, fmt.Errorf("audit_not_available: strict audit could not be loaded for job %q", jobID)
+			return nil, getResultsOutput{}, newToolError(codeAuditNotAvailable, fmt.Sprintf("strict audit could not be loaded for job %q", jobID), nil)
 		}
 	}
 
@@ -414,7 +454,7 @@ func (s *mcpServer) getResults(_ context.Context, _ *mcp.CallToolRequest, in get
 		row := buildResultsRow(page, keywords, manifest, auditResult)
 		rowBytes, err := json.Marshal(row)
 		if err != nil {
-			return nil, getResultsOutput{}, fmt.Errorf("internal_error: encode result row: %v", err)
+			return nil, getResultsOutput{}, newToolError(codeInternalError, "could not encode a result row", map[string]any{"job_id": jobID})
 		}
 		if used+len(rowBytes)+1 > budget {
 			out.Summary.Truncated = true
@@ -443,14 +483,9 @@ func (s *mcpServer) getAudit(_ context.Context, _ *mcp.CallToolRequest, in getAu
 		return nil, getAuditOutput{}, err
 	}
 
-	jobID := strings.TrimSpace(in.JobID)
-	if jobID == "" {
-		return nil, getAuditOutput{}, fmt.Errorf("invalid_argument: job_id is required")
-	}
-
-	job := s.jobs.get(jobID)
-	if job == nil || !job.ownedBy(ownerMCP) {
-		return nil, getAuditOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	job, jobID, err := s.lookupMCPJob(in.JobID)
+	if err != nil {
+		return nil, getAuditOutput{}, err
 	}
 
 	profile := strings.TrimSpace(in.Profile)
@@ -470,14 +505,14 @@ func (s *mcpServer) getAudit(_ context.Context, _ *mcp.CallToolRequest, in getAu
 	}
 
 	if in.Offset < 0 {
-		return nil, getAuditOutput{}, fmt.Errorf("invalid_argument: offset must be non-negative")
+		return nil, getAuditOutput{}, newToolError(codeInvalidArgument, "offset must be non-negative", nil)
 	}
 	limit := in.Limit
 	switch {
 	case limit == 0:
 		limit = defaultGetAuditLimit
 	case limit < 0:
-		return nil, getAuditOutput{}, fmt.Errorf("invalid_argument: limit must be non-negative")
+		return nil, getAuditOutput{}, newToolError(codeInvalidArgument, "limit must be non-negative", nil)
 	case limit > maxGetAuditLimit:
 		limit = maxGetAuditLimit
 	}
@@ -492,10 +527,10 @@ func (s *mcpServer) getAudit(_ context.Context, _ *mcp.CallToolRequest, in getAu
 
 	state := job.auditSnapshot()
 	if state.status != jobStatusDone {
-		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: audit is available only when job %q is done (status %s)", jobID, state.status)
+		return nil, getAuditOutput{}, newToolError(codeAuditNotAvailable, fmt.Sprintf("audit is available only when job %q is done (status %s)", jobID, state.status), nil)
 	}
 	if !state.auditEnabled {
-		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: job %q did not enable audit", jobID)
+		return nil, getAuditOutput{}, newToolError(codeAuditNotAvailable, fmt.Sprintf("job %q did not enable audit", jobID), nil)
 	}
 
 	var ready bool
@@ -515,21 +550,22 @@ func (s *mcpServer) getAudit(_ context.Context, _ *mcp.CallToolRequest, in getAu
 		if storedError != "" {
 			// The stored error explains the failure, but it may contain the
 			// job-owned directory, so strip that before returning it.
-			return nil, getAuditOutput{}, fmt.Errorf(
-				"audit_not_available: %s audit failed for job %q: %s",
-				profile, jobID, sanitizeAuditError(storedError, state.strictDir, state.inclusiveDir),
+			return nil, getAuditOutput{}, newToolError(
+				codeAuditNotAvailable,
+				fmt.Sprintf("%s audit failed for job %q: %s", profile, jobID, sanitizeAuditError(storedError, state.strictDir, state.inclusiveDir)),
+				map[string]any{"job_id": jobID, "profile": profile},
 			)
 		}
-		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: %s audit is not ready for job %q", profile, jobID)
+		return nil, getAuditOutput{}, newToolError(codeAuditNotAvailable, fmt.Sprintf("%s audit is not ready for job %q", profile, jobID), nil)
 	}
 	if strings.TrimSpace(dir) == "" {
-		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: %s audit has no report directory for job %q", profile, jobID)
+		return nil, getAuditOutput{}, newToolError(codeAuditNotAvailable, fmt.Sprintf("%s audit has no report directory for job %q", profile, jobID), nil)
 	}
 
 	result, err := loadAuditResult(dir)
 	if err != nil {
 		// Never echo the loader error: it contains the on-disk path.
-		return nil, getAuditOutput{}, fmt.Errorf("audit_not_available: %s audit could not be loaded for job %q", profile, jobID)
+		return nil, getAuditOutput{}, newToolError(codeAuditNotAvailable, fmt.Sprintf("%s audit could not be loaded for job %q", profile, jobID), nil)
 	}
 
 	out := getAuditOutput{
@@ -543,10 +579,84 @@ func (s *mcpServer) getAudit(_ context.Context, _ *mcp.CallToolRequest, in getAu
 		return nil, getAuditOutput{}, err
 	}
 	out.Truncated = in.Limit > maxGetAuditLimit && out.Total > maxGetAuditLimit
+	capped, err := capAuditResponse(&out, int(s.config.Limits.withDefaults().MaxResponseBytes))
+	if err != nil {
+		return nil, getAuditOutput{}, err
+	}
+	out.Truncated = out.Truncated || capped
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: getAuditSummaryText(out)}},
 	}, out, nil
+}
+
+// capAuditResponse trims a paginated audit section until the serialized output
+// fits the response cap. Sections that cannot paginate, or a trimmed empty
+// result that still exceeds the cap, return limit_exceeded instead.
+func capAuditResponse(out *getAuditOutput, budget int) (bool, error) {
+	if budget <= 0 {
+		return false, nil
+	}
+	truncated := false
+	for {
+		data, err := json.Marshal(out)
+		if err != nil {
+			return false, newToolError(codeInternalError, "could not encode the audit response", map[string]any{"job_id": out.JobID})
+		}
+		if len(data) <= budget {
+			return truncated, nil
+		}
+		if !trimAuditPage(out) {
+			return false, newToolError(codeLimitExceeded, "audit response exceeds the maximum size", map[string]any{
+				"job_id": out.JobID,
+				"limit":  budget,
+			})
+		}
+		truncated = true
+	}
+}
+
+// trimAuditPage drops one trailing row from the populated paginated section and
+// refreshes the pagination envelope so the client can request the remainder.
+func trimAuditPage(out *getAuditOutput) bool {
+	trim := func(n int) {
+		refreshAuditPageEnvelope(out, n)
+	}
+	switch {
+	case out.Pages != nil && len(*out.Pages) > 0:
+		*out.Pages = (*out.Pages)[:len(*out.Pages)-1]
+		trim(len(*out.Pages))
+	case out.Links != nil && len(*out.Links) > 0:
+		*out.Links = (*out.Links)[:len(*out.Links)-1]
+		trim(len(*out.Links))
+	case out.Blocks != nil && len(*out.Blocks) > 0:
+		*out.Blocks = (*out.Blocks)[:len(*out.Blocks)-1]
+		trim(len(*out.Blocks))
+	case out.PageRank != nil && len(out.PageRank.Ranking) > 0:
+		out.PageRank.Ranking = out.PageRank.Ranking[:len(out.PageRank.Ranking)-1]
+		trim(len(out.PageRank.Ranking))
+	case out.Redirects != nil && len(*out.Redirects) > 0:
+		*out.Redirects = (*out.Redirects)[:len(*out.Redirects)-1]
+		trim(len(*out.Redirects))
+	case out.Failed != nil && len(*out.Failed) > 0:
+		*out.Failed = (*out.Failed)[:len(*out.Failed)-1]
+		trim(len(*out.Failed))
+	default:
+		return false
+	}
+	return true
+}
+
+// refreshAuditPageEnvelope recomputes has_more/next_offset after a byte-cap
+// trim without changing the requested limit.
+func refreshAuditPageEnvelope(out *getAuditOutput, shown int) {
+	out.HasMore = out.Offset+shown < out.Total
+	if out.HasMore {
+		next := out.Offset + shown
+		out.NextOffset = &next
+	} else {
+		out.NextOffset = nil
+	}
 }
 
 // getArtifact returns metadata for one whitelisted artifact of a completed
@@ -563,9 +673,9 @@ func (s *mcpServer) getArtifact(_ context.Context, _ *mcp.CallToolRequest, in ge
 		return nil, getArtifactOutput{}, err
 	}
 
-	job := s.jobs.get(jobID)
-	if job == nil || !job.ownedBy(ownerMCP) {
-		return nil, getArtifactOutput{}, fmt.Errorf("job_not_found: job %q not found", jobID)
+	job, jobID, err := s.lookupMCPJob(jobID)
+	if err != nil {
+		return nil, getArtifactOutput{}, err
 	}
 
 	out, err := s.buildArtifact(job, kind, in.Inline)
@@ -888,10 +998,10 @@ func parseStatusCodeFilter(raw any) ([]int, error) {
 	for _, value := range values {
 		code, ok := statusCodeValue(value)
 		if !ok {
-			return nil, fmt.Errorf("invalid_argument: status_code must be an integer or an array of integers")
+			return nil, newToolError(codeInvalidArgument, "status_code must be an integer or an array of integers", nil)
 		}
 		if code < 100 || code > 599 {
-			return nil, fmt.Errorf("invalid_argument: status_code must be between 100 and 599")
+			return nil, newToolError(codeInvalidArgument, "status_code must be between 100 and 599", nil)
 		}
 		out = append(out, code)
 	}
@@ -952,7 +1062,7 @@ func validateJobEnum(field, value string, allowed []string) error {
 	if value == "" || slices.Contains(allowed, value) {
 		return nil
 	}
-	return fmt.Errorf("invalid_argument: %s must be one of %s", field, strings.Join(allowed, ", "))
+	return newToolError(codeInvalidArgument, fmt.Sprintf("%s must be one of %s", field, strings.Join(allowed, ", ")), nil)
 }
 
 // boolPtr returns a pointer to b for SDK annotation fields.
@@ -991,7 +1101,7 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 	switch mode {
 	case "spider":
 		if len(in.URLs) > 0 {
-			return startCrawlPlan{}, fmt.Errorf("invalid_argument: urls is only valid for list mode")
+			return startCrawlPlan{}, newToolError(codeInvalidArgument, "urls is only valid for list mode", nil)
 		}
 		start, err := validateStartURL(in.StartURL, limits)
 		if err != nil {
@@ -1006,7 +1116,7 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 		target = start
 	case "list":
 		if strings.TrimSpace(in.StartURL) != "" {
-			return startCrawlPlan{}, fmt.Errorf("invalid_argument: start_url is only valid for spider mode")
+			return startCrawlPlan{}, newToolError(codeInvalidArgument, "start_url is only valid for spider mode", nil)
 		}
 		urls, err := validateListURLs(in.URLs, limits)
 		if err != nil {
@@ -1022,7 +1132,7 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 		settings.listURLs = urls
 		target = fmt.Sprintf("%d URLs", len(urls))
 	default:
-		return startCrawlPlan{}, fmt.Errorf("invalid_argument: mode must be \"spider\" or \"list\"")
+		return startCrawlPlan{}, newToolError(codeInvalidArgument, "mode must be \"spider\" or \"list\"", nil)
 	}
 
 	keywords, err := validateKeywords(in.Keywords, limits)
@@ -1039,7 +1149,7 @@ func (s *mcpServer) validateStartCrawl(in startCrawlInput) (startCrawlPlan, erro
 
 	if in.Audit {
 		if mode != "spider" {
-			return startCrawlPlan{}, fmt.Errorf("invalid_argument: audit is only supported for spider mode")
+			return startCrawlPlan{}, newToolError(codeInvalidArgument, "audit is only supported for spider mode", nil)
 		}
 		settings.Audit = true
 		if in.AuditFilters != nil && in.AuditFilters.Explicit {
@@ -1079,10 +1189,10 @@ func validateClientRequestID(raw string) (string, error) {
 	}
 	id := strings.TrimSpace(raw)
 	if id == "" {
-		return "", fmt.Errorf("invalid_argument: client_request_id must not be empty")
+		return "", newToolError(codeInvalidArgument, "client_request_id must not be empty", nil)
 	}
 	if utf8.RuneCountInString(id) > maxClientRequestIDLength {
-		return "", fmt.Errorf("invalid_argument: client_request_id must be at most %d characters", maxClientRequestIDLength)
+		return "", newToolError(codeInvalidArgument, fmt.Sprintf("client_request_id must be at most %d characters", maxClientRequestIDLength), nil)
 	}
 	return id, nil
 }

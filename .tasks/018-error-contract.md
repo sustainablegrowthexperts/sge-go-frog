@@ -1,7 +1,7 @@
 ---
 id: task-018
 title: "[Slice] All MCP tools share a stable error and ownership contract"
-status: pending
+status: completed
 depends_on: ["task-017"]
 target_files:
   - "mcp_tools.go"
