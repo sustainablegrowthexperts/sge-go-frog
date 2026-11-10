@@ -239,6 +239,8 @@ location /mcp {
     proxy_set_header Host $host;
     proxy_set_header Authorization $http_authorization;
     proxy_set_header Mcp-Session-Id $http_mcp_session_id;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
     proxy_buffering off;
     proxy_read_timeout 3600s;
 }
@@ -248,6 +250,28 @@ location /mcp {
 - Forward `Authorization` and `Mcp-Session-Id` unchanged. oauth2-proxy performs authentication; go-frog does not validate the Bearer token itself.
 - Keep `Content-Type: application/json` intact and do not strip request headers other than hop-by-hop headers.
 - Publish only one replica. Sessions and jobs are process-local even when job files are persisted.
+
+### MCP artifact downloads
+
+Completed MCP job artifacts are served directly from the MCP subtree at `<mcp-path>/artifacts/<job_id>/<kind>`. The route lives on the same MCP endpoint and listener as tool calls: no new port, service, or volume is required. The existing `/results` volume holds the generated files.
+
+- The proxy must forward `GET` and `HEAD` for `<mcp-path>/artifacts/` to the same backend as `<mcp-path>`. A `location /mcp` block such as the one above already covers the subtree; if you route paths individually, add the artifact prefix explicitly instead of serving it from a separate upstream.
+- Preserve `X-Forwarded-Proto` and `X-Forwarded-Host` when the public origin differs from the container origin. The server uses them to build absolute links on requests that do not have a configured base.
+- Set `GOFROG_MCP_ARTIFACT_BASE_URL` to the external canonical origin (for example `https://crawler.example.com`) when proxy rewriting would otherwise produce wrong URLs. Leave it empty to use request-derived URLs, which is the normal local setup. The value is an origin only; the configured MCP path is appended automatically, so do not include `/artifacts`.
+- Downloads are limited to MCP-created, completed jobs. UI-created jobs remain browser-only and are not reachable through MCP artifact URLs.
+- Completed job artifacts disappear when the retention window expires and requests then return `404`. Retention uses the same `GOFROG_MCP_JOB_TTL` window described below.
+- No app-level token handling, URL signing, or new secret is introduced. Authentication stays at oauth2-proxy, and download requests carry the same Bearer token as MCP tool calls.
+
+#### Artifact download troubleshooting
+
+| Status | Meaning | Check |
+|--------|---------|-------|
+| `404` | Unknown job, UI-owned job, unknown kind, missing artifact, or expired artifact | Confirm the job was created through MCP (`list_jobs`), that `get_job` reports `done`, that the kind is one of the seven supported kinds, and that the retention window has not expired. |
+| `409` | The job exists but is not `done` | Poll `get_job` until the status is terminal. Queued, running, errored, and cancelled jobs do not serve artifacts. |
+| `405` | The request used a method other than `GET` or `HEAD` | Retry with `GET` to download or `HEAD` to inspect headers. The response includes an `Allow: GET, HEAD` header. |
+| `500` | Artifact generation failed | Check `sudo docker compose logs --tail=100` and the job's `get_job` output. The response intentionally omits filesystem paths and internal error details. |
+
+If a URL returns `404` through the proxy but works locally, verify that the proxy forwards the artifact subtree to the same backend and preserves the `X-Forwarded-*` headers used for request-derived links.
 
 ### Restart behavior
 

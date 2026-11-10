@@ -1,7 +1,7 @@
 ---
 id: task-027
 title: "[Slice] Operators and AI clients have accurate artifact-download documentation and acceptance evidence"
-status: pending
+status: completed
 depends_on: ["task-026"]
 target_files:
   - "README.md"

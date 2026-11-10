@@ -131,7 +131,7 @@ There is no app-level token validation, OAuth flow, or per-caller ownership. Aut
 | `get_results` | Read completed page rows with filtering, sorting, pagination, keyword counts, summary counts, manifest depth/discovery, and an optional strict-audit join. |
 | `search_pages` | Search crawl metadata without an archive, or archived raw HTML and visible text when the job has an archive. Supports literal and RE2 regex patterns, case sensitivity, snippets, and pagination. |
 | `get_audit` | Read a strict or inclusive audit section: summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, or all. |
-| `get_artifact` | Get an authenticated download URL, size, and expiry for the CSV report, strict/inclusive audit ZIP, or strict/inclusive audit JSON. Small CSV and JSON bodies can be returned inline. |
+| `get_artifact` | Get an absolute download URL, size, filename, content type, and expiry for the CSV report, strict/inclusive audit ZIP, strict/inclusive audit JSON, or strict/inclusive audit XLSX. Small CSV and JSON bodies can be returned inline. |
 
 ### Job lifecycle and polling
 
@@ -143,7 +143,58 @@ There is no app-level token validation, OAuth flow, or per-caller ownership. Aut
 
 ### Artifacts
 
-`get_artifact` returns an authenticated URL, size, and expiry for CSV, audit ZIP, and audit JSON artifacts. Set `inline=true` to return small CSV or JSON content directly, up to the 1 MB inline cap. Download URLs pass through the same oauth2-proxy, so clients must send the same Bearer token when they fetch them. Artifact URLs expire when the job leaves the retention window.
+`get_artifact` returns an absolute download URL, size, filename, content type, and expiry for one artifact. Set `inline=true` to return small CSV or JSON content directly, up to the 1 MB inline cap. Download URLs pass through the same oauth2-proxy as the MCP endpoint, so clients must send the same Bearer token when they fetch them.
+
+#### Agent workflow: start, poll, read, download
+
+1. Call `start_crawl`. It returns a job ID immediately and includes absolute artifact links for the job.
+2. Poll `get_job` until `status` is terminal (`done`, `error`, or `cancelled`). Polling is the completion mechanism; there is no blocking wait call.
+3. After `done`, use `get_results` for page rows, `get_audit` for audit sections, and `search_pages` for metadata or archive-backed text. HTML/text search requires `archive_html=true` or `audit=true`; audit retrieval requires `audit=true` on a spider job.
+4. Use `get_artifact` for artifact metadata and an absolute URL, or download that URL directly with `GET`.
+
+#### Artifact URL contract
+
+All artifact links are absolute and use this shape:
+
+```text
+<scheme>://<host><mcp-path>/artifacts/<job_id>/<kind>
+```
+
+With the default `/mcp` path, the URLs look like:
+
+```text
+https://crawler.example.com/mcp/artifacts/<job_id>/csv
+https://crawler.example.com/mcp/artifacts/<job_id>/audit_strict_zip
+https://crawler.example.com/mcp/artifacts/<job_id>/audit_json_inclusive
+https://crawler.example.com/mcp/artifacts/<job_id>/audit_xlsx_strict
+```
+
+`<job_id>` is the ID returned by `start_crawl`. All seven artifact kinds are individually addressable:
+
+| Kind | Content |
+|------|---------|
+| `csv` | Crawl report CSV |
+| `audit_strict_zip` | Strict audit bundle (XLSX, CSVs, JSON, and manifest) |
+| `audit_inclusive_zip` | Inclusive audit bundle (XLSX, CSVs, JSON, and manifest) |
+| `audit_json_strict` | Strict audit JSON document |
+| `audit_json_inclusive` | Inclusive audit JSON document |
+| `audit_xlsx_strict` | Strict standalone audit workbook |
+| `audit_xlsx_inclusive` | Inclusive standalone audit workbook |
+
+#### Download behavior
+
+- `GET` returns the file; `HEAD` returns headers only; range requests are supported.
+- Responses set `Content-Type`, a sanitized `Content-Disposition` filename, and `Content-Length`.
+- `404` for an unknown job, a UI-owned job, an unknown kind, or a missing or expired artifact.
+- `409` for a job that exists but is not `done`.
+- `405` for any method other than `GET` or `HEAD`, with an `Allow` header.
+- `500` for an artifact generation failure, without filesystem paths or internal details.
+- Downloads are restricted to MCP-created jobs. UI-created jobs remain browser-only and are not reachable through MCP artifact URLs.
+- URLs expire with the existing job retention window. Once a job or its artifacts leave that window, the URL returns `404`.
+
+#### Artifact base URL resolution
+
+`GOFROG_MCP_ARTIFACT_BASE_URL` sets the canonical public origin (for example `https://crawler.example.com`) when configured. When it is empty, the server uses request-derived URLs: it reads `X-Forwarded-Proto` and `X-Forwarded-Host` from the incoming MCP request, then falls back to TLS and the `Host` header. The configured MCP path is appended after that base, so the base is an origin only and never the full artifact URL. See [DEPLOYMENT.md](DEPLOYMENT.md#mcp-artifact-downloads) for proxy requirements.
 
 ### Limits
 

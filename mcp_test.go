@@ -6915,6 +6915,79 @@ func TestMCPDocumentationContract(t *testing.T) {
 		)
 	})
 
+	t.Run("README documents the artifact retrieval workflow", func(t *testing.T) {
+		requireContractText(t, "README.md", readme,
+			"<scheme>://<host><mcp-path>/artifacts/<job_id>/<kind>",
+			"`get_job`",
+			"`get_results`",
+			"`get_audit`",
+			"`search_pages`",
+			"`get_artifact`",
+			"`GET`",
+			"`HEAD`",
+			"Content-Type",
+			"Content-Disposition",
+			"Content-Length",
+			"csv",
+			"audit_strict_zip",
+			"audit_inclusive_zip",
+			"audit_json_strict",
+			"audit_json_inclusive",
+			"audit_xlsx_strict",
+			"audit_xlsx_inclusive",
+			"archive_html=true",
+			"audit=true",
+		)
+	})
+
+	t.Run("README documents artifact download status codes and ownership", func(t *testing.T) {
+		requireContractText(t, "README.md", readme,
+			"404",
+			"409",
+			"405",
+			"500",
+			"MCP-created jobs",
+			"UI-created jobs",
+			"retention window",
+			"range requests",
+			"GOFROG_MCP_ARTIFACT_BASE_URL",
+			"X-Forwarded-Proto",
+			"X-Forwarded-Host",
+			"request-derived",
+		)
+	})
+
+	t.Run("DEPLOYMENT documents artifact downloads, proxy forwarding, and troubleshooting", func(t *testing.T) {
+		requireContractText(t, "DEPLOYMENT.md", deployment,
+			"<mcp-path>/artifacts/",
+			"GOFROG_MCP_ARTIFACT_BASE_URL",
+			"X-Forwarded-Proto",
+			"X-Forwarded-Host",
+			"`GET`",
+			"`HEAD`",
+			"404",
+			"409",
+			"405",
+			"500",
+			"retention",
+			"MCP-created",
+			"get_job",
+			"oauth2-proxy",
+		)
+	})
+
+	t.Run(".env.example documents the artifact base URL semantics", func(t *testing.T) {
+		requireContractText(t, ".env.example", envExample,
+			"GOFROG_MCP_ARTIFACT_BASE_URL",
+			"canonical",
+			"external proxy origin",
+			"incoming request",
+			"derived",
+			"MCP path is appended",
+			"/artifacts",
+		)
+	})
+
 	t.Run("README includes a remote Streamable HTTP client example", func(t *testing.T) {
 		requireContractText(t, "README.md", readme,
 			`"mcpServers"`,

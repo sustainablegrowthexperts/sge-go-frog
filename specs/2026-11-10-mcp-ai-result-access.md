@@ -161,3 +161,36 @@ http://localhost:4374/mcp/artifacts/<job_id>/audit_xlsx_strict
 20. **Add regression tests** — verify existing UI download routes, CSV columns, audit bundle contents, MCP tool listing, and structured outputs remain unchanged.
 21. **Update documentation** — document the artifact URL shape, supported formats, download workflow, completion polling, and retention behavior in `README.md`, `DEPLOYMENT.md`, and `.env.example`.
 22. **Run the acceptance suite** — `go test ./...`, `go test -race ./...`, and `go vet ./...`; confirm every in-scope item has automated coverage or a documented manual check.
+
+---
+
+## 6. Documentation and acceptance (task-027)
+
+### Verification
+
+- `go test ./...` — passed.
+- `go vet ./...` — passed.
+- `go test -race ./...` — passed in `golang:1.26-alpine` with `gcc` and `musl-dev` installed. The host has `CGO_ENABLED=0` and no C compiler, so `-race` cannot run directly on the workstation.
+- `go test -run TestMCPDocumentationContract .` — passed. The contract test guards the artifact URL shape, all seven kinds, `GET`/`HEAD`, base-URL resolution, status mapping, ownership, retention, and proxy-forwarding documentation, and continues to reject unsupported feature claims.
+
+### In-scope coverage
+
+| In-scope item | Automated coverage |
+|---|---|
+| Artifact download route | `TestArtifactDownloadEndpoint`, `TestArtifactRouteMounting` |
+| Absolute artifact URLs | `TestArtifactURLContract`, `TestArtifactBaseFromRequest`, `TestStartCrawlSpider` |
+| All result formats | `TestGetArtifact`, `TestGetArtifactXLSX`, `TestArtifactDownloadEndpoint` |
+| Standalone XLSX | `TestGetArtifactXLSX` plus the `internal/auditbundle` workbook tests |
+| Download behavior (`GET`, `HEAD`, ranges, headers) | `TestArtifactDownloadEndpoint` |
+| Ownership boundary | `TestArtifactDownloadErrors`, `TestArtifactRouteMounting`, `TestListJobsMCPOnly` |
+| Job-state enforcement | `TestArtifactDownloadErrors` |
+| Completion polling | `TestGetJobStatus`, `TestJobPhases` |
+| Agent guidance | `TestMCPWorkflowGuidance` |
+| Tool descriptions and schemas | `TestToolSchemasGolden`, `TestMCPInitializeHandshake` |
+| Dead link cleanup | `TestArtifactURLContract`, `TestStartCrawlSpider` |
+| Regression safety | Full `go test ./...` suite, including the existing UI download, CSV, audit, and CLI tests |
+| Tests and docs | Full suite plus `TestMCPDocumentationContract` |
+
+### Deliberate deviations
+
+None. Documentation, `.env.example`, and deployment notes match the implemented behavior.
