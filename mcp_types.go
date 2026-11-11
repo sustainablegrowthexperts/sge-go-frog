@@ -712,6 +712,13 @@ type searchPagesOutput struct {
 	Matches      []searchMatch `json:"matches"`
 }
 
+// read_artifact paging defaults and hard cap. Limit and offset are byte-based
+// so text and binary artifacts share one paging contract.
+const (
+	defaultReadArtifactLimit = 256 << 10
+	maxReadArtifactLimit     = 1 << 20
+)
+
 // get_artifact accepted kinds. The list is an allowlist so a client cannot ask
 // the server to read an arbitrary file.
 var getArtifactKinds = []string{
@@ -746,6 +753,32 @@ type getArtifactOutput struct {
 	ExpiresAt   string `json:"expires_at"`
 	Inline      bool   `json:"inline"`
 	Content     string `json:"content,omitempty"`
+}
+
+// readArtifactInput is the typed input for the read_artifact tool. Offsets are
+// raw byte offsets into the artifact, not line or row numbers.
+type readArtifactInput struct {
+	JobID  string `json:"job_id,omitempty" jsonschema:"job ID returned by start_crawl"`
+	Kind   string `json:"kind,omitempty" jsonschema:"artifact kind: csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, audit_json_inclusive, audit_xlsx_strict, or audit_xlsx_inclusive"`
+	Offset int64  `json:"offset,omitempty" jsonschema:"byte offset to start reading from; defaults to 0; use next_offset from the previous page"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"maximum bytes to read; defaults to 262144 and is capped by the server"`
+}
+
+// readArtifactOutput is the typed output for read_artifact. Encoding is utf-8
+// for CSV and audit JSON, and base64 for ZIP and XLSX. Content covers the
+// requested byte range; NextOffset is present only when more bytes remain.
+type readArtifactOutput struct {
+	JobID       string `json:"job_id"`
+	Kind        string `json:"kind"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	SizeBytes   int64  `json:"size_bytes"`
+	Offset      int64  `json:"offset"`
+	Bytes       int    `json:"bytes"`
+	Encoding    string `json:"encoding"`
+	Content     string `json:"content"`
+	HasMore     bool   `json:"has_more"`
+	NextOffset  *int64 `json:"next_offset,omitempty"`
 }
 
 // getJobOutput is the typed output for get_job. It deliberately excludes
@@ -825,6 +858,11 @@ var (
 	})
 	getArtifactInputSchema = mcpInputSchema[getArtifactInput](func(schema *jsonschema.Schema) {
 		setSchemaEnum(schema, "kind", getArtifactKinds)
+	})
+	readArtifactInputSchema = mcpInputSchema[readArtifactInput](func(schema *jsonschema.Schema) {
+		setSchemaEnum(schema, "kind", getArtifactKinds)
+		setSchemaDefault(schema, "offset", 0)
+		setSchemaDefault(schema, "limit", defaultReadArtifactLimit)
 	})
 )
 

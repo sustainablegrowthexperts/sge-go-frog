@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -4824,6 +4825,325 @@ func TestGetArtifactXLSX(t *testing.T) {
 	})
 }
 
+// TestReadArtifact covers the MCP-native artifact read path:
+//   - CSV and audit JSON are returned as UTF-8 text in the tool response so a
+//     text-only MCP client sees the data, not just a summary or URL;
+//   - ZIP and XLSX are returned as base64 so binary artifacts survive MCP text
+//     content;
+//   - byte-offset paging reassembles the artifact exactly and reports
+//     next_offset while more bytes remain;
+//   - invalid offsets, limits, kinds, unfinished jobs, expired jobs, and
+//     missing audits use the stable tool error codes.
+func TestReadArtifact(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resultsDir := t.TempDir()
+	cfg := defaultMCPConfig()
+	cfg.ResultsDir = resultsDir
+	cfg.ArtifactBaseURL = "https://crawler.example.com"
+
+	app, session := newMCPTestSession(t, ctx, cfg, newImmediateFakeRunner(nil, nil))
+
+	report := auditpkg.Result{
+		Version:     auditpkg.AuditVersion,
+		StartURL:    "https://example.com/",
+		Domain:      "example.com",
+		GeneratedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+		Summary:     auditpkg.AuditSummary{Pages: 2},
+	}
+	strictDir := t.TempDir()
+	inclusiveDir := t.TempDir()
+	writeAuditBundleFixture(t, strictDir, report)
+	writeAuditBundleFixture(t, inclusiveDir, report)
+
+	pages := []Page{
+		{
+			URL:         "https://example.com/",
+			StatusCode:  200,
+			LoadTime:    20 * time.Millisecond,
+			Title:       "Café — résumé",
+			Description: "Home page",
+			H1s:         []string{"Accueil"},
+			Robots:      "index, follow",
+			KeywordHits: []int{2, 1},
+		},
+		{
+			URL:         "https://example.com/a",
+			StatusCode:  200,
+			LoadTime:    10 * time.Millisecond,
+			ParentURL:   "https://example.com/",
+			Inlinks:     `"Home"`,
+			Title:       "日本語",
+			Description: "Page A",
+			H1s:         []string{"A"},
+			Robots:      "index, follow",
+			KeywordHits: []int{0, 3},
+		},
+	}
+	job := createDoneResultsJob(t, app, "alpha|beta", pages)
+	job.mu.Lock()
+	job.settings.Audit = true
+	job.auditReady = true
+	job.auditDir = strictDir
+	job.auditInclusiveReady = true
+	job.auditInclusiveDir = inclusiveDir
+	job.mu.Unlock()
+
+	t.Run("csv is returned as utf-8 content and in the text block", func(t *testing.T) {
+		inline := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+			"inline": true,
+		})
+		wantContent := auditString(t, inline, "content")
+
+		res := callTool(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+		})
+		if res.IsError {
+			t.Fatalf("read_artifact returned an error: %s", toolResultText(res))
+		}
+		out := structuredObject(t, res)
+		if out["job_id"] != job.id || out["kind"] != "csv" {
+			t.Fatalf("identity = job_id:%v kind:%v, want %s/csv", out["job_id"], out["kind"], job.id)
+		}
+		if out["encoding"] != "utf-8" {
+			t.Fatalf("encoding = %v, want utf-8", out["encoding"])
+		}
+		if content := auditString(t, out, "content"); content != wantContent {
+			t.Fatalf("csv content differs from get_artifact inline content")
+		}
+		size := auditNumber(t, out, "size_bytes")
+		if size != float64(len(wantContent)) {
+			t.Fatalf("size_bytes = %v, want %d", size, len(wantContent))
+		}
+		if bytesRead := auditNumber(t, out, "bytes"); bytesRead != size {
+			t.Fatalf("bytes = %v, want %v", bytesRead, size)
+		}
+		if out["offset"] != float64(0) {
+			t.Fatalf("offset = %v, want 0", out["offset"])
+		}
+		if out["has_more"] != false {
+			t.Fatalf("has_more = %v, want false", out["has_more"])
+		}
+		if _, present := out["next_offset"]; present {
+			t.Fatal("complete read returned next_offset")
+		}
+		if text := toolResultText(res); !strings.Contains(text, wantContent) {
+			t.Fatalf("text content does not contain the CSV bytes")
+		}
+	})
+
+	t.Run("byte paging reassembles multibyte text exactly", func(t *testing.T) {
+		inline := callToolObject(t, ctx, session, "get_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+			"inline": true,
+		})
+		wantContent := auditString(t, inline, "content")
+
+		var assembled strings.Builder
+		offset := int64(0)
+		pageCount := 0
+		for {
+			res := callTool(t, ctx, session, "read_artifact", map[string]any{
+				"job_id": job.id,
+				"kind":   "csv",
+				"offset": offset,
+				"limit":  17,
+			})
+			if res.IsError {
+				t.Fatalf("read_artifact page returned an error: %s", toolResultText(res))
+			}
+			out := structuredObject(t, res)
+			if out["encoding"] != "utf-8" {
+				t.Fatalf("page encoding = %v, want utf-8", out["encoding"])
+			}
+			chunk := auditString(t, out, "content")
+			if chunk == "" {
+				t.Fatal("paged read returned an empty chunk before the end")
+			}
+			assembled.WriteString(chunk)
+			pageCount++
+			if pageCount > 1000 {
+				t.Fatal("paging did not terminate")
+			}
+			if out["has_more"] == false {
+				break
+			}
+			if text := toolResultText(res); !strings.Contains(text, "next_offset") {
+				t.Fatalf("text content does not expose next_offset: %q", text)
+			}
+			next, ok := out["next_offset"].(float64)
+			if !ok {
+				t.Fatalf("next_offset = %v (%T), want a number", out["next_offset"], out["next_offset"])
+			}
+			if int64(next) <= offset {
+				t.Fatalf("next_offset = %v, want progress beyond %d", next, offset)
+			}
+			offset = int64(next)
+		}
+		if pageCount < 2 {
+			t.Fatalf("pageCount = %d, want multiple pages", pageCount)
+		}
+		if assembled.String() != wantContent {
+			t.Fatalf("paged CSV differs from the full artifact")
+		}
+	})
+
+	t.Run("zip is returned as base64", func(t *testing.T) {
+		res := callTool(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "audit_strict_zip",
+		})
+		if res.IsError {
+			t.Fatalf("read_artifact returned an error: %s", toolResultText(res))
+		}
+		out := structuredObject(t, res)
+		if out["encoding"] != "base64" {
+			t.Fatalf("encoding = %v, want base64", out["encoding"])
+		}
+		content := auditString(t, out, "content")
+		if text := toolResultText(res); !strings.Contains(text, content) {
+			t.Fatalf("text content does not contain the base64 artifact")
+		}
+		raw, err := base64.StdEncoding.DecodeString(content)
+		if err != nil {
+			t.Fatalf("decode base64 zip: %v", err)
+		}
+		if size := auditNumber(t, out, "size_bytes"); size != float64(len(raw)) {
+			t.Fatalf("size_bytes = %v, want %d", size, len(raw))
+		}
+		zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+		if err != nil {
+			t.Fatalf("read decoded zip: %v", err)
+		}
+		names := make([]string, 0, len(zr.File))
+		for _, file := range zr.File {
+			names = append(names, file.Name)
+		}
+		for _, want := range []string{"audit.xlsx", "audit.json", "manifest.txt"} {
+			if !slices.Contains(names, want) {
+				t.Fatalf("zip entries = %v, want %q", names, want)
+			}
+		}
+	})
+
+	t.Run("xlsx is returned as base64", func(t *testing.T) {
+		out := callToolObject(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "audit_xlsx_strict",
+		})
+		if out["encoding"] != "base64" {
+			t.Fatalf("encoding = %v, want base64", out["encoding"])
+		}
+		raw, err := base64.StdEncoding.DecodeString(auditString(t, out, "content"))
+		if err != nil {
+			t.Fatalf("decode base64 xlsx: %v", err)
+		}
+		f, err := excelize.OpenReader(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("open decoded workbook: %v", err)
+		}
+		defer f.Close()
+		sheets := map[string]bool{}
+		for _, name := range f.GetSheetList() {
+			sheets[name] = true
+		}
+		for _, name := range []string{"Summary", "Pages", "Links", "Blocks"} {
+			if !sheets[name] {
+				t.Fatalf("workbook missing sheet %s: %v", name, f.GetSheetList())
+			}
+		}
+	})
+
+	t.Run("offset at the end returns an empty complete page", func(t *testing.T) {
+		first := callToolObject(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+		})
+		size := int64(auditNumber(t, first, "size_bytes"))
+		out := callToolObject(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": job.id,
+			"kind":   "csv",
+			"offset": size,
+		})
+		if content := auditString(t, out, "content"); content != "" {
+			t.Fatalf("content at end = %q, want empty", content)
+		}
+		if out["has_more"] != false {
+			t.Fatalf("has_more at end = %v, want false", out["has_more"])
+		}
+	})
+
+	t.Run("rejects invalid arguments", func(t *testing.T) {
+		cases := []struct {
+			name string
+			args map[string]any
+			want string
+		}{
+			{"missing job id", map[string]any{"kind": "csv"}, "job_id"},
+			{"path-like job id", map[string]any{"job_id": "../etc/passwd", "kind": "csv"}, "invalid_argument"},
+			{"missing kind", map[string]any{"job_id": job.id}, "kind"},
+			{"invalid kind", map[string]any{"job_id": job.id, "kind": "pdf"}, "kind"},
+			{"path-like kind", map[string]any{"job_id": job.id, "kind": "../audit"}, "kind"},
+			{"negative offset", map[string]any{"job_id": job.id, "kind": "csv", "offset": -1}, "offset"},
+			{"offset past the end", map[string]any{"job_id": job.id, "kind": "csv", "offset": 1 << 30}, "offset"},
+			{"negative limit", map[string]any{"job_id": job.id, "kind": "csv", "limit": -1}, "limit"},
+			{"unknown job", map[string]any{"job_id": "missing", "kind": "csv"}, "job_not_found"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := callTool(t, ctx, session, "read_artifact", tc.args)
+				if !res.IsError {
+					t.Fatalf("read_artifact accepted invalid input: %v", res.StructuredContent)
+				}
+				if text := strings.ToLower(toolResultText(res)); !strings.Contains(text, tc.want) {
+					t.Fatalf("error = %q, want %q", text, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects unfinished, expired, and audit-less jobs", func(t *testing.T) {
+		running := createDoneResultsJob(t, app, "", pages[:1])
+		running.mu.Lock()
+		running.status = jobStatusRunning
+		running.phase = jobPhaseCrawling
+		running.mu.Unlock()
+		res := callTool(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": running.id,
+			"kind":   "csv",
+		})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "job_not_finished") {
+			t.Fatalf("running job error = %q, want job_not_finished", toolResultText(res))
+		}
+
+		expired := createDoneResultsJob(t, app, "", pages[:1])
+		expired.mu.Lock()
+		expired.finishedAt = time.Now().Add(-48 * time.Hour)
+		expired.mu.Unlock()
+		res = callTool(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": expired.id,
+			"kind":   "csv",
+		})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "job_not_found") {
+			t.Fatalf("expired job error = %q, want job_not_found", toolResultText(res))
+		}
+
+		noAudit := createDoneResultsJob(t, app, "", pages[:1])
+		res = callTool(t, ctx, session, "read_artifact", map[string]any{
+			"job_id": noAudit.id,
+			"kind":   "audit_json_strict",
+		})
+		if !res.IsError || !strings.Contains(strings.ToLower(toolResultText(res)), "audit_not_available") {
+			t.Fatalf("audit-less job error = %q, want audit_not_available", toolResultText(res))
+		}
+	})
+}
+
 // newMCPTestApp starts an MCP-enabled application and returns the app plus the
 // httptest server base URL. It is the HTTP-level counterpart to
 // newMCPTestSession, for tests that exercise the artifact download endpoint
@@ -5541,7 +5861,7 @@ func parseToolErrorEnvelope(t *testing.T, text string) toolErrorEnvelope {
 }
 
 // TestToolErrorContractCodes covers the code mapping and the uniform envelope
-// across all seven tools, including panic recovery.
+// across all eight tools, including panic recovery.
 func TestToolErrorContractCodes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -5597,6 +5917,7 @@ func TestToolErrorContractCodes(t *testing.T) {
 			{"search_pages", map[string]any{}},
 			{"get_audit", map[string]any{}},
 			{"get_artifact", map[string]any{}},
+			{"read_artifact", map[string]any{}},
 		}
 		for _, tc := range cases {
 			t.Run(tc.tool, func(t *testing.T) {
@@ -6410,7 +6731,7 @@ func assertGoldenField(t *testing.T, path string, schema map[string]any, want go
 	}
 }
 
-// TestToolSchemasGolden locks the seven-tool v1 contract: exact names and
+// TestToolSchemasGolden locks the eight-tool v1 contract: exact names and
 // count, annotations, input-schema fields and enums, required properties, and
 // serverInfo metadata. A failure names the exact tool and schema path.
 func TestToolSchemasGolden(t *testing.T) {
@@ -6473,6 +6794,7 @@ func TestToolSchemasGolden(t *testing.T) {
 		"search_pages",
 		"get_audit",
 		"get_artifact",
+		"read_artifact",
 	}
 	gotNames := make([]string, 0, len(tools.Tools))
 	byName := make(map[string]*mcp.Tool, len(tools.Tools))
@@ -6617,6 +6939,17 @@ func TestToolSchemasGolden(t *testing.T) {
 				"inline": boolField(),
 			},
 		},
+		{
+			name:        "read_artifact",
+			annotations: readOnly,
+			required:    nil,
+			fields: map[string]goldenField{
+				"job_id": stringField(),
+				"kind":   stringEnum("csv", "audit_strict_zip", "audit_inclusive_zip", "audit_json_strict", "audit_json_inclusive", "audit_xlsx_strict", "audit_xlsx_inclusive"),
+				"offset": withDefault(intField(), 0),
+				"limit":  withDefault(intField(), 262144),
+			},
+		},
 	}
 
 	for _, golden := range goldens {
@@ -6710,6 +7043,7 @@ func TestMCPWorkflowGuidance(t *testing.T) {
 		"start_crawl",
 		"get_job",
 		"get_artifact",
+		"read_artifact",
 		"get_results",
 		"get_audit",
 		"search_pages",
@@ -6783,6 +7117,10 @@ func TestMCPWorkflowGuidance(t *testing.T) {
 	artifactDescription = append(artifactDescription, artifactKinds...)
 	requireDescription("get_artifact", artifactDescription...)
 
+	readArtifactDescription := []string{"base64", "offset", "limit", "next_offset", "done"}
+	readArtifactDescription = append(readArtifactDescription, artifactKinds...)
+	requireDescription("read_artifact", readArtifactDescription...)
+
 	// The seven-kind enum remains the wire contract; this task must not widen it.
 	getArtifact := byName["get_artifact"]
 	schema, ok := getArtifact.InputSchema.(map[string]any)
@@ -6852,7 +7190,7 @@ func TestMCPDocumentationContract(t *testing.T) {
 	compose := readContractFile(t, "compose.yml")
 	envExample := readContractFile(t, ".env.example")
 
-	t.Run("README documents the seven tools", func(t *testing.T) {
+	t.Run("README documents the eight tools", func(t *testing.T) {
 		requireContractText(t, "README.md", readme,
 			"`start_crawl`",
 			"`get_job`",
@@ -6861,6 +7199,7 @@ func TestMCPDocumentationContract(t *testing.T) {
 			"`search_pages`",
 			"`get_audit`",
 			"`get_artifact`",
+			"`read_artifact`",
 		)
 	})
 
@@ -6923,11 +7262,14 @@ func TestMCPDocumentationContract(t *testing.T) {
 			"`get_audit`",
 			"`search_pages`",
 			"`get_artifact`",
+			"`read_artifact`",
 			"`GET`",
 			"`HEAD`",
 			"Content-Type",
 			"Content-Disposition",
 			"Content-Length",
+			"base64",
+			"next_offset",
 			"csv",
 			"audit_strict_zip",
 			"audit_inclusive_zip",

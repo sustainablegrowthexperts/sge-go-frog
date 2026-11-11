@@ -259,6 +259,7 @@ Completed MCP job artifacts are served directly from the MCP subtree at `<mcp-pa
 - Preserve `X-Forwarded-Proto` and `X-Forwarded-Host` when the public origin differs from the container origin. The server uses them to build absolute links on requests that do not have a configured base.
 - Set `GOFROG_MCP_ARTIFACT_BASE_URL` to the external canonical origin (for example `https://crawler.example.com`) when proxy rewriting would otherwise produce wrong URLs. Leave it empty to use request-derived URLs, which is the normal local setup. The value is an origin only; the configured MCP path is appended automatically, so do not include `/artifacts`.
 - Downloads are limited to MCP-created, completed jobs. UI-created jobs remain browser-only and are not reachable through MCP artifact URLs.
+- Clients whose outbound network policy blocks the artifact host can use the `read_artifact` tool instead of a direct download. It returns the same job-scoped artifact in the MCP response: CSV and audit JSON as UTF-8, ZIP and XLSX as base64, paged with `offset`, `limit`, and `next_offset`. This path does not require an extra proxy route or allowlist entry because it stays inside the MCP request.
 - Completed job artifacts disappear when the retention window expires and requests then return `404`. Retention uses the same `GOFROG_MCP_JOB_TTL` window described below.
 - No app-level token handling, URL signing, or new secret is introduced. Authentication stays at oauth2-proxy, and download requests carry the same Bearer token as MCP tool calls.
 

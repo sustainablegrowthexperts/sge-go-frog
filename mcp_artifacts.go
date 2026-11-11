@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go-frog/internal/auditbundle"
 )
@@ -697,6 +700,195 @@ func getArtifactSummaryText(out getArtifactOutput) string {
 	)
 	if out.Inline {
 		summary += " Content is included inline."
+	}
+	return summary
+}
+
+// readArtifactResponseOverhead reserves envelope and summary bytes when sizing
+// a read_artifact page against the response cap.
+const readArtifactResponseOverhead = 2048
+
+// readArtifactContent resolves one artifact and returns a byte range of its
+// content. Text artifacts are returned as UTF-8 and binary artifacts as base64.
+// The artifact path still comes only from the whitelisted kind; no client value
+// is ever interpreted as a filesystem path.
+func (s *mcpServer) readArtifactContent(ctx context.Context, job *crawlJob, kind string, offset int64, limit int) (readArtifactOutput, error) {
+	snapshot := job.artifactSnapshot()
+	if snapshot.status != jobStatusDone {
+		return readArtifactOutput{}, newToolError(
+			codeJobNotFinished,
+			fmt.Sprintf("job %q is %s; artifacts are available only when the job is done", job.id, snapshot.status),
+			map[string]any{"job_id": job.id, "status": snapshot.status},
+		)
+	}
+	if artifactDownloadExpired(snapshot, s.jobs.retention.withDefaults().MCPTTL, s.jobs.now()) {
+		return readArtifactOutput{}, newToolError(
+			codeJobNotFound,
+			fmt.Sprintf("job %q not found", job.id),
+			map[string]any{"job_id": job.id},
+		)
+	}
+
+	desc, err := s.resolveArtifact(ctx, job.id, kind, snapshot)
+	if err != nil {
+		return readArtifactOutput{}, artifactToolError(err, job.id, kind)
+	}
+	info, err := os.Stat(desc.path)
+	if err != nil || info.IsDir() {
+		return readArtifactOutput{}, artifactUnavailableError(kind, job.id)
+	}
+
+	if offset < 0 {
+		return readArtifactOutput{}, newToolError(codeInvalidArgument, "offset must be non-negative", nil)
+	}
+	if offset > info.Size() {
+		return readArtifactOutput{}, newToolError(
+			codeInvalidArgument,
+			fmt.Sprintf("offset must be between 0 and %d", info.Size()),
+			map[string]any{"size_bytes": info.Size()},
+		)
+	}
+	if limit < 0 {
+		return readArtifactOutput{}, newToolError(codeInvalidArgument, "limit must be non-negative", nil)
+	}
+	if limit == 0 {
+		limit = defaultReadArtifactLimit
+	}
+	if max := s.readArtifactPageLimit(); limit > max {
+		limit = max
+	}
+
+	data, textual, err := readArtifactChunk(desc.path, offset, int64(limit), desc.inlineable)
+	if err != nil {
+		// Never echo the reader error: it contains the on-disk path.
+		return readArtifactOutput{}, newToolError(
+			codeInternalError,
+			fmt.Sprintf("could not read %s artifact for job %q", kind, job.id),
+			map[string]any{"job_id": job.id},
+		)
+	}
+
+	out := readArtifactOutput{
+		JobID:       job.id,
+		Kind:        kind,
+		Filename:    desc.filename,
+		ContentType: desc.contentType,
+		SizeBytes:   info.Size(),
+		Offset:      offset,
+		Bytes:       len(data),
+		Encoding:    "base64",
+		Content:     base64.StdEncoding.EncodeToString(data),
+	}
+	if textual {
+		out.Encoding = "utf-8"
+		out.Content = string(data)
+	}
+	if end := offset + int64(len(data)); end < info.Size() {
+		out.HasMore = true
+		out.NextOffset = &end
+	}
+
+	logJobEvent(s.loggerOr(), "artifact read", job.id,
+		"kind", kind, "offset", offset, "bytes", len(data), "encoding", out.Encoding)
+	return out, nil
+}
+
+// readArtifactPageLimit returns the effective per-call byte cap. Content is
+// carried both in structured content and the text block, and base64 expands
+// binary data by roughly 4/3, so the response budget is divided conservatively.
+func (s *mcpServer) readArtifactPageLimit() int {
+	limits := s.config.Limits.withDefaults()
+	max := int64(maxReadArtifactLimit)
+	if limits.MaxInlineArtifactBytes > 0 && limits.MaxInlineArtifactBytes < max {
+		max = limits.MaxInlineArtifactBytes
+	}
+	if limits.MaxResponseBytes > 0 {
+		byBudget := (limits.MaxResponseBytes - readArtifactResponseOverhead) * 3 / 7
+		if byBudget < max {
+			max = byBudget
+		}
+	}
+	if max < utf8.UTFMax {
+		max = utf8.UTFMax
+	}
+	return int(max)
+}
+
+// readArtifactChunk reads one byte range. textual reports whether data is a
+// complete UTF-8 sequence that can be returned as text. When a text range ends
+// in the middle of a rune, the incomplete suffix is left for the next page so
+// no byte is lost or replaced. A range that starts inside a rune, or contains
+// invalid UTF-8, is returned as raw bytes for base64 encoding.
+func readArtifactChunk(path string, offset, limit int64, textual bool) ([]byte, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		return nil, false, fmt.Errorf("artifact is not readable")
+	}
+	if offset >= info.Size() {
+		return []byte{}, textual, nil
+	}
+	if remaining := info.Size() - offset; limit > remaining {
+		limit = remaining
+	}
+	if limit < 0 {
+		limit = 0
+	}
+
+	buf := make([]byte, limit)
+	n, err := file.ReadAt(buf, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	data := buf[:n]
+	if !textual {
+		return data, false, nil
+	}
+
+	if utf8.Valid(data) {
+		return data, true, nil
+	}
+
+	// A valid text artifact can only be incomplete at its trailing rune. Check
+	// the last few rune starts; anything else is treated as binary data.
+	start := len(data) - utf8.UTFMax
+	if start < 0 {
+		start = 0
+	}
+	for i := len(data) - 1; i >= start; i-- {
+		if !utf8.RuneStart(data[i]) {
+			continue
+		}
+		if !utf8.Valid(data[:i]) {
+			continue
+		}
+		if i == 0 {
+			// The page is too small to hold even one rune. Return the raw
+			// bytes so the next offset still advances.
+			return data, false, nil
+		}
+		return data[:i], true, nil
+	}
+	return data, false, nil
+}
+
+// readArtifactSummaryText renders byte-range and paging metadata. The content
+// itself is returned as a separate text block so copy/paste stays exact.
+func readArtifactSummaryText(out readArtifactOutput) string {
+	summary := fmt.Sprintf(
+		"%s artifact %s for job %s: %d of %d bytes from offset %d, encoding %s.",
+		out.Kind, out.Filename, out.JobID,
+		out.Bytes, out.SizeBytes, out.Offset, out.Encoding,
+	)
+	if out.HasMore && out.NextOffset != nil {
+		summary += fmt.Sprintf(" More bytes available; next_offset is %d.", *out.NextOffset)
+	} else {
+		summary += " End of artifact."
 	}
 	return summary
 }

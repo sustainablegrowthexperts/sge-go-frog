@@ -71,6 +71,13 @@ func (s *mcpServer) registerTools() {
 		Annotations: readOnlyToolAnnotations(),
 		InputSchema: getArtifactInputSchema,
 	}, wrapMCPTool(s, "get_artifact", s.getArtifact))
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "read_artifact",
+		Description: "Read a done MCP job's artifact content directly over MCP when the client cannot fetch download URLs. Kinds are csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, audit_json_inclusive, audit_xlsx_strict, and audit_xlsx_inclusive. CSV and audit JSON are returned as UTF-8; ZIP and XLSX are returned as base64. Use offset and limit for byte-range paging, and follow next_offset while has_more is true.",
+		Annotations: readOnlyToolAnnotations(),
+		InputSchema: readArtifactInputSchema,
+	}, wrapMCPTool(s, "read_artifact", s.readArtifact))
 }
 
 // startCrawlAnnotations marks start_crawl as a non-destructive but non-idempotent
@@ -177,6 +184,8 @@ func toolCallJobID(in, out any) string {
 		id = v.JobID
 	case getArtifactOutput:
 		id = v.JobID
+	case readArtifactOutput:
+		id = v.JobID
 	}
 	if id = strings.TrimSpace(id); id != "" {
 		return id
@@ -191,6 +200,8 @@ func toolCallJobID(in, out any) string {
 	case getAuditInput:
 		id = v.JobID
 	case getArtifactInput:
+		id = v.JobID
+	case readArtifactInput:
 		id = v.JobID
 	}
 	return strings.TrimSpace(id)
@@ -230,10 +241,13 @@ func toolCallPages(out any) (int, bool) {
 	return 0, false
 }
 
-// toolCallBytes reports the artifact size carried by a get_artifact output.
+// toolCallBytes reports the artifact bytes carried by a read or metadata output.
 func toolCallBytes(out any) (int64, bool) {
-	if v, ok := out.(getArtifactOutput); ok {
+	switch v := out.(type) {
+	case getArtifactOutput:
 		return v.SizeBytes, true
+	case readArtifactOutput:
+		return int64(v.Bytes), true
 	}
 	return 0, false
 }
@@ -859,6 +873,43 @@ func (s *mcpServer) getArtifact(ctx context.Context, _ *mcp.CallToolRequest, in 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: getArtifactSummaryText(out)}},
 	}, out, nil
+}
+
+// readArtifact returns artifact bytes in the tool response instead of a
+// download URL. It is the fallback for MCP clients whose outbound network
+// policy blocks the artifact host. CSV and audit JSON are UTF-8 text; ZIP and
+// XLSX are base64 so binary bytes survive text content. Paging is by byte
+// offset and never returns a partial UTF-8 rune from a text artifact.
+func (s *mcpServer) readArtifact(ctx context.Context, _ *mcp.CallToolRequest, in readArtifactInput) (*mcp.CallToolResult, readArtifactOutput, error) {
+	if err := s.checkToolRateLimit(); err != nil {
+		return nil, readArtifactOutput{}, err
+	}
+
+	jobID, kind, err := validateGetArtifactInput(getArtifactInput{
+		JobID: in.JobID,
+		Kind:  in.Kind,
+	})
+	if err != nil {
+		return nil, readArtifactOutput{}, err
+	}
+
+	job, jobID, err := s.lookupMCPJob(jobID)
+	if err != nil {
+		return nil, readArtifactOutput{}, err
+	}
+
+	out, err := s.readArtifactContent(ctx, job, kind, in.Offset, in.Limit)
+	if err != nil {
+		return nil, readArtifactOutput{}, err
+	}
+
+	content := []mcp.Content{
+		&mcp.TextContent{Text: readArtifactSummaryText(out) + "\n"},
+	}
+	if out.Content != "" {
+		content = append(content, &mcp.TextContent{Text: out.Content})
+	}
+	return &mcp.CallToolResult{Content: content}, out, nil
 }
 
 // auditJobSnapshot is one consistent copy of the audit lifecycle fields.

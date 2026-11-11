@@ -121,7 +121,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for proxy routing, the results volume, restar
 
 There is no app-level token validation, OAuth flow, or per-caller ownership. Authentication is enforced by the deployment's oauth2-proxy with one shared Bearer token: clients send `Authorization: Bearer <token>`, the proxy validates it, and go-frog assumes the request is already authenticated. Tokens are never logged. Use TLS at the proxy; do not send the token over plain HTTP.
 
-### The seven tools
+### The eight tools
 
 | Tool | What it does |
 |------|--------------|
@@ -132,10 +132,11 @@ There is no app-level token validation, OAuth flow, or per-caller ownership. Aut
 | `search_pages` | Search crawl metadata without an archive, or archived raw HTML and visible text when the job has an archive. Supports literal and RE2 regex patterns, case sensitivity, snippets, and pagination. |
 | `get_audit` | Read a strict or inclusive audit section: summary, pages, links, blocks, anchors, pagerank, redirects, failed, sitemap, structure, or all. |
 | `get_artifact` | Get an absolute download URL, size, filename, content type, and expiry for the CSV report, strict/inclusive audit ZIP, strict/inclusive audit JSON, or strict/inclusive audit XLSX. Small CSV and JSON bodies can be returned inline. |
+| `read_artifact` | Read artifact bytes directly in the tool response when the client cannot fetch download URLs. CSV and audit JSON are UTF-8 text; ZIP and XLSX are base64. Supports byte-offset paging with `offset`, `limit`, and `next_offset`. |
 
 ### Job lifecycle and polling
 
-`start_crawl` returns immediately; crawls run in the background. Polling with `get_job` is the v1 progress mechanism. Use `status` (`queued`, `running`, `done`, `error`, `cancelled`) to decide when to stop, and `phase` (`queued`, `starting`, `discovering_sitemap`, `crawling`, `sitemap_coverage`, `auditing_strict`, `auditing_inclusive`, `done`, `error`, `cancelled`) to see what the job is doing. `list_jobs` shows only jobs created by MCP tools. Reuse the same `client_request_id` to retry `start_crawl` safely: an identical request returns the existing job, while different input with the same ID returns a `conflict` error. `get_results`, `get_audit`, and `get_artifact` refuse jobs that are still running.
+`start_crawl` returns immediately; crawls run in the background. Polling with `get_job` is the v1 progress mechanism. Use `status` (`queued`, `running`, `done`, `error`, `cancelled`) to decide when to stop, and `phase` (`queued`, `starting`, `discovering_sitemap`, `crawling`, `sitemap_coverage`, `auditing_strict`, `auditing_inclusive`, `done`, `error`, `cancelled`) to see what the job is doing. `list_jobs` shows only jobs created by MCP tools. Reuse the same `client_request_id` to retry `start_crawl` safely: an identical request returns the existing job, while different input with the same ID returns a `conflict` error. `get_results`, `get_audit`, `get_artifact`, and `read_artifact` refuse jobs that are still running.
 
 ### Search, archives, and audits
 
@@ -145,12 +146,14 @@ There is no app-level token validation, OAuth flow, or per-caller ownership. Aut
 
 `get_artifact` returns an absolute download URL, size, filename, content type, and expiry for one artifact. Set `inline=true` to return small CSV or JSON content directly, up to the 1 MB inline cap. Download URLs pass through the same oauth2-proxy as the MCP endpoint, so clients must send the same Bearer token when they fetch them.
 
+`read_artifact` returns the artifact bytes in the tool response itself, so an MCP client behind an outbound network allowlist can retrieve reports without fetching the download URL. CSV and audit JSON come back as UTF-8 text; ZIP and XLSX come back as `base64`. Reads are paged by byte offset: the response includes `offset`, `bytes`, `has_more`, and `next_offset` when more data remains. Follow `next_offset` until `has_more` is false, then decode or concatenate the pages. The default page is 256 KB; each page is capped by the inline artifact limit and the response size limit.
+
 #### Agent workflow: start, poll, read, download
 
 1. Call `start_crawl`. It returns a job ID immediately and includes absolute artifact links for the job.
 2. Poll `get_job` until `status` is terminal (`done`, `error`, or `cancelled`). Polling is the completion mechanism; there is no blocking wait call.
 3. After `done`, use `get_results` for page rows, `get_audit` for audit sections, and `search_pages` for metadata or archive-backed text. HTML/text search requires `archive_html=true` or `audit=true`; audit retrieval requires `audit=true` on a spider job.
-4. Use `get_artifact` for artifact metadata and an absolute URL, or download that URL directly with `GET`.
+4. Use `get_artifact` for artifact metadata and an absolute URL, or download that URL directly with `GET`. If the client cannot reach the artifact host, use `read_artifact` to read the bytes over MCP and follow `next_offset` until complete.
 
 #### Artifact URL contract
 

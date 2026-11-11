@@ -41,13 +41,14 @@ After completion:
 - get_audit returns strict or inclusive audit sections.
 - search_pages searches page metadata and, when archived, raw HTML or visible text.
 - get_artifact returns a download URL for a generated file; you may also GET that absolute URL directly.
+- read_artifact returns artifact bytes in the tool response when the client cannot reach the download URL. CSV and audit JSON are UTF-8 text; ZIP and XLSX are base64. Page with offset and limit, and follow next_offset while has_more is true.
 
 Prerequisites:
 - HTML and text search requires archive_html=true or audit=true.
 - Audit retrieval requires audit=true on a spider job.
 - Artifacts are available only when the job status is done.
 
-Artifacts: csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, audit_json_inclusive, audit_xlsx_strict, audit_xlsx_inclusive. URLs returned by start_crawl and get_artifact are absolute, job-scoped, and under the configured MCP endpoint. Downloads support GET and HEAD; URLs expire with the job retention window. Artifact downloads return 404 for unknown or expired URLs, 409 for unfinished jobs, and 405 for unsupported methods. Page, duration, size, and retention limits are server-enforced.`
+Artifacts: csv, audit_strict_zip, audit_inclusive_zip, audit_json_strict, audit_json_inclusive, audit_xlsx_strict, audit_xlsx_inclusive. URLs returned by start_crawl and get_artifact are absolute, job-scoped, and under the configured MCP endpoint. Downloads support GET and HEAD; URLs expire with the job retention window. Artifact downloads return 404 for unknown or expired URLs, 409 for unfinished jobs, and 405 for unsupported methods. read_artifact is the fallback when direct downloads are blocked. Page, duration, size, and retention limits are server-enforced.`
 
 // mcpServer is the thin adapter around the official MCP Go SDK. SDK types and
 // transport details stay in this file so the crawl/job code does not depend on
